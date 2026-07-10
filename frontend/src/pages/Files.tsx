@@ -1,0 +1,315 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { api, FileItem, Storage } from "../lib/api";
+import { Card, statusBadge, useToast, useDialog } from "../ui";
+import { humanSize, fmtTime } from "../lib/format";
+import { useTransfers } from "../transfer";
+import { JobEvent } from "../App";
+
+// ---- path helpers ----------------------------------------------------------
+
+function normDir(d: string): string {
+  let s = d.startsWith("/") ? d : "/" + d;
+  if (!s.endsWith("/")) s += "/";
+  return s.replace(/\/+/g, "/");
+}
+function fullPath(p: string): string {
+  return p.startsWith("/") ? p : "/" + p;
+}
+function parentDir(p: string): string {
+  const fp = fullPath(p).replace(/\/+$/, "");
+  const i = fp.lastIndexOf("/");
+  return i <= 0 ? "/" : fp.slice(0, i) + "/";
+}
+function baseName(p: string): string {
+  const fp = fullPath(p).replace(/\/+$/, "");
+  return fp.slice(fp.lastIndexOf("/") + 1);
+}
+function extOf(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(i + 1).toUpperCase() + " 文件" : "文件";
+}
+
+interface FolderRow { name: string; count: number; size: number; modified: string; }
+
+// Derive folders + files directly under `cwd`. Explicit empty dirs (is_dir) are
+// merged in so they show even with no children.
+function buildListing(files: FileItem[], cwd: string) {
+  const dir = normDir(cwd);
+  const folders = new Map<string, FolderRow>();
+  const here: FileItem[] = [];
+  const touch = (name: string): FolderRow => {
+    let r = folders.get(name);
+    if (!r) { r = { name, count: 0, size: 0, modified: "" }; folders.set(name, r); }
+    return r;
+  };
+  for (const f of files) {
+    const p = fullPath(f.path);
+    if (!p.startsWith(dir)) continue;
+    const rest = p.slice(dir.length);
+    if (rest === "") continue;
+    const slash = rest.indexOf("/");
+    if (slash === -1) {
+      if (f.is_dir) {
+        const r = touch(rest);
+        if (f.modified > r.modified) r.modified = f.modified;
+      } else here.push(f);
+    } else {
+      const r = touch(rest.slice(0, slash));
+      if (!f.is_dir) { r.count++; r.size += f.size; }
+      if (f.modified > r.modified) r.modified = f.modified;
+    }
+  }
+  const folderRows = [...folders.values()].sort((a, b) => a.name.localeCompare(b.name));
+  here.sort((a, b) => a.path.localeCompare(b.path));
+  return { folderRows, here };
+}
+
+// ---- icons -----------------------------------------------------------------
+
+function FolderIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
+      <path fill="#f5b849" d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
+    </svg>
+  );
+}
+function FileIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
+      <path fill="#94a3b8" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <path fill="#cbd5e1" d="M14 2v6h6z" />
+    </svg>
+  );
+}
+
+type Target =
+  | { kind: "blank" }
+  | { kind: "folder"; name: string; path: string }
+  | { kind: "file"; item: FileItem };
+interface Menu { x: number; y: number; target: Target; }
+interface Clip { path: string; isDir: boolean; }
+interface MenuItem { label: string; onClick?: () => void; danger?: boolean; disabled?: boolean; }
+
+export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [storage, setStorage] = useState<Storage | null>(null);
+  const [cwd, setCwd] = useState("/");
+  const [menu, setMenu] = useState<Menu | null>(null);
+  const [clip, setClip] = useState<Clip | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const toast = useToast();
+  const dialog = useDialog();
+  const transfers = useTransfers();
+
+  const askDelete = async (label: string, fn: () => Promise<any>, ok: string) => {
+    if (await dialog.confirm({ title: "删除确认", message: `确定删除 ${label} 吗?此操作不可撤销。`, danger: true, confirmLabel: "删除" })) {
+      run(fn(), ok);
+    }
+  };
+
+  const refresh = () => api.listFiles(cwd).then(setFiles).catch(() => {});
+  const refreshStorage = () => api.storage().then(setStorage).catch(() => {});
+  useEffect(() => { refresh(); refreshStorage(); }, [cwd]);
+
+  const doneCount = Object.values(jobs).filter((j) => j.status === "done").length;
+  useEffect(() => { refresh(); refreshStorage(); }, [doneCount]);
+
+  const { folderRows, here } = useMemo(() => buildListing(files, cwd), [files, cwd]);
+  const segments = cwd.split("/").filter(Boolean);
+
+  function goTo(depth: number) { setCwd(depth <= 0 ? "/" : "/" + segments.slice(0, depth).join("/") + "/"); }
+  function up() { goTo(segments.length - 1); }
+  function enter(name: string) { setCwd(normDir(cwd) + name + "/"); }
+  const closeMenu = () => setMenu(null);
+
+  function openMenu(e: React.MouseEvent, target: Target) {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY, target });
+  }
+
+  async function run(p: Promise<any>, ok: string) {
+    try { await p; toast("ok", ok); refresh(); refreshStorage(); }
+    catch (e: any) { toast("err", e.message); }
+  }
+
+  // ---- actions -------------------------------------------------------------
+
+  function pickFile() { fileRef.current?.click(); }
+
+  function onFilePicked() {
+    if (cwd === "/") { toast("info", "请先进入一个挂载节点"); return; }
+    const f = fileRef.current?.files?.[0];
+    if (!f) return;
+    if (storage && storage.total > 0 && f.size > storage.free) {
+      toast("err", `文件 ${humanSize(f.size)} 超过系统可用容量 ${humanSize(storage.free)},上传已取消`);
+      if (fileRef.current) fileRef.current.value = "";
+      return;
+    }
+    transfers.startUpload(f, normDir(cwd) + f.name);
+    toast("ok", "已加入上传队列,可在「传输管理」查看进度");
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  async function newFolder() {
+    if (cwd === "/") { toast("info", "请先进入一个挂载节点"); return; }
+    const name = await dialog.prompt({ title: "新建文件夹", placeholder: "文件夹名称" });
+    if (!name || !name.trim()) return;
+    run(api.createFolder(normDir(cwd) + name.trim()), "文件夹已创建");
+  }
+
+  function doDownload(item: FileItem) {
+    transfers.startDownload(item);
+    toast("info", "已加入下载队列,可在「传输管理」查看进度");
+  }
+
+  async function doRename(path: string) {
+    const cur = baseName(path);
+    const name = await dialog.prompt({ title: "重命名", defaultValue: cur, placeholder: "新名称" });
+    if (!name || !name.trim() || name.trim() === cur) return;
+    run(api.move(path, parentDir(path) + name.trim()), "已重命名");
+  }
+
+  function paste(targetDir: string) {
+    if (!clip) return;
+    const dst = normDir(targetDir) + baseName(clip.path);
+    run(api.move(clip.path, dst), "已粘贴").then(() => setClip(null));
+  }
+
+  // ---- context menu items --------------------------------------------------
+
+  function menuItems(t: Target): (MenuItem | "div")[] {
+    const wrap = (fn: () => void) => () => { closeMenu(); fn(); };
+    if (t.kind === "file") {
+      const it = t.item;
+      return [
+        { label: "下载", onClick: wrap(() => doDownload(it)), disabled: it.status !== "ready" },
+        { label: "剪切", onClick: wrap(() => setClip({ path: fullPath(it.path), isDir: false })) },
+        { label: "重命名", onClick: wrap(() => doRename(fullPath(it.path))) },
+        "div",
+        { label: "删除", danger: true, onClick: wrap(() => askDelete(baseName(it.path), () => api.deletePath(it.path), "已删除")) },
+      ];
+    }
+    if (t.kind === "folder") {
+      const atRoot = cwd === "/";
+      return [
+        { label: "打开", onClick: wrap(() => enter(t.name)) },
+        { label: "剪切", onClick: wrap(() => setClip({ path: t.path, isDir: true })), disabled: atRoot },
+        { label: "粘贴到此", onClick: wrap(() => paste(t.path)), disabled: !clip || atRoot },
+        { label: "重命名", onClick: wrap(() => doRename(t.path)), disabled: atRoot },
+        "div",
+        { label: "删除", danger: true, disabled: atRoot, onClick: wrap(() => askDelete(`文件夹 ${t.name} 及其内容`, () => api.deleteFolder(t.path), "已删除")) },
+      ];
+    }
+    return [
+      { label: "新建文件夹", onClick: wrap(newFolder), disabled: cwd === "/" },
+      { label: "上传文件", onClick: wrap(pickFile), disabled: cwd === "/" },
+      { label: clip ? `粘贴 “${baseName(clip.path)}”` : "粘贴", onClick: wrap(() => paste(cwd)), disabled: !clip || cwd === "/" },
+      "div",
+      { label: "刷新", onClick: wrap(() => { refresh(); refreshStorage(); }) },
+    ];
+  }
+
+  const empty = folderRows.length === 0 && here.length === 0;
+  const usedPct = storage && storage.total > 0 ? Math.round((storage.used / storage.total) * 100) : 0;
+  const cutPath = clip?.path;
+
+  return (
+    <Card
+      title="文件资源管理器"
+      action={
+        <div className="row">
+          <button className="btn ghost sm" onClick={newFolder} disabled={cwd === "/"}>新建文件夹</button>
+          <button className="btn" onClick={pickFile} disabled={cwd === "/"}>上传文件</button>
+        </div>
+      }
+    >
+      <input ref={fileRef} type="file" style={{ display: "none" }} onChange={onFilePicked} />
+
+      {/* capacity */}
+      <div className="cap-wrap">
+        <div className="cap-bar"><span style={{ width: `${usedPct}%`, background: usedPct > 85 ? "#dc2626" : "#6366f1" }} /></div>
+        <div className="cap-text">
+          {storage && storage.total > 0
+            ? <>总 {humanSize(storage.total)} · 已用 {humanSize(storage.used)} ({usedPct}%) · 可用 <b>{humanSize(storage.free)}</b></>
+            : "容量未知（请联系管理员接入网盘账号）"}
+        </div>
+      </div>
+
+      {/* breadcrumb + toolbar */}
+      <div className="explorer-bar">
+        <button className="btn ghost sm" onClick={up} disabled={segments.length === 0}>← 上级</button>
+        <div className="crumbs">
+          <span className={`crumb${segments.length === 0 ? " active" : ""}`} onClick={() => goTo(0)}>根目录</span>
+          {segments.map((s, i) => (
+            <span key={i}>
+              <span className="crumb-sep">/</span>
+              <span className={`crumb${i === segments.length - 1 ? " active" : ""}`} onClick={() => goTo(i + 1)}>{s}</span>
+            </span>
+          ))}
+        </div>
+        <div className="crumb-count">
+          {clip && <span className="clip-hint">已剪切: {baseName(clip.path)} · <span className="link" onClick={() => paste(cwd)}>粘贴到此</span></span>}
+          <span>{folderRows.length} 个文件夹 · {here.length} 个文件</span>
+        </div>
+      </div>
+
+      <div className="explorer-body" onContextMenu={(e) => openMenu(e, { kind: "blank" })}>
+        <table className="explorer">
+          <thead>
+            <tr><th>名称</th><th style={{ width: 120 }}>大小</th><th style={{ width: 180 }}>修改日期</th><th style={{ width: 140 }}>类型</th><th style={{ width: 200 }}></th></tr>
+          </thead>
+          <tbody>
+            {folderRows.map((d) => {
+              const dp = normDir(cwd) + d.name;
+              return (
+                <tr key={"d:" + d.name} className="row-folder" style={cutPath === dp ? { opacity: 0.5 } : undefined}
+                  onDoubleClick={() => enter(d.name)}
+                  onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
+                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span></div></td>
+                  <td className="muted">{humanSize(d.size)}</td>
+                  <td className="muted">{d.modified ? fmtTime(d.modified) : "—"}</td>
+                  <td className="muted">文件夹 ({d.count})</td>
+                  <td></td>
+                </tr>
+              );
+            })}
+            {here.map((f) => {
+              const name = baseName(f.path);
+              return (
+                <tr key={"f:" + f.id} style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
+                  onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
+                  <td><div className="name-cell"><FileIcon /> <span>{name}</span> {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td className="muted">{humanSize(f.size)}</td>
+                  <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
+                  <td className="muted">{extOf(name)}</td>
+                  <td>
+                    <div className="row">
+                      {f.status === "ready" && <button className="btn ghost sm" onClick={() => doDownload(f)}>下载</button>}
+                      <button className="btn ghost sm" onClick={() => doRename(fullPath(f.path))}>重命名</button>
+                      <button className="btn danger sm" onClick={() => askDelete(name, () => api.deletePath(f.path), "已删除")}>删除</button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {empty && <tr><td colSpan={5} className="empty">此目录为空 · 右键可新建文件夹或上传</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {menu && (
+        <>
+          <div className="ctx-overlay" onClick={closeMenu} onContextMenu={(e) => { e.preventDefault(); closeMenu(); }} />
+          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+            {menuItems(menu.target).map((it, i) =>
+              it === "div"
+                ? <div key={i} className="ctx-div" />
+                : <div key={i} className={`ctx-item${it.danger ? " danger" : ""}${it.disabled ? " disabled" : ""}`}
+                    onClick={() => !it.disabled && it.onClick?.()}>{it.label}</div>
+            )}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
