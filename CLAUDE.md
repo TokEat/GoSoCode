@@ -11,11 +11,13 @@ GoSoCode pools multiple Baidu Netdisk (百度网盘) accounts into "storage node
 ```bash
 # Backend (from backend/)
 go run ./cmd/server        # runs on :8080, creates/migrates gosocode.db (SQLite)
+go run ./cmd/client -server http://<server>:8080   # local CLI client on :8090 (data plane direct to Baidu)
 go build ./... && go vet ./...
 
 # Frontend (from frontend/)
 npm run dev                # vite on :5173, proxies /api (+WebSocket) to :8080
-npm run build              # tsc -b && vite build
+                           # VITE_API_TARGET=http://localhost:8090 npm run dev -> client mode
+npm run build              # tsc -b && vite build; point GSC_WEBUI (or client -webui) at dist/
 ```
 
 There are no tests. Config is env vars only (see `backend/internal/config/config.go`): `GSC_ADDR`, `GSC_DB`, `GSC_JWT_SECRET`, `GSC_REDIS` (empty = in-memory coordination, single instance), `GSC_STREAM_ENABLED/_MAX_CONCURRENT/_WINDOW`, etc. First registered user (or seeded `admin`/`admin@qwe123`) is admin. Baidu OAuth app credentials live in the DB (admin UI), not env.
@@ -38,6 +40,10 @@ Backend packages (`backend/internal/`):
 2. **Store-and-forward** (`api/uploads.go` + `job/manager.go`, fallback): chunks accumulate in a temp file, then an async job pushes to Baidu. Used when streaming is disabled/full, plan fails, or file is empty.
 
 Design doc: `docs/streaming-upload-sync.md`.
+
+### Client mode (CLI, data plane bypasses the server)
+
+`cmd/client` + `internal/clientd`: a local daemon that reverse-proxies the whole API/UI to the server but intercepts the transfer data plane — upload slices go straight from the local machine to Baidu (superfile2) and downloads are fetched from Baidu with parallel ranged connections (both with larger windows than server mode). The server keeps the control plane via `/api/agent/*` (`api/agent.go`): `upload/init` returns `uploadid + node access_token + remote_path` (agent sessions skip the streamStates cap), `upload/progress` keeps the server's `StreamSession` bitmap authoritative, `download/resolve` hands out `dlink + token`, `download/report` feeds accounting. Stream `finish/status/cancel` are plain proxied (create + accounting stay server-side). The web UI auto-detects via `GET /api/client/info` (server answers `mode:server`; the client intercepts the same path with `mode:client`) and the client rewrites the plan `window` larger — the browser transfer engine is unchanged. Handing out `access_token` = full account control: trusted deployments only; gate with `GSC_AGENT_ENABLED=0`. See `docs/client-mode.md`.
 
 Downloads (`api/files.go handleDownload`) proxy bytes cloud→server→client with a small buffer + Flush per write (no server buffering, backpressure end to end), forward `Range`, and re-resolve an expired dlink once.
 

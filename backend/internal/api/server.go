@@ -2,7 +2,12 @@
 package api
 
 import (
+	"log"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +38,9 @@ type Server struct {
 	// active streaming-upload sessions (per-session serialization + concurrency cap)
 	streamMu     sync.Mutex
 	streamStates map[string]*streamState
+
+	// serializes agent progress bitmap updates (read-modify-write)
+	agentMu sync.Mutex
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baidu.Client,
@@ -52,6 +60,11 @@ func (s *Server) Router() *gin.Engine {
 		AllowCredentials: false,
 	}))
 	r.MaxMultipartMemory = 32 << 20
+
+	r.GET("/api/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+	// mode probe: a CLI client intercepts this same path and answers mode=client,
+	// which is how the web UI auto-detects what it is bound to.
+	r.GET("/api/client/info", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"mode": "server"}) })
 
 	r.POST("/api/register", s.handleRegister)
 	r.POST("/api/login", s.handleLogin)
@@ -92,6 +105,16 @@ func (s *Server) Router() *gin.Engine {
 		auth.GET("/transfers/log", s.handleListTransferLog)
 	}
 
+	// control plane for CLI clients that transfer directly against Baidu
+	agent := r.Group("/api/agent", s.authMiddleware(), s.agentGuard())
+	{
+		agent.POST("/upload/init", s.handleAgentUploadInit)
+		agent.GET("/upload/session", s.handleAgentUploadSession)
+		agent.POST("/upload/progress", s.handleAgentUploadProgress)
+		agent.GET("/download/resolve", s.handleAgentDownloadResolve)
+		agent.POST("/download/report", s.handleAgentDownloadReport)
+	}
+
 	admin := r.Group("/api/admin", s.authMiddleware(), s.adminMiddleware())
 	{
 		admin.GET("/users", s.handleListUsers)
@@ -117,6 +140,27 @@ func (s *Server) Router() *gin.Engine {
 	}
 
 	r.GET("/api/ws", s.handleWS) // token passed as query param
+
+	// Serve the built web UI (frontend/dist copied to cfg.WebUIDir) when present,
+	// with SPA fallback to index.html. Both server and CLI client bind the same UI.
+	if dir := s.cfg.WebUIDir; dir != "" {
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			r.NoRoute(func(c *gin.Context) {
+				p := c.Request.URL.Path
+				if strings.HasPrefix(p, "/api/") || c.Request.Method != http.MethodGet {
+					c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+					return
+				}
+				fp := filepath.Join(dir, filepath.FromSlash(path.Clean("/"+p)))
+				if st, err := os.Stat(fp); err == nil && !st.IsDir() {
+					c.File(fp)
+					return
+				}
+				c.File(filepath.Join(dir, "index.html"))
+			})
+			log.Printf("web ui: serving %s", dir)
+		}
+	}
 	return r
 }
 

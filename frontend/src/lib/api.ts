@@ -113,6 +113,22 @@ export const api = {
   logs: (): Promise<LogItem[]> => json("/admin/logs", "GET").then((r) => r.logs),
 };
 
+export interface ClientInfo { mode: "client" | "server"; window?: number; dl_conns?: number; server?: string; }
+
+// Mode probe: the local CLI client intercepts this path and answers
+// mode=client; the server answers mode=server. Lets the UI auto-detect
+// whether transfers go through the local client (direct to Baidu) or the server.
+export async function clientInfo(): Promise<ClientInfo> {
+  try {
+    const res = await fetch("/api/client/info");
+    if (!res.ok) return { mode: "server" };
+    const data = await res.json();
+    return data.mode === "client" ? data : { mode: "server" };
+  } catch {
+    return { mode: "server" };
+  }
+}
+
 export function openProgressSocket(onEvent: (e: any) => void): WebSocket {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${auth.token}`);

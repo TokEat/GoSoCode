@@ -22,6 +22,10 @@ type Config struct {
 	StreamEnabled       bool // feature gate for pipelined (streaming) uploads
 	StreamMaxConcurrent int  // max simultaneous streaming-upload sessions (memory guard)
 	StreamWindow        int  // in-flight slice window advertised to clients
+
+	AgentEnabled bool   // allow CLI clients to transfer directly against Baidu
+	AgentWindow  int    // in-flight slice window advertised to CLI clients (bigger: localhost leg is free)
+	WebUIDir     string // if the dir exists, serve the built web UI from it
 }
 
 func env(key, def string) string {
@@ -47,6 +51,10 @@ func Load() *Config {
 		StreamEnabled:       env("GSC_STREAM_ENABLED", "1") != "0",
 		StreamMaxConcurrent: envInt("GSC_STREAM_MAX_CONCURRENT", 8),
 		StreamWindow:        envInt("GSC_STREAM_WINDOW", 3),
+
+		AgentEnabled: env("GSC_AGENT_ENABLED", "1") != "0",
+		AgentWindow:  envInt("GSC_AGENT_WINDOW", 8),
+		WebUIDir:     env("GSC_WEBUI", "webui"),
 	}
 }
 

@@ -93,11 +93,14 @@ func streamRetry(attempts int, label string, fn func() error) error {
 
 // handleStreamPlan pre-selects a storage node so the client knows which slice
 // size to hash with. Not a reservation: init re-picks and re-validates.
-// GET /files/stream/plan?size=<bytes>&path=<logical>
+// GET /files/stream/plan?size=<bytes>&path=<logical>[&agent=1]
 func (s *Server) handleStreamPlan(c *gin.Context) {
 	size, _ := strconv.ParseInt(c.Query("size"), 10, 64)
+	// Agent (CLI) sessions push slices to Baidu themselves, so the server-memory
+	// concurrency cap does not apply to them.
+	agent := c.Query("agent") == "1"
 	// Empty files (and disabled/full stream) fall back to store-and-forward.
-	if !s.cfg.StreamEnabled || size <= 0 || s.streamActive() >= s.cfg.StreamMaxConcurrent {
+	if !s.cfg.StreamEnabled || size <= 0 || (!agent && s.streamActive() >= s.cfg.StreamMaxConcurrent) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
@@ -126,18 +129,21 @@ func (s *Server) handleStreamPlan(c *gin.Context) {
 	})
 }
 
+// streamInitReq is the shared request body of the browser and agent init
+// endpoints.
+type streamInitReq struct {
+	Name      string   `json:"name" binding:"required"`
+	Path      string   `json:"path"`
+	Size      int64    `json:"size" binding:"required,gt=0"`
+	SliceSize int64    `json:"slice_size" binding:"required,gt=0"`
+	BlockList []string `json:"block_list" binding:"required,min=1"`
+}
+
 // handleStreamInit picks the node for real, runs precreate (which also detects
 // rapid-upload), and opens the session.
 // POST /files/stream/init {name,path,size,slice_size,block_list}
 func (s *Server) handleStreamInit(c *gin.Context) {
-	uid := uidOf(c)
-	var in struct {
-		Name      string   `json:"name" binding:"required"`
-		Path      string   `json:"path"`
-		Size      int64    `json:"size" binding:"required,gt=0"`
-		SliceSize int64    `json:"slice_size" binding:"required,gt=0"`
-		BlockList []string `json:"block_list" binding:"required,min=1"`
-	}
+	var in streamInitReq
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -151,6 +157,23 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 		return
 	}
 
+	sess, _, need, rapid, ok := s.openStreamSession(c, in)
+	if !ok {
+		return
+	}
+	s.streamStateFor(sess.ID) // register as active (counts toward the concurrency cap)
+	c.JSON(http.StatusOK, gin.H{
+		"session_id": sess.ID, "upload_id": sess.UploadID,
+		"need_seqs": need, "rapid": rapid,
+		"slice_size": sess.SliceSize, "total": sess.TotalSlices, "window": s.cfg.StreamWindow,
+	})
+}
+
+// openStreamSession is the shared init core: node placement, precreate
+// (rapid-upload detection), File + StreamSession records. On failure it writes
+// the error response itself and returns ok=false.
+func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *models.StreamSession, token string, need []int, rapid bool, ok bool) {
+	uid := uidOf(c)
 	ctx := c.Request.Context()
 	logical := cleanLogical(in.Path)
 	if logical == "/" {
@@ -177,7 +200,7 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 		return
 	}
 
-	token, err := s.pool.Token(ctx, acc)
+	token, err = s.pool.Token(ctx, acc)
 	if err != nil {
 		release()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -207,7 +230,7 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 		return
 	}
 
-	rapid := returnType == 2
+	rapid = returnType == 2
 	bitmap := strings.Repeat("0", total)
 	doneCount := 0
 	if rapid {
@@ -228,7 +251,7 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 	}
 
 	blocks, _ := json.Marshal(in.BlockList)
-	sess := models.StreamSession{
+	sess = &models.StreamSession{
 		ID: uuid.NewString(), UserID: uid, BaiduAccountID: acc.ID, FileID: f.ID,
 		Name: in.Name, LogicalPath: logical, RemotePath: remote,
 		Size: in.Size, SliceSize: sliceSize, TotalSlices: total,
@@ -236,25 +259,20 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 		DoneBitmap: bitmap, DoneCount: doneCount,
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
-	if err := s.db.Create(&sess).Error; err != nil {
+	if err := s.db.Create(sess).Error; err != nil {
 		release()
 		s.db.Delete(&models.File{}, f.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	s.streamStateFor(sess.ID) // register as active
 
-	need := needSeqs(bitmap)
+	need = needSeqs(bitmap)
 	if !rapid && len(missing) > 0 && len(missing) < total {
 		need = missing // Baidu told us a subset is already there
 	}
 	log.Printf("[stream] init session=%s user=%d path=%s size=%d slices=%d slice_size=%d rapid=%v",
 		sess.ID, uid, logical, in.Size, total, sliceSize, rapid)
-	c.JSON(http.StatusOK, gin.H{
-		"session_id": sess.ID, "upload_id": uploadID,
-		"need_seqs": need, "rapid": rapid,
-		"slice_size": sliceSize, "total": total, "window": s.cfg.StreamWindow,
-	})
+	return sess, token, need, rapid, true
 }
 
 // handleStreamSlice receives one raw slice and synchronously forwards it to

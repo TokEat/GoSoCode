@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { auth, openProgressSocket } from "./lib/api";
+import { auth, clientInfo, openProgressSocket } from "./lib/api";
 import { ToastProvider, DialogProvider } from "./ui";
 import { TransferProvider, useTransfers } from "./transfer";
 import Login from "./pages/Login";
@@ -51,8 +51,17 @@ export default function App() {
 function Shell({ onLogout }: { onLogout: () => void }) {
   const [page, setPage] = useState<Page>("overview");
   const [jobs, setJobs] = useState<Record<string, JobEvent>>({});
+  const [clientMode, setClientMode] = useState(false);
   const isAdmin = auth.role === "admin";
   const transfers = useTransfers();
+
+  // Auto-detect whether we are bound to a local client (transfers go straight
+  // to Baidu from this machine) or to the server (browser <-> server relay).
+  useEffect(() => {
+    let alive = true;
+    clientInfo().then((info) => { if (alive) setClientMode(info.mode === "client"); });
+    return () => { alive = false; };
+  }, []);
 
   // Single WebSocket for the whole session; feeds live transfer progress and
   // flips a finalizing upload to done/error once the server->Baidu leg finishes.
@@ -102,6 +111,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         <header className="topbar">
           <h1>{active?.label}</h1>
           <div className="row">
+            {clientMode && <span className="badge green" title="传输由本机客户端直连云端，不经过平台服务器">客户端直连</span>}
             <span className={`badge ${isAdmin ? "blue" : "gray"}`}>{isAdmin ? "管理员" : "用户"}</span>
           </div>
         </header>
