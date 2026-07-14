@@ -123,10 +123,17 @@ jobs:
           mkdir -p artifacts
           mv gosocode-*.zip artifacts/
 
-      - name: Upload artifact
+      - name: Upload raw binaries (for GSC_CLIENT_DIR layout)
         uses: actions/upload-artifact@v4
         with:
-          name: gosocode-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          name: bin-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload packaged archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: artifacts/*
           if-no-files-found: error
 
@@ -145,16 +152,17 @@ jobs:
       - name: Build GSC_CLIENT_DIR layout
         run: |
           mkdir -p client-binaries
-          # Each per-platform artifact has the form:
-          #   artifacts/<os>-<arch>/server, client[, server.exe, client.exe]
-          for d in artifacts/*/; do
+          # bin-<os>-<arch> artifacts contain raw server/client binaries at the root.
+          for d in artifacts/bin-*/; do
             target=$(basename "$d")
+            target="${target#bin-}"   # strip "bin-" prefix
             os="${target%%-*}"
             arch="${target##*-}"
-            mkdir -p "client-binaries/${os}-${arch}"
+            out="client-binaries/${os}-${arch}"
+            mkdir -p "$out"
             for f in server client server.exe client.exe; do
               if [ -f "${d}${f}" ]; then
-                cp "${d}${f}" "client-binaries/${os}-${arch}/"
+                cp "${d}${f}" "$out/"
               fi
             done
           done
@@ -163,7 +171,7 @@ jobs:
           mkdir -p release-assets
           mv "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" release-assets/
           # Bring per-platform archives across so they're attached to the release too.
-          find artifacts -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release-assets/ \;
+          find artifacts/pkg-* -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release-assets/ \;
           ls -lh release-assets/
 
       - name: Create GitHub Release
