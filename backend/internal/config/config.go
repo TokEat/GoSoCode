@@ -26,6 +26,7 @@ type Config struct {
 	AgentEnabled bool   // allow CLI clients to transfer directly against Baidu
 	AgentWindow  int    // in-flight slice window advertised to CLI clients (bigger: localhost leg is free)
 	WebUIDir     string // if the dir exists, serve the built web UI from it
+	ClientDir    string // if set, serves CLI client binaries at /api/client/download/<os>/<arch>
 }
 
 func env(key, def string) string {
@@ -55,6 +56,7 @@ func Load() *Config {
 		AgentEnabled: env("GSC_AGENT_ENABLED", "1") != "0",
 		AgentWindow:  envInt("GSC_AGENT_WINDOW", 8),
 		WebUIDir:     env("GSC_WEBUI", "webui"),
+		ClientDir:    env("GSC_CLIENT_DIR", ""),
 	}
 }
 

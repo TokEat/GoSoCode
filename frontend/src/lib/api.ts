@@ -165,6 +165,24 @@ export const clientApi = {
   remove: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}`, "DELETE"),
 };
 
+// CLI client binary downloads served by the backend from $GSC_CLIENT_DIR.
+export interface ClientDownloadInfo {
+  enabled: boolean;
+  platforms: { os: string; arch: string; size: number; missing?: boolean }[];
+}
+export async function clientDownloads(): Promise<ClientDownloadInfo> {
+  try {
+    const res = await fetch("/api/client/download/info");
+    if (!res.ok) return { enabled: false, platforms: [] };
+    return res.json();
+  } catch {
+    return { enabled: false, platforms: [] };
+  }
+}
+export function clientDownloadUrl(os: string, arch: string): string {
+  return `/api/client/download/${encodeURIComponent(os)}/${encodeURIComponent(arch)}`;
+}
+
 export function openProgressSocket(onEvent: (e: any) => void): WebSocket {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${auth.token}`);

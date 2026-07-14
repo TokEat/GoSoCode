@@ -1,6 +1,50 @@
 import { useEffect, useState } from "react";
-import { clientApi, ClientInfo } from "../lib/api";
+import { clientApi, ClientInfo, clientDownloads, clientDownloadUrl, ClientDownloadInfo } from "../lib/api";
 import { Card, useToast } from "../ui";
+
+// Detects the current browser platform and maps it to one of the 6 binaries
+// built by .github/workflows/release.yml. Falls back gracefully on unknown
+// platforms (returns null and lets the UI show the full picker).
+function detectPlatform(): { os: string; arch: string } | null {
+  const ua = navigator.userAgent || "";
+  const uaData = (navigator as any).userAgentData as { platforms?: string[] } | undefined;
+  const platform = (uaData?.platforms?.[0] || (navigator as any).platform || "").toLowerCase();
+
+  let os = "";
+  if (/windows/i.test(platform) || /win/i.test(ua.split(" ")[0] || "")) os = "windows";
+  else if (/mac|darwin/i.test(platform)) os = "darwin";
+  else if (/linux|x11/i.test(platform) || /linux/i.test(ua)) os = "linux";
+  if (!os) return null;
+
+  let arch = "";
+  // navigator.userAgentData doesn't expose arch; fall back to UA + screen.
+  if (/arm64|aarch64/i.test(ua)) arch = "arm64";
+  else if (/wow64|win64|x64|amd64/i.test(ua) || (navigator as any).userAgent?.includes("x86_64") || (navigator as any).userAgent?.includes("x64")) arch = "amd64";
+  // Apple Silicon: navigator.platform is "MacIntel" with arm64 in UA — already caught above.
+  // iOS / iPadOS are not supported (no CLI client binaries).
+  if (!arch) {
+    // Default: most users are on amd64. Power users on Linux arm64 should override manually.
+    arch = "amd64";
+  }
+  return { os, arch };
+}
+
+function humanSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+const OS_LABEL: Record<string, string> = {
+  windows: "Windows",
+  darwin: "macOS",
+  linux: "Linux",
+};
+const ARCH_LABEL: Record<string, string> = {
+  amd64: "x86_64",
+  arm64: "ARM 64",
+};
 
 interface Props {
   info: ClientInfo;
@@ -90,5 +134,62 @@ export default function ClientSettings({ info, firstRun = false, onSaved }: Prop
     );
   }
 
-  return <Card title="客户端连接与本地存储">{form}</Card>;
+  return (
+    <>
+      <Card title="客户端连接与本地存储">{form}</Card>
+      <ClientDownloadCard />
+    </>
+  );
+}
+
+function ClientDownloadCard() {
+  const [info, setInfo] = useState<ClientDownloadInfo | null>(null);
+  const [detected] = useState(() => detectPlatform());
+
+  useEffect(() => {
+    clientDownloads().then(setInfo);
+  }, []);
+
+  if (!info || !info.enabled) return null;
+
+  const matched =
+    detected && info.platforms.find((p) => p.os === detected.os && p.arch === detected.arch && !p.missing);
+  const detectedLabel = detected ? `${OS_LABEL[detected.os] || detected.os} · ${ARCH_LABEL[detected.arch] || detected.arch}` : "";
+
+  return (
+    <Card title="下载本地客户端">
+      <p className="field-help" style={{ marginTop: 0 }}>
+        客户端在你的电脑上直接与百度网盘通信，绕过浏览器上传/下载限制与平台服务器中转。
+        {detected && <> 当前设备识别为 <strong>{detectedLabel}</strong>。</>}
+      </p>
+      {matched ? (
+        <a className="btn" href={clientDownloadUrl(matched.os, matched.arch)} download>
+          下载 {OS_LABEL[matched.os] || matched.os} 客户端（{humanSize(matched.size)}）
+        </a>
+      ) : (
+        <div className="client-config-error" style={{ marginBottom: 0 }}>
+          {detected
+            ? `当前平台 (${detectedLabel}) 没有可用的预编译客户端，请按下方列表手动选择其他平台或自行编译。`
+            : "无法识别当前平台，请按下方列表手动选择。"}
+        </div>
+      )}
+      <details style={{ marginTop: 18 }}>
+        <summary className="field-help" style={{ cursor: "pointer" }}>其他平台 ({info.platforms.length})</summary>
+        <div className="client-download-list">
+          {info.platforms.map((p) => (
+            <div key={`${p.os}-${p.arch}`} className="client-download-row">
+              <span>{OS_LABEL[p.os] || p.os} · {ARCH_LABEL[p.arch] || p.arch}</span>
+              {p.missing
+                ? <span className="field-help">未提供</span>
+                : (
+                  <a className="btn sm ghost" href={clientDownloadUrl(p.os, p.arch)} download>
+                    下载 {humanSize(p.size)}
+                  </a>
+                )}
+            </div>
+          ))}
+        </div>
+      </details>
+    </Card>
+  );
 }

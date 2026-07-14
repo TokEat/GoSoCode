@@ -80,6 +80,9 @@ func (s *Server) Router() *gin.Engine {
 	// mode probe: a CLI client intercepts this same path and answers mode=client,
 	// which is how the web UI auto-detects what it is bound to.
 	r.GET("/api/client/info", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"mode": "server"}) })
+	// CLI client binary downloads (served from $GSC_CLIENT_DIR, public).
+	r.GET("/api/client/download/info", s.handleClientDownloadInfo)
+	r.GET("/api/client/download/:os/:arch", s.handleClientDownload)
 
 	r.POST("/api/login", s.handleLogin)
 	// Public Baidu callback (the browser is redirected here by Baidu, so the

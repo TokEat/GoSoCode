@@ -137,14 +137,33 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -lh artifacts
+      - name: Build GSC_CLIENT_DIR layout
+        run: |
+          mkdir -p client-binaries
+          # Each per-platform artifact has the form:
+          #   artifacts/<os>-<arch>/server, client[, server.exe, client.exe]
+          for d in artifacts/*/; do
+            target=$(basename "$d")
+            os="${target%%-*}"
+            arch="${target##*-}"
+            mkdir -p "client-binaries/${os}-${arch}"
+            for f in server client server.exe client.exe; do
+              if [ -f "${d}${f}" ]; then
+                cp "${d}${f}" "client-binaries/${os}-${arch}/"
+              fi
+            done
+          done
+          find client-binaries -type f | sort
+          tar -czf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" -C client-binaries .
+          mkdir -p release-assets
+          mv "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" release-assets/
+          # Bring per-platform archives across so they're attached to the release too.
+          find artifacts -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release-assets/ \;
+          ls -lh release-assets/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
+          files: release-assets/*
