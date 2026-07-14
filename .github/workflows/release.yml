@@ -17,12 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - { os: linux,   arch: amd64, ext: tar.gz, sh: '' }
-          - { os: linux,   arch: arm64, ext: tar.gz, sh: '' }
-          - { os: windows, arch: amd64, ext: zip,    sh: '.exe' }
-          - { os: windows, arch: arm64, ext: zip,    sh: '.exe' }
-          - { os: darwin,  arch: amd64, ext: tar.gz, sh: '' }
-          - { os: darwin,  arch: arm64, ext: tar.gz, sh: '' }
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
 
     steps:
       - name: Checkout
@@ -101,40 +101,11 @@ jobs:
               ./cmd/${bin}
           done
 
-      - name: Package (tar.gz)
-        if: matrix.target.ext == 'tar.gz'
-        working-directory: backend
-        run: |
-          cd ../dist
-          tar -czf ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz \
-            server client
-          cd ..
-          mkdir -p artifacts
-          mv gosocode-*.tar.gz artifacts/
-
-      - name: Package (zip)
-        if: matrix.target.ext == 'zip'
-        working-directory: backend
-        run: |
-          cd ../dist
-          7z a ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip \
-            server.exe client.exe
-          cd ..
-          mkdir -p artifacts
-          mv gosocode-*.zip artifacts/
-
-      - name: Upload raw binaries (for GSC_CLIENT_DIR layout)
+      - name: Upload raw binaries
         uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: dist/*
-          if-no-files-found: error
-
-      - name: Upload packaged archives
-        uses: actions/upload-artifact@v4
-        with:
-          name: pkg-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          path: artifacts/*
           if-no-files-found: error
 
   release:
@@ -170,8 +141,6 @@ jobs:
           tar -czf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" -C client-binaries .
           mkdir -p release-assets
           mv "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" release-assets/
-          # Bring per-platform archives across so they're attached to the release too.
-          find artifacts/pkg-* -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release-assets/ \;
           ls -lh release-assets/
 
       - name: Create GitHub Release
