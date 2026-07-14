@@ -57,13 +57,14 @@ jobs:
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          mkdir -p dist
+          cd backend
+          mkdir -p ../dist
           for bin in server client; do
             go build \
               -trimpath \
               -ldflags="-s -w" \
-              -o dist/${bin} \
-              ./backend/cmd/${bin}
+              -o ../dist/${bin} \
+              ./cmd/${bin}
           done
 
       - name: Build (Windows)
@@ -73,13 +74,14 @@ jobs:
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          mkdir -p dist
+          cd backend
+          mkdir -p ../dist
           for bin in server client; do
             go build \
               -trimpath \
               -ldflags="-s -w" \
-              -o dist/${bin}.exe \
-              ./backend/cmd/${bin}
+              -o ../dist/${bin}.exe \
+              ./cmd/${bin}
           done
 
       - name: Build (macOS)
@@ -89,13 +91,14 @@ jobs:
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          mkdir -p dist
+          cd backend
+          mkdir -p ../dist
           for bin in server client; do
             go build \
               -trimpath \
               -ldflags="-s -w" \
-              -o dist/${bin} \
-              ./backend/cmd/${bin}
+              -o ../dist/${bin} \
+              ./cmd/${bin}
           done
 
       - name: Package (tar.gz)
