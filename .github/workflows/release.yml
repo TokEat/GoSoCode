@@ -31,8 +31,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache: true
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -52,12 +52,12 @@ jobs:
 
       - name: Build (Linux)
         if: matrix.target.os == 'linux'
+        working-directory: backend
         env:
           GOOS: linux
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          cd backend
           mkdir -p ../dist
           for bin in server client; do
             go build \
@@ -69,12 +69,12 @@ jobs:
 
       - name: Build (Windows)
         if: matrix.target.os == 'windows'
+        working-directory: backend
         env:
           GOOS: windows
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          cd backend
           mkdir -p ../dist
           for bin in server client; do
             go build \
@@ -86,12 +86,12 @@ jobs:
 
       - name: Build (macOS)
         if: matrix.target.os == 'darwin'
+        working-directory: backend
         env:
           GOOS: darwin
           GOARCH: ${{ matrix.target.arch }}
           CGO_ENABLED: 0
         run: |
-          cd backend
           mkdir -p ../dist
           for bin in server client; do
             go build \
@@ -103,8 +103,9 @@ jobs:
 
       - name: Package (tar.gz)
         if: matrix.target.ext == 'tar.gz'
+        working-directory: backend
         run: |
-          cd dist
+          cd ../dist
           tar -czf ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz \
             server client
           cd ..
@@ -113,8 +114,9 @@ jobs:
 
       - name: Package (zip)
         if: matrix.target.ext == 'zip'
+        working-directory: backend
         run: |
-          cd dist
+          cd ../dist
           7z a ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip \
             server.exe client.exe
           cd ..
