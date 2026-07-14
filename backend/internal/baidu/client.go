@@ -30,10 +30,11 @@ const (
 	apiFile  = "https://pan.baidu.com/rest/2.0/xpan/file"
 	apiMulti = "https://pan.baidu.com/rest/2.0/xpan/multimedia"
 	apiNas   = "https://pan.baidu.com/rest/2.0/xpan/nas"
-	apiSuper = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
-	apiToken = "https://openapi.baidu.com/oauth/2.0/token"
-	apiAuth  = "https://openapi.baidu.com/oauth/2.0/authorize"
-	apiQuota = "https://pan.baidu.com/api/quota"
+	// Default PCS upload server; LocateUpload can return closer ones.
+	pcsDefaultServer = "https://d.pcs.baidu.com"
+	apiToken         = "https://openapi.baidu.com/oauth/2.0/token"
+	apiAuth          = "https://openapi.baidu.com/oauth/2.0/authorize"
+	apiQuota         = "https://pan.baidu.com/api/quota"
 	// UserAgent required when fetching a dlink, otherwise Baidu returns 403.
 	UserAgent = "pan.baidu.com"
 )
@@ -86,9 +87,20 @@ type baseErr struct {
 	Errmsg string `json:"errmsg"`
 }
 
+// APIError preserves the numeric Baidu errno so callers can log and classify
+// ambiguous/transient API failures without parsing an error string.
+type APIError struct {
+	Errno  int
+	Errmsg string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("baidu api errno=%d msg=%s", e.Errno, e.Errmsg)
+}
+
 func (b baseErr) err() error {
 	if b.Errno != 0 {
-		return fmt.Errorf("baidu api errno=%d msg=%s", b.Errno, b.Errmsg)
+		return &APIError{Errno: b.Errno, Errmsg: b.Errmsg}
 	}
 	return nil
 }
@@ -265,8 +277,57 @@ func (c *Client) Precreate(ctx context.Context, token, remotePath string, size i
 	return &out, out.err()
 }
 
+// LocateUpload returns upload server base URLs (e.g. "https://xx.baidupcs.com")
+// close to this machine. The default d.pcs.baidu.com intermittently answers
+// empty-body HTTP 500s; rotating across located servers works around that.
+func (c *Client) LocateUpload(ctx context.Context, token, remotePath, uploadID string) ([]string, error) {
+	q := url.Values{}
+	q.Set("method", "locateupload")
+	q.Set("appid", "250528")
+	q.Set("access_token", token)
+	q.Set("path", remotePath)
+	q.Set("uploadid", uploadID)
+	q.Set("upload_version", "2.0")
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, pcsDefaultServer+"/rest/2.0/pcs/file?"+q.Encode(), nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		ErrorCode int    `json:"error_code"`
+		ErrorMsg  string `json:"error_msg"`
+		Servers   []struct {
+			Server string `json:"server"`
+		} `json:"servers"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return nil, err
+	}
+	if out.ErrorCode != 0 {
+		return nil, fmt.Errorf("locateupload error %d: %s", out.ErrorCode, out.ErrorMsg)
+	}
+	var servers []string
+	for _, s := range out.Servers {
+		if strings.HasPrefix(s.Server, "https://") {
+			servers = append(servers, strings.TrimRight(s.Server, "/"))
+		}
+	}
+	return servers, nil
+}
+
 // UploadChunk sends one slice to superfile2. partseq is the 0-based index.
 func (c *Client) UploadChunk(ctx context.Context, token, remotePath, uploadID string, partseq int, chunk []byte) error {
+	return c.UploadChunkTo(ctx, "", token, remotePath, uploadID, partseq, chunk)
+}
+
+// UploadChunkTo is UploadChunk against a specific upload server base URL from
+// LocateUpload; empty means the default server.
+func (c *Client) UploadChunkTo(ctx context.Context, server, token, remotePath, uploadID string, partseq int, chunk []byte) error {
+	if server == "" {
+		server = pcsDefaultServer
+	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	fw, err := mw.CreateFormFile("file", "chunk")
@@ -286,7 +347,7 @@ func (c *Client) UploadChunk(ctx context.Context, token, remotePath, uploadID st
 	q.Set("uploadid", uploadID)
 	q.Set("partseq", strconv.Itoa(partseq))
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, apiSuper+"?"+q.Encode(), &buf)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server+"/rest/2.0/pcs/superfile2?"+q.Encode(), &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -294,8 +355,17 @@ func (c *Client) UploadChunk(ctx context.Context, token, remotePath, uploadID st
 	}
 	defer resp.Body.Close()
 	var be baseErr
-	body, _ := io.ReadAll(resp.Body)
-	_ = json.Unmarshal(body, &be) // superfile2 returns {md5:...} on success, errno on failure
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("baidu upload HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if err := json.Unmarshal(body, &be); err != nil {
+		return fmt.Errorf("invalid baidu upload response: %w", err)
+	}
+	// superfile2 returns {md5:...} on success, errno on failure.
 	return be.err()
 }
 
@@ -482,7 +552,13 @@ func (c *Client) postForm(ctx context.Context, u string, form url.Values, out an
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("baidu API HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	return json.Unmarshal(body, out)
 }
 

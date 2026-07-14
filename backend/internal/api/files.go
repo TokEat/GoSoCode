@@ -225,7 +225,10 @@ func (s *Server) remoteItemByPath(ctx *gin.Context, acc *models.BaiduAccount, to
 	}
 	for _, it := range items {
 		if it.Path == remotePath || it.ServerFilename == name {
-			return &baiduListRef{FsID: it.FsID, Name: it.ServerFilename, Size: it.Size, IsDir: it.IsDir == 1}, nil
+			return &baiduListRef{
+				FsID: it.FsID, Name: it.ServerFilename, Size: it.Size,
+				IsDir: it.IsDir == 1, MTime: it.ServerMTime,
+			}, nil
 		}
 	}
 	return nil, gorm.ErrRecordNotFound
@@ -236,6 +239,7 @@ type baiduListRef struct {
 	Name  string
 	Size  int64
 	IsDir bool
+	MTime int64
 }
 
 func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string) {

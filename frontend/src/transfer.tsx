@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from "react";
 import SparkMD5 from "spark-md5";
-import { auth } from "./lib/api";
+import { auth, clientApi, ClientTask } from "./lib/api";
 
 const CHUNK = 4 * 1024 * 1024; // 4MB browser->server chunk (legacy store-and-forward)
 const MAX_RETRY = 5;           // consecutive-stall retries before giving up
@@ -71,9 +71,11 @@ interface Ctl {
 }
 
 interface TransferApi {
+  clientMode: boolean;
   transfers: Transfer[];
   startUpload: (file: File, path: string) => void;
-  startDownload: (item: { id: number; path: string; size: number; download_url?: string }) => void;
+  startClientUpload: (localPath: string, remoteDir: string) => Promise<void>;
+  startDownload: (item: { id: number; path: string; size: number; download_url?: string }) => void | Promise<void>;
   pause: (id: string) => void;
   resume: (id: string) => void;
   cancel: (id: string) => void;
@@ -84,6 +86,12 @@ interface TransferApi {
 
 const Ctx = createContext<TransferApi>(null as unknown as TransferApi);
 export const useTransfers = () => useContext(Ctx);
+
+export function TransferProvider({ children, mode = "server" }: { children: ReactNode; mode?: "client" | "server" }) {
+  return mode === "client"
+    ? <ClientTransferProvider>{children}</ClientTransferProvider>
+    : <BrowserTransferProvider>{children}</BrowserTransferProvider>;
+}
 
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const authHeader = () => ({ Authorization: `Bearer ${auth.token}` });
@@ -252,8 +260,9 @@ function putSliceXHR(
       try { data = JSON.parse(xhr.responseText || "{}"); } catch { /* not json */ }
       if (xhr.status >= 200 && xhr.status < 300) resolve(data as { done_count: number; total: number });
       else {
-        const err = new Error((data.error as string) || `HTTP ${xhr.status}`) as Error & { status?: number };
+        const err = new Error((data.error as string) || `HTTP ${xhr.status}`) as Error & { status?: number; data?: Record<string, unknown> };
         err.status = xhr.status;
+        err.data = data;
         reject(err);
       }
     };
@@ -267,6 +276,40 @@ function putSliceXHR(
     xhrs.add(xhr);
     xhr.send(body);
   });
+}
+
+// SLICE_PART is the browser->server request size for big slices. VIP/SVIP
+// nodes use 16/32MB Baidu slices; a single request that large rarely survives
+// a flaky link, so putSlice ships it as sequential 4MB sub-chunks (?off=) that
+// the server assembles. After any error the server replies 409 with the
+// acknowledged offset, so a retry resumes mid-slice instead of starting over.
+const SLICE_PART = 4 * 1024 * 1024;
+
+async function putSlice(
+  url: string, body: ArrayBuffer,
+  onProgress: (loaded: number) => void,
+  xhrs: Set<XMLHttpRequest>,
+): Promise<{ done_count: number; total: number }> {
+  if (body.byteLength <= SLICE_PART) return putSliceXHR(url, body, onProgress, xhrs);
+  let off = 0;
+  for (;;) {
+    const end = Math.min(off + SLICE_PART, body.byteLength);
+    try {
+      const res = await putSliceXHR(
+        `${url}&off=${off}`, body.slice(off, end),
+        (loaded) => onProgress(off + loaded), xhrs,
+      );
+      if (end >= body.byteLength) return res;
+      off = end;
+    } catch (e) {
+      const err = e as Error & { status?: number; data?: { expected?: number } };
+      if (err.status === 409 && typeof err.data?.expected === "number" && err.data.expected !== off) {
+        off = err.data.expected; // re-sync with what the server already has
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 // computeBlockList md5-hashes the file slice by slice (local read only, no
@@ -287,7 +330,7 @@ async function computeBlockList(
   return out;
 }
 
-export function TransferProvider({ children }: { children: ReactNode }) {
+function BrowserTransferProvider({ children }: { children: ReactNode }) {
   // restore persisted transfers exactly once, before first render
   const restored = useRef<{ list: Transfer[]; ctls: Map<string, Ctl>; resumeIds: string[] } | null>(null);
   if (restored.current === null) restored.current = restoreTransfers();
@@ -480,7 +523,7 @@ export function TransferProvider({ children }: { children: ReactNode }) {
             let attempt = 0;
             for (;;) {
               try {
-                await putSliceXHR(
+                await putSlice(
                   `/api/files/stream/slice?session=${st.sessionId}&seq=${seq}`, buf,
                   (loaded) => { st.inflight.set(seq, Math.min(loaded, buf.byteLength)); recomputeSent(ctl); tick(id); },
                   st.xhrs,
@@ -773,6 +816,10 @@ export function TransferProvider({ children }: { children: ReactNode }) {
     })();
   }, [driveStreamUpload, driveUpload]);
 
+  const startClientUpload = useCallback(async () => {
+    throw new Error("当前页面未连接本地客户端");
+  }, []);
+
   const startDownload = useCallback((item: { id: number; path: string; size: number; download_url?: string }) => {
     const id = uid();
     const name = item.path.split("/").pop() || "download";
@@ -922,7 +969,107 @@ export function TransferProvider({ children }: { children: ReactNode }) {
   }, [patch, resume]);
 
   return (
-    <Ctx.Provider value={{ transfers, startUpload, startDownload, pause, resume, cancel, remove, clearFinished, resolveJob }}>
+    <Ctx.Provider value={{ clientMode: false, transfers, startUpload, startClientUpload, startDownload, pause, resume, cancel, remove, clearFinished, resolveJob }}>
+      {children}
+    </Ctx.Provider>
+  );
+}
+
+function taskToTransfer(task: ClientTask): Transfer {
+  const active = task.status === "waiting" || task.status === "hashing" || task.status === "running";
+  const status: TransferStatus = active
+    ? "running"
+    : task.status === "done" ? "done" : task.status === "error" ? "error" : "canceled";
+  const note = task.status === "waiting"
+    ? "等待本地客户端调度"
+    : task.status === "hashing"
+      ? "正在本机计算文件指纹"
+      : undefined;
+  return {
+    id: task.id,
+    kind: task.kind,
+    name: task.name,
+    path: task.kind === "upload" ? task.remote_path : task.local_path || task.remote_path,
+    total: task.size,
+    transferred: task.done,
+    speed: task.speed,
+    eta: task.status === "running" && task.speed > 1024 && task.size > task.done
+      ? (task.size - task.done) / task.speed
+      : undefined,
+    status,
+    note,
+    error: task.error,
+  };
+}
+
+// In client mode the browser is only a control surface. The daemon reads and
+// writes local files, talks to Baidu, and exposes lightweight task snapshots.
+function ClientTransferProvider({ children }: { children: ReactNode }) {
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
+
+  const refresh = useCallback(async () => {
+    const tasks = await clientApi.tasks();
+    setTransfers(tasks.map(taskToTransfer));
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const tasks = await clientApi.tasks();
+        if (alive) setTransfers(tasks.map(taskToTransfer));
+      } catch { /* login/server transitions are handled by the surrounding UI */ }
+    };
+    poll();
+    const timer = window.setInterval(poll, 800);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, []);
+
+  const startClientUpload = useCallback(async (localPath: string, remoteDir: string) => {
+    await clientApi.upload(localPath, remoteDir);
+    await refresh();
+  }, [refresh]);
+
+  const startDownload = useCallback(async (item: { id: number; path: string; size: number }) => {
+    const name = item.path.split("/").pop() || "download";
+    await clientApi.download({ path: item.path, name });
+    await refresh();
+  }, [refresh]);
+
+  const cancel = useCallback(async (id: string) => {
+    await clientApi.cancel(id);
+    await refresh();
+  }, [refresh]);
+
+  const remove = useCallback(async (id: string) => {
+    await clientApi.remove(id);
+    setTransfers((list) => list.filter((t) => t.id !== id));
+  }, []);
+
+  const clearFinished = useCallback(() => {
+    const finished = transfers.filter((t) => t.status === "done" || t.status === "error" || t.status === "canceled");
+    Promise.all(finished.map((t) => clientApi.remove(t.id).catch(() => undefined))).then(refresh);
+  }, [transfers, refresh]);
+
+  const noop = useCallback(() => {}, []);
+  const startUpload = useCallback(() => {
+    throw new Error("客户端模式请从本地文件选择器添加上传任务");
+  }, []);
+
+  return (
+    <Ctx.Provider value={{
+      clientMode: true,
+      transfers,
+      startUpload,
+      startClientUpload,
+      startDownload,
+      pause: noop,
+      resume: noop,
+      cancel,
+      remove,
+      clearFinished,
+      resolveJob: noop,
+    }}>
       {children}
     </Ctx.Provider>
   );

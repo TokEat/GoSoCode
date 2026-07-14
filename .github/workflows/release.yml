@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target.os }}/${{ matrix.target.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: linux,   arch: amd64, ext: tar.gz, sh: '' }
+          - { os: linux,   arch: arm64, ext: tar.gz, sh: '' }
+          - { os: windows, arch: amd64, ext: zip,    sh: '.exe' }
+          - { os: windows, arch: arm64, ext: zip,    sh: '.exe' }
+          - { os: darwin,  arch: amd64, ext: tar.gz, sh: '' }
+          - { os: darwin,  arch: arm64, ext: tar.gz, sh: '' }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          cd ..
+          mkdir -p backend/internal/webui/static
+          cp -r frontend/dist/. backend/internal/webui/static/
+
+      - name: Build (Linux)
+        if: matrix.target.os == 'linux'
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.target.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          for bin in server client; do
+            go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o dist/${bin} \
+              ./backend/cmd/${bin}
+          done
+
+      - name: Build (Windows)
+        if: matrix.target.os == 'windows'
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.target.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          for bin in server client; do
+            go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o dist/${bin}.exe \
+              ./backend/cmd/${bin}
+          done
+
+      - name: Build (macOS)
+        if: matrix.target.os == 'darwin'
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.target.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          for bin in server client; do
+            go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o dist/${bin} \
+              ./backend/cmd/${bin}
+          done
+
+      - name: Package (tar.gz)
+        if: matrix.target.ext == 'tar.gz'
+        run: |
+          cd dist
+          tar -czf ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.tar.gz \
+            server client
+          cd ..
+          mkdir -p artifacts
+          mv gosocode-*.tar.gz artifacts/
+
+      - name: Package (zip)
+        if: matrix.target.ext == 'zip'
+        run: |
+          cd dist
+          7z a ../gosocode-${{ github.ref_name }}-${{ matrix.target.os }}-${{ matrix.target.arch }}.zip \
+            server.exe client.exe
+          cd ..
+          mkdir -p artifacts
+          mv gosocode-*.zip artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gosocode-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip

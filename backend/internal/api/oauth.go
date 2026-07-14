@@ -66,8 +66,8 @@ func (s *Server) handleOAuthURL(c *gin.Context) {
 		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "尚未配置百度应用 AppKey/SecretKey，请先在「百度应用配置」中填写"})
 		return
 	}
-	state := c.DefaultQuery("state", "gosocode")
-	c.JSON(http.StatusOK, gin.H{"url": s.client.AuthCodeURL(bc.RedirectURI, state), "oob": bc.RedirectURI == "oob"})
+	state := s.mintOAuthState()
+	c.JSON(http.StatusOK, gin.H{"url": s.client.AuthCodeURL(bc.RedirectURI, state), "oob": bc.RedirectURI == "oob", "state": state})
 }
 
 // handleOAuthExchange completes the "oob" (out-of-band) flow used when Baidu
@@ -122,7 +122,15 @@ func (s *Server) handleOAuthExchange(c *gin.Context) {
 // responds with an HTML page that notifies the opener window (the Nodes page)
 // via postMessage and then closes itself, so the whole flow is driven from the
 // frontend with no manual token entry.
+//
+// Public route: the browser is redirected here by Baidu so we cannot require a
+// JWT. Instead we require the `state` parameter to be a single-use token
+// minted by handleOAuthURL — see Server.mintOAuthState / consumeOAuthState.
 func (s *Server) handleOAuthCallback(c *gin.Context) {
+	if !s.consumeOAuthState(c.Query("state")) {
+		s.oauthResult(c, false, 0, "授权已失效或 state 不合法，请回到接入页面重新发起")
+		return
+	}
 	code := c.Query("code")
 	if code == "" {
 		s.oauthResult(c, false, 0, "缺少授权码 code")

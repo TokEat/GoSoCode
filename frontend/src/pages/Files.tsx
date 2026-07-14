@@ -4,6 +4,8 @@ import { Card, statusBadge, useToast, useDialog } from "../ui";
 import { humanSize, fmtTime } from "../lib/format";
 import { useTransfers } from "../transfer";
 import { JobEvent } from "../App";
+import LocalFilePicker from "../LocalFilePicker";
+import { LocalEntry } from "../lib/api";
 
 // ---- path helpers ----------------------------------------------------------
 
@@ -96,6 +98,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const [cwd, setCwd] = useState("/");
   const [menu, setMenu] = useState<Menu | null>(null);
   const [clip, setClip] = useState<Clip | null>(null);
+  const [localPicker, setLocalPicker] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
   const dialog = useDialog();
@@ -134,7 +137,24 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
 
   // ---- actions -------------------------------------------------------------
 
-  function pickFile() { fileRef.current?.click(); }
+  function pickFile() {
+    if (transfers.clientMode) setLocalPicker(true);
+    else fileRef.current?.click();
+  }
+
+  async function onLocalFilePicked(entry: LocalEntry) {
+    if (storage && storage.total > 0 && entry.size > storage.free) {
+      toast("err", `文件 ${humanSize(entry.size)} 超过系统可用容量 ${humanSize(storage.free)}，上传已取消`);
+      return;
+    }
+    try {
+      await transfers.startClientUpload(entry.path, cwd);
+      setLocalPicker(false);
+      toast("ok", "本机上传任务已创建，可在「传输管理」查看进度");
+    } catch (e: any) {
+      toast("err", e.message || "创建上传任务失败");
+    }
+  }
 
   function onFilePicked() {
     if (cwd === "/") { toast("info", "请先进入一个挂载节点"); return; }
@@ -157,9 +177,15 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     run(api.createFolder(normDir(cwd) + name.trim()), "文件夹已创建");
   }
 
-  function doDownload(item: FileItem) {
-    transfers.startDownload(item);
-    toast("info", "已加入下载队列,可在「传输管理」查看进度");
+  async function doDownload(item: FileItem) {
+    try {
+      await transfers.startDownload(item);
+      toast("info", transfers.clientMode
+        ? "本机下载任务已创建，可在「传输管理」查看进度"
+        : "已加入下载队列，可在「传输管理」查看进度");
+    } catch (e: any) {
+      toast("err", e.message || "创建下载任务失败");
+    }
   }
 
   async function doRename(path: string) {
@@ -219,11 +245,12 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
       action={
         <div className="row">
           <button className="btn ghost sm" onClick={newFolder} disabled={cwd === "/"}>新建文件夹</button>
-          <button className="btn" onClick={pickFile} disabled={cwd === "/"}>上传文件</button>
+          <button className="btn" onClick={pickFile} disabled={cwd === "/"}>{transfers.clientMode ? "选择本机文件" : "上传文件"}</button>
         </div>
       }
     >
       <input ref={fileRef} type="file" style={{ display: "none" }} onChange={onFilePicked} />
+      <LocalFilePicker open={localPicker} onClose={() => setLocalPicker(false)} onSelect={onLocalFilePicked} />
 
       {/* capacity */}
       <div className="cap-wrap">

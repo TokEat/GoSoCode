@@ -2,6 +2,8 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"log"
 	"net/http"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 	"gosocode/internal/realtime"
+	"gosocode/internal/webui"
 )
 
 type Server struct {
@@ -41,14 +44,26 @@ type Server struct {
 
 	// serializes agent progress bitmap updates (read-modify-write)
 	agentMu sync.Mutex
+
+	// single-use nonces for Baidu OAuth callback. The /api/admin/oauth/url
+	// handler mints a random state and stores it here; /api/oauth/callback
+	// (public, because Baidu redirects the browser) only honours a state
+	// that exists, is fresh, and has not been consumed. Stops an attacker
+	// who can read a leaked code from registering a node by hitting the
+	// callback with an arbitrary code.
+	oauthStatesMu sync.Mutex
+	oauthStates   map[string]time.Time
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baidu.Client,
 	co *coord.Coordinator, jobs *job.Manager, hub *realtime.Hub, meter *metrics.Meter) *Server {
-	return &Server{
+	srv := &Server{
 		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter,
 		streamStates: map[string]*streamState{},
+		oauthStates:  map[string]time.Time{},
 	}
+	go srv.streamPartialJanitor()
+	return srv
 }
 
 func (s *Server) Router() *gin.Engine {
@@ -66,9 +81,11 @@ func (s *Server) Router() *gin.Engine {
 	// which is how the web UI auto-detects what it is bound to.
 	r.GET("/api/client/info", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"mode": "server"}) })
 
-	r.POST("/api/register", s.handleRegister)
 	r.POST("/api/login", s.handleLogin)
-	r.GET("/api/oauth/callback", s.handleOAuthCallback) // Baidu redirects here
+	// Public Baidu callback (the browser is redirected here by Baidu, so the
+	// admin can't carry a JWT header). Protected by a one-time `state` we
+	// generate when starting the OAuth flow — see handleOAuthURL.
+	r.GET("/api/oauth/callback", s.handleOAuthCallback)
 
 	auth := r.Group("/api", s.authMiddleware())
 	{
@@ -141,24 +158,38 @@ func (s *Server) Router() *gin.Engine {
 
 	r.GET("/api/ws", s.handleWS) // token passed as query param
 
-	// Serve the built web UI (frontend/dist copied to cfg.WebUIDir) when present,
-	// with SPA fallback to index.html. Both server and CLI client bind the same UI.
+	// Serve the web UI with SPA fallback: an on-disk dir (cfg.WebUIDir) wins so
+	// deployments can override, otherwise the UI embedded in the binary is used.
+	// Both server and CLI client bind the same UI this way.
+	diskUI := ""
 	if dir := s.cfg.WebUIDir; dir != "" {
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
-			r.NoRoute(func(c *gin.Context) {
-				p := c.Request.URL.Path
-				if strings.HasPrefix(p, "/api/") || c.Request.Method != http.MethodGet {
-					c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-					return
-				}
-				fp := filepath.Join(dir, filepath.FromSlash(path.Clean("/"+p)))
+			diskUI = dir
+		}
+	}
+	embedded := webui.Handler()
+	if diskUI != "" || embedded != nil {
+		r.NoRoute(func(c *gin.Context) {
+			p := c.Request.URL.Path
+			if strings.HasPrefix(p, "/api/") || c.Request.Method != http.MethodGet {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+				return
+			}
+			if diskUI != "" {
+				fp := filepath.Join(diskUI, filepath.FromSlash(path.Clean("/"+p)))
 				if st, err := os.Stat(fp); err == nil && !st.IsDir() {
 					c.File(fp)
 					return
 				}
-				c.File(filepath.Join(dir, "index.html"))
-			})
-			log.Printf("web ui: serving %s", dir)
+				c.File(filepath.Join(diskUI, "index.html"))
+				return
+			}
+			embedded.ServeHTTP(c.Writer, c.Request)
+		})
+		if diskUI != "" {
+			log.Printf("web ui: serving %s", diskUI)
+		} else {
+			log.Printf("web ui: serving embedded assets")
 		}
 	}
 	return r
@@ -193,6 +224,42 @@ func (s *Server) baiduConfig() models.BaiduAppConfig {
 		bc.RedirectURI = s.cfg.RedirectURI
 	}
 	return bc
+}
+
+// mintOAuthState returns a fresh 32-char hex state and remembers it for 5
+// minutes. /api/oauth/callback only accepts a state minted here. Garbage-
+// collects expired entries on every mint.
+func (s *Server) mintOAuthState() string {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	state := hex.EncodeToString(raw[:])
+	cutoff := time.Now().Add(5 * time.Minute)
+	s.oauthStatesMu.Lock()
+	defer s.oauthStatesMu.Unlock()
+	for k, exp := range s.oauthStates {
+		if exp.Before(time.Now()) {
+			delete(s.oauthStates, k)
+		}
+	}
+	s.oauthStates[state] = cutoff
+	return state
+}
+
+// consumeOAuthState returns true exactly once for a state minted in the last
+// 5 minutes. Any further call with the same state returns false.
+func (s *Server) consumeOAuthState(state string) bool {
+	if state == "" {
+		return false
+	}
+	s.oauthStatesMu.Lock()
+	defer s.oauthStatesMu.Unlock()
+	exp, ok := s.oauthStates[state]
+	if !ok || exp.Before(time.Now()) {
+		delete(s.oauthStates, state)
+		return false
+	}
+	delete(s.oauthStates, state)
+	return true
 }
 
 func itoa(u uint) string {

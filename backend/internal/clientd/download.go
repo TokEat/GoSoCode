@@ -7,34 +7,57 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
-	"strings"
+	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	dlSegSize   = 8 << 20  // per-connection segment
-	dlReportAt  = 32 << 20 // report transferred bytes to the server this often
-	dlRetryEach = 4        // attempts per segment (with dlink re-resolve)
+	dlSegSize     = 8 << 20  // per-connection segment
+	dlReportAt    = 32 << 20 // report transferred bytes to the server this often
+	dlRetryEach   = 5        // attempts per segment (with dlink re-resolve)
+	dlRetryRounds = 6        // reconciliation rounds that only retry missing segments
 )
 
 type dlInfo struct {
-	Dlink string `json:"dlink"`
-	Token string `json:"access_token"`
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
+	Dlink   string `json:"dlink"`
+	Token   string `json:"access_token"`
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	NodeID  uint   `json:"node_id"`
+	VipType int    `json:"vip_type"`
 }
 
-// dlSource holds the resolved dlink and refreshes it once when a segment hits
-// a 4xx (dlinks are temporary and can be invalidated early).
+// downloadConnsForTier keeps ordinary accounts conservative while still
+// allowing two ranged connections. Paid tiers may use more, but never beyond
+// the operator's -dl-conns setting.
+func downloadConnsForTier(requested, vipType int) int {
+	limit := 2
+	if vipType == 1 {
+		limit = 4
+	} else if vipType >= 2 {
+		limit = 8
+	}
+	if requested < 1 {
+		requested = 1
+	}
+	if requested > limit {
+		requested = limit
+	}
+	return requested
+}
+
+// dlSource holds the resolved dlink and refreshes it when a segment hits a
+// 4xx (dlinks are temporary and can be invalidated early).
 type dlSource struct {
-	d      *Daemon
-	auth   string
-	fileID string
-	mu     sync.Mutex
-	info   *dlInfo
+	d    *Daemon
+	auth string
+	path string
+	task *Task
+	mu   sync.Mutex
+	info *dlInfo
 }
 
 func (s *dlSource) get() *dlInfo {
@@ -49,7 +72,13 @@ func (s *dlSource) refresh(ctx context.Context, stale *dlInfo) error {
 	if s.info != stale { // another worker already refreshed
 		return nil
 	}
-	info, _, _, err := s.d.resolve(ctx, s.auth, s.fileID)
+	s.task.logf("refreshing expired cloud download link")
+	var info *dlInfo
+	err := retryTask(ctx, s.task, 5, "refresh cloud download link", func() error {
+		var e error
+		info, _, e = s.d.resolve(ctx, s.auth, s.path)
+		return e
+	})
 	if err != nil {
 		return err
 	}
@@ -57,168 +86,202 @@ func (s *dlSource) refresh(ctx context.Context, stale *dlInfo) error {
 	return nil
 }
 
-func (d *Daemon) resolve(ctx context.Context, auth, fileID string) (*dlInfo, int, []byte, error) {
-	status, raw, err := d.serverJSON(ctx, auth, http.MethodGet, "/api/agent/download/resolve?id="+fileID, nil)
+func (d *Daemon) resolve(ctx context.Context, auth, logicalPath string) (*dlInfo, []byte, error) {
+	status, raw, err := d.serverJSON(ctx, auth, http.MethodGet,
+		"/api/agent/download/resolve?path="+url.QueryEscape(logicalPath), nil)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, nil, err
 	}
 	if status != http.StatusOK {
-		return nil, status, raw, fmt.Errorf("resolve HTTP %d", status)
+		return nil, raw, fmt.Errorf("%s", serverErrMsg(raw, "无法获取下载地址"))
 	}
 	var info dlInfo
 	if err := json.Unmarshal(raw, &info); err != nil || info.Dlink == "" {
-		return nil, status, raw, fmt.Errorf("服务端响应异常")
+		return nil, raw, fmt.Errorf("服务端响应异常")
 	}
-	return &info, status, raw, nil
+	return &info, raw, nil
 }
 
-// parseRange handles the single-range forms the web UI sends: "bytes=a-" and
-// "bytes=a-b".
-func parseRange(h string, size int64) (start, end int64, ok bool) {
-	h = strings.TrimPrefix(h, "bytes=")
-	parts := strings.SplitN(h, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	start, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
-	if err != nil || start < 0 || start >= size {
-		return 0, 0, false
-	}
-	end = size - 1
-	if p := strings.TrimSpace(parts[1]); p != "" {
-		if e, err := strconv.ParseInt(p, 10, 64); err == nil && e >= start && e < size {
-			end = e
-		}
-	}
-	return start, end, true
-}
-
-// handleDownload streams a file to the browser while fetching it from Baidu
-// directly with several parallel ranged connections (ordered re-assembly), so
-// the effective speed is the sum of the connections and no byte touches the
-// platform server.
-func (d *Daemon) handleDownload(w http.ResponseWriter, r *http.Request, fileID string) {
-	auth := r.Header.Get("Authorization")
-	info, status, raw, err := d.resolve(r.Context(), auth, fileID)
+// runDownload executes one download entirely inside this process: resolve the
+// dlink through the server, fetch segments from Baidu with parallel ranged
+// connections, write them at their offsets in a local .gscpart file, then
+// rename into the configured download directory.
+func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
+	t.logf("resolving cloud download source path=%q", logicalPath)
+	var info *dlInfo
+	err := retryTask(ctx, t, 5, "resolve cloud download source", func() error {
+		var e error
+		info, _, e = d.resolve(ctx, t.auth, logicalPath)
+		return e
+	})
 	if err != nil {
-		if raw != nil {
-			passthrough(w, status, raw)
-		} else {
-			writeErr(w, http.StatusBadGateway, "无法连接服务端: "+err.Error())
+		t.fail(err.Error())
+		return
+	}
+	t.set(func(t *Task) {
+		if info.Name != "" {
+			t.Name = info.Name
 		}
+		t.Size = info.Size
+	})
+	t.logf("download source resolved node=%d vip_type=%d name=%q size=%d", info.NodeID, info.VipType, info.Name, info.Size)
+	t.setStatus("running")
+	if ctx.Err() != nil {
 		return
 	}
 
-	start, end := int64(0), info.Size-1
-	ranged := false
-	if rh := r.Header.Get("Range"); rh != "" && info.Size > 0 {
-		if s0, e0, ok := parseRange(rh, info.Size); ok {
-			start, end, ranged = s0, e0, true
-		}
-	}
-
-	h := w.Header()
-	h.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, info.Name))
-	h.Set("Accept-Ranges", "bytes")
-	if info.Size <= 0 { // empty file: headers only
-		h.Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
+	cfg := d.config()
+	if err := os.MkdirAll(cfg.DownloadDir, 0o755); err != nil {
+		t.fail("无法创建下载目录: " + err.Error())
 		return
 	}
-	length := end - start + 1
-	h.Set("Content-Length", strconv.FormatInt(length, 10))
-	if ranged {
-		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size))
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
+	target := uniquePath(cfg.DownloadDir, t.Name)
+	part := target + ".gscpart"
+	t.logf("opening local target part=%q final=%q", part, target)
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+	if err != nil {
+		t.fail("无法创建本地文件: " + err.Error())
+		return
 	}
 
-	nseg := int((length + dlSegSize - 1) / dlSegSize)
-	conns := d.opts.DLConns
-	if conns > nseg {
-		conns = nseg
-	}
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	src := &dlSource{d: d, auth: auth, fileID: fileID, info: info}
-
-	results := make([]chan []byte, nseg)
-	for i := range results {
-		results[i] = make(chan []byte, 1)
-	}
-	var next int64
-	var fetchErr atomic.Value
-	worker := func() {
-		for {
-			i := int(atomic.AddInt64(&next, 1) - 1)
-			if i >= nseg || ctx.Err() != nil {
-				return
-			}
-			s0 := start + int64(i)*dlSegSize
-			e0 := s0 + dlSegSize - 1
-			if e0 > end {
-				e0 = end
-			}
-			data, err := src.fetchSegment(ctx, s0, e0)
-			if err != nil {
-				fetchErr.Store(err)
-				cancel()
-				return
-			}
-			select {
-			case results[i] <- data:
-			case <-ctx.Done():
-				return
-			}
+	var reported int64 // bytes not yet reported to the server
+	cleanup := func(ok bool) {
+		f.Close()
+		if !ok {
+			_ = os.Remove(part)
+		}
+		if n := atomic.SwapInt64(&reported, 0); n > 0 {
+			d.reportDown(t.auth, info.NodeID, n)
 		}
 	}
-	for k := 0; k < conns; k++ {
-		go worker()
-	}
 
-	flusher, _ := w.(http.Flusher)
-	var written, unreported int64
-	for i := 0; i < nseg; i++ {
-		var data []byte
-		select {
-		case data = <-results[i]:
-		case <-ctx.Done():
-			if e, _ := fetchErr.Load().(error); e != nil {
-				log.Printf("[client] 直连下载中断 file=%s after %d bytes: %v", fileID, written, e)
+	if info.Size > 0 {
+		src := &dlSource{d: d, auth: t.auth, path: logicalPath, task: t, info: info}
+		nseg := int((info.Size + dlSegSize - 1) / dlSegSize)
+		conns := downloadConnsForTier(d.opts.DLConns, info.VipType)
+		if conns > nseg {
+			conns = nseg
+		}
+		t.logf("segment download started segments=%d concurrency=%d requested_concurrency=%d segment_size=%d", nseg, conns, d.opts.DLConns, dlSegSize)
+		progress := make([]int64, nseg)
+		var progressMu sync.Mutex
+		setSegmentProgress := func(i int, current int64) {
+			progressMu.Lock()
+			delta := current - progress[i]
+			progress[i] = current
+			progressMu.Unlock()
+			if delta != 0 {
+				t.addDone(delta)
 			}
-			d.reportDown(auth, fileID, unreported)
+		}
+		completed := make([]bool, nseg)
+		pending := make([]int, nseg)
+		for i := range pending {
+			pending[i] = i
+		}
+		var lastErr error
+		for round := 0; round < dlRetryRounds && len(pending) > 0; round++ {
+			t.logf("download reconciliation round=%d/%d missing_segments=%d", round+1, dlRetryRounds, len(pending))
+			var next int64
+			var errMu sync.Mutex
+			var wg sync.WaitGroup
+			for k := 0; k < conns; k++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						at := int(atomic.AddInt64(&next, 1) - 1)
+						if at >= len(pending) || ctx.Err() != nil {
+							return
+						}
+						i := pending[at]
+						s0 := int64(i) * dlSegSize
+						e0 := s0 + dlSegSize - 1
+						if e0 > info.Size-1 {
+							e0 = info.Size - 1
+						}
+						data, err := src.fetchSegment(ctx, s0, e0, func(current int64) {
+							setSegmentProgress(i, current)
+						})
+						if err == nil {
+							_, err = f.WriteAt(data, s0)
+							if err != nil {
+								setSegmentProgress(i, 0)
+								err = fmt.Errorf("写入本地文件失败: %v", err)
+							}
+						}
+						if err != nil {
+							errMu.Lock()
+							lastErr = err
+							errMu.Unlock()
+							continue
+						}
+						completed[i] = true
+						if atomic.AddInt64(&reported, int64(len(data))) >= dlReportAt {
+							d.reportDown(t.auth, info.NodeID, atomic.SwapInt64(&reported, 0))
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if ctx.Err() != nil { // user cancel
+				t.logf("download workers stopped by cancellation")
+				cleanup(false)
+				return
+			}
+			pending = pending[:0]
+			for i, done := range completed {
+				if !done {
+					pending = append(pending, i)
+				}
+			}
+			if len(pending) > 0 && round < dlRetryRounds-1 {
+				t.logf("download round incomplete; preserving %d completed segments and retrying %d missing segments", nseg-len(pending), len(pending))
+				if err := waitTaskRetry(ctx, t, "download missing segments", round+1); err != nil {
+					cleanup(false)
+					return
+				}
+			}
+		}
+		if len(pending) > 0 {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("unknown network error")
+			}
+			t.fail(fmt.Sprintf("仍有 %d 个下载分段未完成: %v", len(pending), lastErr))
+			cleanup(false)
 			return
 		}
-		if _, err := w.Write(data); err != nil {
-			cancel() // browser went away; it resumes via Range
-			d.reportDown(auth, fileID, unreported+int64(len(data)))
-			return
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		written += int64(len(data))
-		unreported += int64(len(data))
-		if unreported >= dlReportAt {
-			d.reportDown(auth, fileID, unreported)
-			unreported = 0
-		}
+		t.logf("all download segments written bytes=%d", info.Size)
 	}
-	d.reportDown(auth, fileID, unreported)
+
+	cleanup(true)
+	if err := os.Rename(part, target); err != nil {
+		t.fail("保存本地文件失败: " + err.Error())
+		return
+	}
+	t.set(func(t *Task) { t.LocalPath = target })
+	t.setStatus("done")
+	t.logf("completed remote=%q local=%q bytes=%d", t.RemotePath, target, info.Size)
+
+	// history entry, same as the browser flow does on completion
+	body, _ := json.Marshal(map[string]any{"kind": "download", "name": t.Name, "path": t.RemotePath, "size": info.Size})
+	bg, cancelBg := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelBg()
+	_, _, _ = d.serverJSON(bg, t.auth, http.MethodPost, "/api/transfers/log", body)
 }
 
 // fetchSegment reads one ranged segment from Baidu, re-resolving the dlink on
 // upstream errors (it may have expired mid-download).
-func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64) ([]byte, error) {
+func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64, onProgress func(int64)) ([]byte, error) {
 	rng := fmt.Sprintf("bytes=%d-%d", s0, e0)
 	wantLen := e0 - s0 + 1
 	var lastErr error
 	for attempt := 0; attempt < dlRetryEach; attempt++ {
+		onProgress(0)
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				onProgress(0)
 				return nil, ctx.Err()
 			case <-time.After(time.Duration(300*(1<<attempt)) * time.Millisecond):
 			}
@@ -227,6 +290,7 @@ func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64) ([]byte, erro
 		resp, err := s.d.baidu.OpenDownload(ctx, info.Token, info.Dlink, rng)
 		if err != nil {
 			lastErr = err
+			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
 			continue
 		}
 		if resp.StatusCode >= 400 {
@@ -235,37 +299,58 @@ func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64) ([]byte, erro
 			if err := s.refresh(ctx, info); err != nil {
 				lastErr = fmt.Errorf("云端直链失效且无法刷新: %w", err)
 			}
+			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
 			continue
 		}
 		// 200 instead of 206 means Range was ignored; only usable from offset 0.
 		if resp.StatusCode == http.StatusOK && s0 != 0 {
 			resp.Body.Close()
-			lastErr = fmt.Errorf("云端不支持断点续传")
+			lastErr = fmt.Errorf("云端不支持分段下载")
+			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
 			continue
 		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, wantLen))
+		data := make([]byte, wantLen)
+		var received int64
+		var readErr error
+		for received < wantLen {
+			n, e := resp.Body.Read(data[received:])
+			if n > 0 {
+				received += int64(n)
+				onProgress(received)
+			}
+			if e != nil {
+				if e != io.EOF {
+					readErr = e
+				}
+				break
+			}
+		}
 		resp.Body.Close()
-		if err != nil || int64(len(data)) != wantLen {
-			lastErr = fmt.Errorf("读取云端数据不完整: %v", err)
+		if readErr != nil || received != wantLen {
+			lastErr = fmt.Errorf("读取云端数据不完整: received=%d want=%d error=%v", received, wantLen, readErr)
+			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
 			continue
 		}
 		return data, nil
 	}
+	onProgress(0)
 	return nil, lastErr
 }
 
 // reportDown tells the server how many bytes moved directly (traffic
-// accounting + live chart). Uses its own context: the browser request may
-// already be gone when the final report fires.
-func (d *Daemon) reportDown(auth, fileID string, bytes int64) {
+// accounting + live chart). Uses its own context: the task may already be
+// canceled when the final report fires.
+func (d *Daemon) reportDown(auth string, nodeID uint, bytes int64) {
 	if bytes <= 0 {
 		return
 	}
-	id, _ := strconv.Atoi(fileID)
-	body, _ := json.Marshal(map[string]any{"file_id": id, "bytes": bytes})
+	body, _ := json.Marshal(map[string]any{"node_id": nodeID, "bytes": bytes})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if _, _, err := d.serverJSON(ctx, auth, http.MethodPost, "/api/agent/download/report", body); err != nil {
-		log.Printf("[client] 下载流量上报失败 file=%s bytes=%d: %v", fileID, bytes, err)
+	status, raw, err := d.serverJSON(ctx, auth, http.MethodPost, "/api/agent/download/report", body)
+	if err != nil {
+		log.Printf("[client] 下载流量上报失败 node=%d bytes=%d: %v", nodeID, bytes, err)
+	} else if status != http.StatusOK {
+		log.Printf("[client] 下载流量上报失败 node=%d bytes=%d HTTP=%d error=%s", nodeID, bytes, status, serverErrMsg(raw, "unknown"))
 	}
 }

@@ -123,6 +123,7 @@ type StreamSession struct {
 	BlockList      string // JSON array of per-slice hex md5
 	DoneBitmap     string
 	DoneCount      int
+	Completed      bool `gorm:"default:false"` // completion receipt; makes finish idempotent across lost responses
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }

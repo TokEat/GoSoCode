@@ -67,7 +67,6 @@ const json = (p: string, method: string, body?: any) =>
 export const api = {
   // auth + profile
   login: (username: string, password: string) => json("/login", "POST", { username, password }),
-  register: (username: string, password: string) => json("/register", "POST", { username, password }),
   me: (): Promise<Me> => json("/me", "GET"),
   changePassword: (oldp: string, newp: string) => json("/me/password", "PUT", { old_password: oldp, new_password: newp }),
 
@@ -113,7 +112,30 @@ export const api = {
   logs: (): Promise<LogItem[]> => json("/admin/logs", "GET").then((r) => r.logs),
 };
 
-export interface ClientInfo { mode: "client" | "server"; window?: number; dl_conns?: number; server?: string; }
+export interface ClientInfo {
+  mode: "client" | "server";
+  configured?: boolean;
+  window?: number;
+  dl_conns?: number;
+  server?: string;
+  download_dir?: string;
+}
+
+export interface LocalEntry { name: string; path: string; dir: boolean; size: number; }
+export interface LocalDirectory { path: string; parent: string; entries: LocalEntry[]; drives?: LocalEntry[]; }
+export interface ClientTask {
+  id: string;
+  kind: "upload" | "download";
+  name: string;
+  local_path: string;
+  remote_path: string;
+  size: number;
+  done: number;
+  status: "waiting" | "hashing" | "running" | "done" | "error" | "canceled";
+  error?: string;
+  speed: number;
+  created_at: string;
+}
 
 // Mode probe: the local CLI client intercepts this path and answers
 // mode=client; the server answers mode=server. Lets the UI auto-detect
@@ -128,6 +150,20 @@ export async function clientInfo(): Promise<ClientInfo> {
     return { mode: "server" };
   }
 }
+
+export const clientApi = {
+  saveConfig: (config: { server?: string; download_dir?: string }): Promise<ClientInfo> =>
+    json("/client/config", "PUT", config),
+  localFiles: (path = ""): Promise<LocalDirectory> =>
+    json(`/client/fs${path ? `?path=${encodeURIComponent(path)}` : ""}`, "GET"),
+  tasks: (): Promise<ClientTask[]> => json("/client/transfers", "GET").then((r) => r.tasks),
+  upload: (localPath: string, remoteDir: string): Promise<{ id: string }> =>
+    json("/client/transfers/upload", "POST", { local_path: localPath, remote_dir: remoteDir }),
+  download: (file: { path: string; name: string }): Promise<{ id: string }> =>
+    json("/client/transfers/download", "POST", { path: file.path, name: file.name }),
+  cancel: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}/cancel`, "POST"),
+  remove: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}`, "DELETE"),
+};
 
 export function openProgressSocket(onEvent: (e: any) => void): WebSocket {
   const proto = location.protocol === "https:" ? "wss" : "ws";

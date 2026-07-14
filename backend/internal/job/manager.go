@@ -83,10 +83,12 @@ func (m *Manager) cleanupStaleUploads() {
 	var staleStreams []models.StreamSession
 	m.db.Where("updated_at < ?", time.Now().Add(-24*time.Hour)).Find(&staleStreams)
 	for _, s := range staleStreams {
-		m.pool.Release(s.BaiduAccountID)
-		if s.FileID != 0 {
-			m.db.Model(&models.File{}).Where("id = ? AND status = ?", s.FileID, "uploading").
-				Update("status", "failed")
+		if !s.Completed {
+			m.pool.Release(s.BaiduAccountID)
+			if s.FileID != 0 {
+				m.db.Model(&models.File{}).Where("id = ? AND status = ?", s.FileID, "uploading").
+					Update("status", "failed")
+			}
 		}
 		m.db.Delete(&models.StreamSession{}, "id = ?", s.ID)
 		log.Printf("[stream] janitor reaped stale session=%s path=%s", s.ID, s.LogicalPath)

@@ -37,6 +37,19 @@ import (
 // session, while different sessions and body receives still run in parallel.
 type streamState struct {
 	mu sync.Mutex
+
+	// partial slice assemblies for the sub-chunked browser->server leg
+	// (?off=). Guarded by its own mutex so receives never wait behind mu,
+	// which is held for the duration of a server->Baidu push.
+	pmu     sync.Mutex
+	partial map[int]*slicePartial
+}
+
+// slicePartial is one slice being assembled from sequential sub-chunks.
+type slicePartial struct {
+	buf     []byte
+	next    int64 // bytes received so far; the only offset accepted next
+	lastUse time.Time
 }
 
 func (s *Server) streamStateFor(id string) *streamState {
@@ -60,6 +73,32 @@ func (s *Server) streamActive() int {
 	s.streamMu.Lock()
 	defer s.streamMu.Unlock()
 	return len(s.streamStates)
+}
+
+// streamPartialJanitor drops slice assembly buffers that stopped receiving
+// sub-chunks (browser gone mid-slice), so abandoned sessions don't pin
+// window x slice_size of memory until the 24h session janitor runs.
+func (s *Server) streamPartialJanitor() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		cutoff := time.Now().Add(-20 * time.Minute)
+		s.streamMu.Lock()
+		states := make([]*streamState, 0, len(s.streamStates))
+		for _, st := range s.streamStates {
+			states = append(states, st)
+		}
+		s.streamMu.Unlock()
+		for _, st := range states {
+			st.pmu.Lock()
+			for seq, p := range st.partial {
+				if p.lastUse.Before(cutoff) {
+					delete(st.partial, seq)
+				}
+			}
+			st.pmu.Unlock()
+		}
+	}
 }
 
 func sliceCount(size, sliceSize int64) int {
@@ -306,11 +345,65 @@ func (s *Server) handleStreamSlice(c *gin.Context) {
 
 	// Receiving the body is the browser->server leg; it runs outside the session
 	// lock so it overlaps with another slice's server->Baidu push (the pipeline).
-	data, err := io.ReadAll(io.LimitReader(c.Request.Body, sess.SliceSize+1))
-	if err != nil {
-		log.Printf("[stream] slice read error session=%s seq=%d: %v", id, seq, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "读取分片失败: " + err.Error()})
-		return
+	// With ?off= the slice arrives as small sequential sub-chunks assembled here:
+	// one huge request rarely survives a flaky link, small ones are cheap to
+	// retry, and a reconnect resumes from the acknowledged offset (409 expected).
+	var data []byte
+	if offStr := c.Query("off"); offStr != "" {
+		off, err := strconv.ParseInt(offStr, 10, 64)
+		if err != nil || off < 0 || off >= want {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid off"})
+			return
+		}
+		if sess.DoneBitmap[seq] == '1' { // retry of an already-synced slice
+			c.JSON(http.StatusOK, gin.H{"seq": seq, "done_count": sess.DoneCount, "total": sess.TotalSlices})
+			return
+		}
+		chunk, err := io.ReadAll(io.LimitReader(c.Request.Body, want-off+1))
+		if err != nil {
+			log.Printf("[stream] slice read error session=%s seq=%d off=%d: %v", id, seq, off, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "读取分片失败: " + err.Error()})
+			return
+		}
+		if off+int64(len(chunk)) > want {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "分片数据超长"})
+			return
+		}
+		st := s.streamStateFor(sess.ID)
+		st.pmu.Lock()
+		if st.partial == nil {
+			st.partial = map[int]*slicePartial{}
+		}
+		p := st.partial[seq]
+		if p == nil {
+			p = &slicePartial{buf: make([]byte, want)}
+			st.partial[seq] = p
+		}
+		if off != p.next {
+			expected := p.next
+			st.pmu.Unlock()
+			c.JSON(http.StatusConflict, gin.H{"error": "offset mismatch", "expected": expected})
+			return
+		}
+		copy(p.buf[off:], chunk)
+		p.next += int64(len(chunk))
+		p.lastUse = time.Now()
+		if p.next < want {
+			received := p.next
+			st.pmu.Unlock()
+			c.JSON(http.StatusOK, gin.H{"seq": seq, "received": received, "partial": true})
+			return
+		}
+		delete(st.partial, seq)
+		st.pmu.Unlock()
+		data = p.buf
+	} else {
+		data, err = io.ReadAll(io.LimitReader(c.Request.Body, sess.SliceSize+1))
+		if err != nil {
+			log.Printf("[stream] slice read error session=%s seq=%d: %v", id, seq, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "读取分片失败: " + err.Error()})
+			return
+		}
 	}
 	if int64(len(data)) != want {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("分片大小不符: got %d want %d", len(data), want)})
@@ -406,6 +499,10 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
 		return
 	}
+	if sess.Completed {
+		c.JSON(http.StatusOK, gin.H{"file_id": sess.FileID, "already_completed": true})
+		return
+	}
 	if sess.DoneCount < sess.TotalSlices {
 		c.JSON(http.StatusConflict, gin.H{"error": "仍有分片未同步", "need_seqs": needSeqs(sess.DoneBitmap)})
 		return
@@ -431,6 +528,16 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 		return
 	}
 	defer unlock()
+	// Another finish request may have completed while this request waited for
+	// the distributed path lock. Re-read to keep accounting exactly once.
+	if err := s.db.First(&sess, "id = ?", sess.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
+		return
+	}
+	if sess.Completed {
+		c.JSON(http.StatusOK, gin.H{"file_id": sess.FileID, "already_completed": true})
+		return
+	}
 
 	var blockList []string
 	_ = json.Unmarshal([]byte(sess.BlockList), &blockList)
@@ -448,24 +555,58 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		// create may have reached Baidu even when its response was lost or returned
+		// an ambiguous errno. Reconcile against a newly modified file before
+		// declaring failure so a successful upload is not retried from scratch.
+		var ref *baiduListRef
+		reconcileErr := streamRetry(3, "reconcile create "+sess.RemotePath, func() error {
+			var e error
+			ref, e = s.remoteItemByPath(c, acc, token, sess.RemotePath)
+			return e
+		})
+		if reconcileErr == nil && ref != nil && !ref.IsDir && ref.Size == sess.Size &&
+			ref.MTime >= sess.CreatedAt.Unix()-5 {
+			fsID = ref.FsID
+			log.Printf("[stream] create response ambiguous but remote file verified session=%s path=%s fsid=%d", sess.ID, sess.LogicalPath, fsID)
+			err = nil
+		}
+	}
+	if err != nil {
 		log.Printf("[stream] finish create failed session=%s path=%s: %v", sess.ID, sess.LogicalPath, err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
 
-	s.db.Model(&models.File{}).Where("id = ?", sess.FileID).
-		Updates(map[string]any{"fs_id": fsID, "size": sess.Size, "status": "ready", "updated_at": time.Now()})
-	s.pool.AddUsed(acc.ID, sess.Size)
-
-	s.db.Model(&models.User{}).Where("id = ?", uid).UpdateColumn("bytes_up", gorm.Expr("bytes_up + ?", sess.Size))
-	s.db.Model(&models.BaiduAccount{}).Where("id = ?", acc.ID).UpdateColumn("bytes_up", gorm.Expr("bytes_up + ?", sess.Size))
-	s.db.Create(&models.TransferLog{
-		UserID: uid, Kind: "upload", Name: path.Base(sess.LogicalPath),
-		Path: sess.LogicalPath, Size: sess.Size, At: time.Now(),
-	})
-
-	s.pool.Release(acc.ID)
-	s.db.Delete(&models.StreamSession{}, "id = ?", sess.ID)
+	now := time.Now()
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.File{}).Where("id = ?", sess.FileID).
+			Updates(map[string]any{"fs_id": fsID, "size": sess.Size, "status": "ready", "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.User{}).Where("id = ?", uid).
+			UpdateColumn("bytes_up", gorm.Expr("bytes_up + ?", sess.Size)).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.BaiduAccount{}).Where("id = ?", acc.ID).Updates(map[string]any{
+			"quota_used":   gorm.Expr("quota_used + ?", sess.Size),
+			"bytes_up":     gorm.Expr("bytes_up + ?", sess.Size),
+			"current_load": gorm.Expr("CASE WHEN current_load > 0 THEN current_load - 1 ELSE 0 END"),
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&models.TransferLog{
+			UserID: uid, Kind: "upload", Name: path.Base(sess.LogicalPath),
+			Path: sess.LogicalPath, Size: sess.Size, At: now,
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.StreamSession{}).Where("id = ?", sess.ID).
+			Updates(map[string]any{"completed": true, "updated_at": now}).Error
+	}); err != nil {
+		log.Printf("[stream] finish accounting transaction failed session=%s: %v", sess.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "上传已到达云端，但本地记账失败，请重试"})
+		return
+	}
 	s.streamStateDrop(sess.ID)
 
 	log.Printf("[stream] finish ok session=%s path=%s bytes=%d fsid=%d", sess.ID, sess.LogicalPath, sess.Size, fsID)
@@ -487,8 +628,10 @@ func (s *Server) handleStreamCancel(c *gin.Context) {
 	}
 	var sess models.StreamSession
 	if err := s.db.Where("id = ? AND user_id = ?", in.SessionID, uid).First(&sess).Error; err == nil {
-		s.pool.Release(sess.BaiduAccountID)
-		s.db.Delete(&models.File{}, sess.FileID)
+		if !sess.Completed {
+			s.pool.Release(sess.BaiduAccountID)
+			s.db.Delete(&models.File{}, sess.FileID)
+		}
 		s.db.Delete(&models.StreamSession{}, "id = ?", sess.ID)
 		s.streamStateDrop(sess.ID)
 		log.Printf("[stream] cancel session=%s path=%s", sess.ID, sess.LogicalPath)

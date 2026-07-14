@@ -1,243 +1,384 @@
 package clientd
 
 import (
-	"crypto/md5"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
+	"sync"
+	"time"
+
+	"gosocode/internal/baidu"
 )
 
-// uploadSession is the client-side state of a direct-to-Baidu upload: enough
-// to push superfile2 slices without asking the server per slice. The server's
-// bitmap stays authoritative via the progress reports.
-type uploadSession struct {
-	ID         string
-	UploadID   string
-	RemotePath string
-	Token      string
-	Size       int64
-	SliceSize  int64
-	Total      int
-	BlockList  []string
+// uploadInit is the agent init response: everything needed to push slices to
+// Baidu without the server in the data path.
+type uploadInit struct {
+	SessionID   string `json:"session_id"`
+	UploadID    string `json:"upload_id"`
+	NeedSeqs    []int  `json:"need_seqs"`
+	Rapid       bool   `json:"rapid"`
+	SliceSize   int64  `json:"slice_size"`
+	Total       int    `json:"total"`
+	AccessToken string `json:"access_token"`
+	RemotePath  string `json:"remote_path"`
+
+	// upload server base URLs from locateupload; retries rotate through them
+	// because the default server intermittently answers empty HTTP 500s.
+	servers []string
 }
 
-// handlePlan forwards the plan to the server (as an agent, exempt from the
-// server-memory concurrency cap) and raises the advertised window: the
-// browser->client leg is localhost, so more slices in flight only cost this
-// machine's uplink.
-func (d *Daemon) handlePlan(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+func (s *uploadInit) pickServer(attempt int) string {
+	if len(s.servers) == 0 {
+		return ""
+	}
+	return s.servers[attempt%len(s.servers)]
+}
+
+// runUpload executes one upload entirely inside this process: local md5
+// pre-scan, agent init (server does precreate and hands back uploadid + node
+// token), windowed slice pushes straight to Baidu, then the regular stream
+// finish on the server (create + accounting).
+func (d *Daemon) runUpload(ctx context.Context, t *Task) {
+	// 1. plan: which slice size to hash with (node tier dependent)
+	t.logf("planning upload with server")
+	q := url.Values{}
+	q.Set("size", strconv.FormatInt(t.Size, 10))
+	q.Set("path", t.RemotePath)
 	q.Set("agent", "1")
-	status, raw, err := d.serverJSON(r.Context(), r.Header.Get("Authorization"),
-		http.MethodGet, "/api/files/stream/plan?"+q.Encode(), nil)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "无法连接服务端: "+err.Error())
-		return
-	}
-	var plan map[string]any
-	if status == http.StatusOK && json.Unmarshal(raw, &plan) == nil {
-		if enabled, _ := plan["enabled"].(bool); enabled {
-			if cur, _ := plan["window"].(float64); int(cur) < d.opts.Window {
-				plan["window"] = d.opts.Window
-			}
-			plan["mode"] = "client"
-			writeJSON(w, http.StatusOK, plan)
-			return
-		}
-	}
-	passthrough(w, status, raw)
-}
-
-// handleInit opens the session through the server's agent control plane, which
-// returns the node token + remote path for direct pushes. The browser gets the
-// same response shape as the server's stream init (credentials stripped).
-func (d *Daemon) handleInit(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "读取请求失败: "+err.Error())
-		return
-	}
-	status, raw, err := d.serverJSON(r.Context(), r.Header.Get("Authorization"),
-		http.MethodPost, "/api/agent/upload/init", body)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "无法连接服务端: "+err.Error())
-		return
-	}
-	if status != http.StatusOK {
-		passthrough(w, status, raw)
-		return
-	}
-
-	var out struct {
-		SessionID   string `json:"session_id"`
-		UploadID    string `json:"upload_id"`
-		NeedSeqs    []int  `json:"need_seqs"`
-		Rapid       bool   `json:"rapid"`
-		SliceSize   int64  `json:"slice_size"`
-		Total       int    `json:"total"`
-		AccessToken string `json:"access_token"`
-		RemotePath  string `json:"remote_path"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || out.SessionID == "" {
-		writeErr(w, http.StatusBadGateway, "服务端响应异常")
-		return
-	}
-	var in struct {
-		Size      int64    `json:"size"`
-		BlockList []string `json:"block_list"`
-	}
-	_ = json.Unmarshal(body, &in)
-
-	d.mu.Lock()
-	d.sessions[out.SessionID] = &uploadSession{
-		ID: out.SessionID, UploadID: out.UploadID, RemotePath: out.RemotePath,
-		Token: out.AccessToken, Size: in.Size, SliceSize: out.SliceSize,
-		Total: out.Total, BlockList: in.BlockList,
-	}
-	d.mu.Unlock()
-	log.Printf("[client] 上传会话 %s 已开启（直连百度，窗口 %d）", out.SessionID, d.opts.Window)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id": out.SessionID, "upload_id": out.UploadID,
-		"need_seqs": out.NeedSeqs, "rapid": out.Rapid,
-		"slice_size": out.SliceSize, "total": out.Total, "window": d.opts.Window,
-	})
-}
-
-// session returns local state for id, rebuilding it from the server after a
-// client restart so uploads survive the client process.
-func (d *Daemon) session(r *http.Request, id string) (*uploadSession, int) {
-	d.mu.Lock()
-	sess := d.sessions[id]
-	d.mu.Unlock()
-	if sess != nil {
-		return sess, 0
-	}
-	status, raw, err := d.serverJSON(r.Context(), r.Header.Get("Authorization"),
-		http.MethodGet, "/api/agent/upload/session?session_id="+id, nil)
-	if err != nil || status != http.StatusOK {
-		if status == 0 {
-			status = http.StatusBadGateway
-		}
-		return nil, status
-	}
-	var out struct {
-		SessionID   string `json:"session_id"`
-		UploadID    string `json:"upload_id"`
-		SliceSize   int64  `json:"slice_size"`
-		Total       int    `json:"total"`
-		Size        int64  `json:"size"`
-		BlockList   string `json:"block_list"` // JSON array stored as string
-		AccessToken string `json:"access_token"`
-		RemotePath  string `json:"remote_path"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || out.SessionID == "" {
-		return nil, http.StatusBadGateway
-	}
-	var blocks []string
-	_ = json.Unmarshal([]byte(out.BlockList), &blocks)
-	sess = &uploadSession{
-		ID: out.SessionID, UploadID: out.UploadID, RemotePath: out.RemotePath,
-		Token: out.AccessToken, Size: out.Size, SliceSize: out.SliceSize,
-		Total: out.Total, BlockList: blocks,
-	}
-	d.mu.Lock()
-	d.sessions[id] = sess
-	d.mu.Unlock()
-	return sess, 0
-}
-
-// handleSlice receives one slice from the browser (localhost) and pushes it to
-// Baidu directly. A 200 means cloud-synced AND server-recorded, matching the
-// server's streaming semantics, so the web UI needs no changes.
-func (d *Daemon) handleSlice(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		d.proxy.ServeHTTP(w, r)
-		return
-	}
-	id := r.URL.Query().Get("session")
-	seq, err := strconv.Atoi(r.URL.Query().Get("seq"))
-	if err != nil || seq < 0 {
-		writeErr(w, http.StatusBadRequest, "invalid seq")
-		return
-	}
-	sess, errStatus := d.session(r, id)
-	if sess == nil {
-		if errStatus == http.StatusNotFound {
-			writeErr(w, http.StatusNotFound, "上传会话已失效，请重新上传")
-		} else {
-			writeErr(w, errStatus, "无法连接服务端，请稍后重试")
-		}
-		return
-	}
-	if seq >= sess.Total {
-		writeErr(w, http.StatusBadRequest, "seq out of range")
-		return
-	}
-
-	want := sess.SliceSize
-	if seq == sess.Total-1 {
-		want = sess.Size - int64(sess.Total-1)*sess.SliceSize
-	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, sess.SliceSize+1))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "读取分片失败: "+err.Error())
-		return
-	}
-	if int64(len(data)) != want {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("分片大小不符: got %d want %d", len(data), want))
-		return
-	}
-	if seq < len(sess.BlockList) {
-		sum := md5.Sum(data)
-		if hex.EncodeToString(sum[:]) != sess.BlockList[seq] {
-			writeErr(w, http.StatusBadRequest, "数据校验未通过，请重试")
-			return
-		}
-	}
-
-	// data plane: this machine -> Baidu, no server in between
-	if err := retry(3, func() error {
-		return d.baidu.UploadChunk(r.Context(), sess.Token, sess.RemotePath, sess.UploadID, seq, data)
-	}); err != nil {
-		log.Printf("[client] 分片直传失败 session=%s seq=%d: %v", id, seq, err)
-		writeErr(w, http.StatusBadGateway, "云端同步失败: "+err.Error())
-		return
-	}
-
-	// keep the server's bitmap authoritative; if reporting fails the browser
-	// retries this slice, and superfile2 is idempotent by partseq.
-	rep, _ := json.Marshal(map[string]any{"session_id": id, "seqs": []int{seq}, "bytes": len(data)})
 	var status int
 	var raw []byte
-	if err := retry(2, func() error {
-		var e error
-		status, raw, e = d.serverJSON(r.Context(), r.Header.Get("Authorization"),
-			http.MethodPost, "/api/agent/upload/progress", rep)
-		if e == nil && status >= 500 {
-			return fmt.Errorf("server HTTP %d", status)
+	err := retryTask(ctx, t, 5, "request upload plan", func() error {
+		var callErr error
+		status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodGet, "/api/files/stream/plan?"+q.Encode(), nil)
+		if callErr == nil && (status == http.StatusTooManyRequests || status >= 500) {
+			return fmt.Errorf("server HTTP %d: %s", status, serverErrMsg(raw, "temporary error"))
 		}
-		return e
-	}); err != nil {
-		writeErr(w, http.StatusBadGateway, "云端已同步但进度上报失败，请重试")
+		return callErr
+	})
+	if err != nil {
+		t.fail("无法连接服务端: " + err.Error())
 		return
 	}
-	if status == http.StatusNotFound {
-		writeErr(w, http.StatusNotFound, "上传会话已失效，请重新上传")
+	var plan struct {
+		Enabled   bool  `json:"enabled"`
+		SliceSize int64 `json:"slice_size"`
+	}
+	if status != http.StatusOK || json.Unmarshal(raw, &plan) != nil || !plan.Enabled || plan.SliceSize <= 0 {
+		t.fail(serverErrMsg(raw, "服务端暂无可用存储空间或流式上传未启用"))
 		return
 	}
-	if status != http.StatusOK {
-		passthrough(w, status, raw)
-		return
+	sliceSize := plan.SliceSize
+	t.logf("plan ready slice_size=%d window=%d", sliceSize, d.opts.Window)
+
+	// 2. hash + init (the node is only locked at init; if its tier implies a
+	// different slice size, re-hash once with the new value)
+	var ses uploadInit
+	var blocks []string
+	for attempt := 0; ; attempt++ {
+		t.setStatus("hashing")
+		t.logf("hashing local file attempt=%d slice_size=%d", attempt+1, sliceSize)
+		var size int64
+		blocks, size, err = baidu.SliceFileMD5s(t.LocalPath, sliceSize)
+		if err != nil {
+			t.fail("读取本地文件失败: " + err.Error())
+			return
+		}
+		if size != t.Size {
+			t.logf("local file size changed stat=%d read=%d", t.Size, size)
+			t.set(func(t *Task) { t.Size = size }) // file changed on disk since stat
+		}
+		t.logf("hashing complete slices=%d size=%d", len(blocks), size)
+		if ctx.Err() != nil {
+			return
+		}
+		body, _ := json.Marshal(map[string]any{
+			"name": t.Name, "path": t.RemotePath, "size": size,
+			"slice_size": sliceSize, "block_list": blocks,
+		})
+		err = retryTask(ctx, t, 5, "initialize upload session", func() error {
+			var callErr error
+			status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/agent/upload/init", body)
+			if callErr == nil && (status == http.StatusTooManyRequests || status >= 500) {
+				return fmt.Errorf("server HTTP %d: %s", status, serverErrMsg(raw, "temporary error"))
+			}
+			return callErr
+		})
+		if err != nil {
+			t.fail("无法连接服务端: " + err.Error())
+			return
+		}
+		if status == http.StatusConflict && attempt == 0 {
+			var conflict struct {
+				SliceSize int64 `json:"slice_size"`
+			}
+			if json.Unmarshal(raw, &conflict) == nil && conflict.SliceSize > 0 && conflict.SliceSize != sliceSize {
+				t.logf("server selected different slice_size=%d; rehashing", conflict.SliceSize)
+				sliceSize = conflict.SliceSize
+				continue
+			}
+		}
+		if status != http.StatusOK {
+			t.fail(serverErrMsg(raw, "上传初始化失败"))
+			return
+		}
+		if json.Unmarshal(raw, &ses) != nil || ses.SessionID == "" {
+			t.fail("服务端响应异常")
+			return
+		}
+		break
 	}
-	var pr struct {
-		DoneCount int `json:"done_count"`
-		Total     int `json:"total"`
+	t.logf("upload session opened session=%s total_slices=%d need_slices=%d rapid=%v", ses.SessionID, ses.Total, len(ses.NeedSeqs), ses.Rapid)
+
+	// on any abort the server session must be canceled to free the node's load slot
+	abort := func() {
+		body, _ := json.Marshal(map[string]string{"session_id": ses.SessionID})
+		bg, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _, _ = d.serverJSON(bg, t.auth, http.MethodPost, "/api/files/stream/cancel", body)
 	}
-	_ = json.Unmarshal(raw, &pr)
-	writeJSON(w, http.StatusOK, map[string]any{"seq": seq, "done_count": pr.DoneCount, "total": pr.Total})
+
+	t.setStatus("running")
+	if ses.Rapid {
+		t.logf("rapid upload hit; no slice transfer needed")
+		t.set(func(t *Task) { t.Done = t.Size })
+	} else {
+		if servers, err := d.baidu.LocateUpload(ctx, ses.AccessToken, ses.RemotePath, ses.UploadID); err != nil || len(servers) == 0 {
+			t.logf("locateupload unavailable, using default upload server: %v", err)
+		} else {
+			ses.servers = servers
+			t.logf("upload servers resolved count=%d primary=%s", len(servers), servers[0])
+		}
+		if err := d.syncUploadMissing(ctx, t, &ses, sliceSize, ses.NeedSeqs); err != nil {
+			if ctx.Err() == nil { // real failure (not user cancel)
+				t.fail(err.Error())
+			}
+			abort()
+			return
+		}
+	}
+
+	// 3. finish (create + accounting run server-side). Ambiguous/transient
+	// failures are retried; a bitmap conflict only re-sends missing slices.
+	finishErr := "云端保存未完成"
+	for attempt := 0; attempt < 5; attempt++ {
+		t.logf("finishing cloud file attempt=%d/5 session=%s", attempt+1, ses.SessionID)
+		body, _ := json.Marshal(map[string]string{"session_id": ses.SessionID})
+		status, raw, err = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/files/stream/finish", body)
+		if err != nil {
+			finishErr = "无法连接服务端: " + err.Error()
+		} else if status == http.StatusOK {
+			t.set(func(t *Task) { t.Done = t.Size })
+			t.setStatus("done")
+			t.logf("completed remote=%q bytes=%d", t.RemotePath, t.Size)
+			return
+		} else if status == http.StatusConflict {
+			var need struct {
+				NeedSeqs []int `json:"need_seqs"`
+			}
+			if json.Unmarshal(raw, &need) == nil && len(need.NeedSeqs) > 0 {
+				t.logf("finish reported %d missing slices; retrying them", len(need.NeedSeqs))
+				if err := d.syncUploadMissing(ctx, t, &ses, sliceSize, need.NeedSeqs); err == nil {
+					continue
+				} else {
+					finishErr = err.Error()
+				}
+			} else {
+				finishErr = serverErrMsg(raw, "云端仍有分片未同步")
+			}
+		} else {
+			finishErr = serverErrMsg(raw, fmt.Sprintf("server HTTP %d", status))
+		}
+		if ctx.Err() != nil {
+			abort()
+			return
+		}
+		if attempt < 4 {
+			if err := waitTaskRetry(ctx, t, "finish cloud file", attempt+1); err != nil {
+				abort()
+				return
+			}
+		}
+	}
+	t.fail(finishErr)
+	t.logf("upload session retained for server-side reconciliation session=%s", ses.SessionID)
+}
+
+func uploadMissingBytes(size, sliceSize int64, seqs []int) int64 {
+	var missing int64
+	for _, seq := range seqs {
+		off := int64(seq) * sliceSize
+		length := sliceSize
+		if off+length > size {
+			length = size - off
+		}
+		if length > 0 {
+			missing += length
+		}
+	}
+	return missing
+}
+
+func (d *Daemon) uploadNeedSeqs(ctx context.Context, t *Task, sessionID string) ([]int, error) {
+	var status int
+	var raw []byte
+	err := retryTask(ctx, t, 4, "query missing upload slices", func() error {
+		var callErr error
+		status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodGet,
+			"/api/files/stream/status?session="+url.QueryEscape(sessionID), nil)
+		if callErr != nil {
+			return callErr
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("server HTTP %d: %s", status, serverErrMsg(raw, "status query failed"))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		NeedSeqs []int `json:"need_seqs"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("解析上传进度失败: %w", err)
+	}
+	return out.NeedSeqs, nil
+}
+
+// syncUploadMissing performs several reconciliation rounds. Each round asks
+// the server for its authoritative bitmap and only re-sends slices still marked
+// missing. superfile2 is idempotent by partseq.
+func (d *Daemon) syncUploadMissing(ctx context.Context, t *Task, ses *uploadInit, sliceSize int64, need []int) error {
+	var lastErr error
+	for round := 0; round < 6; round++ {
+		missing := uploadMissingBytes(t.Size, sliceSize, need)
+		t.set(func(t *Task) { t.Done = t.Size - missing })
+		if len(need) == 0 {
+			return nil
+		}
+		t.logf("upload reconciliation round=%d/6 missing_slices=%d missing_bytes=%d", round+1, len(need), missing)
+		pushErr := d.pushSlices(ctx, t, ses, sliceSize, need)
+		serverNeed, statusErr := d.uploadNeedSeqs(ctx, t, ses.SessionID)
+		if statusErr == nil {
+			need = serverNeed
+			missing = uploadMissingBytes(t.Size, sliceSize, need)
+			t.set(func(t *Task) { t.Done = t.Size - missing })
+			if len(need) == 0 {
+				return nil
+			}
+		}
+		if pushErr != nil {
+			lastErr = pushErr
+		} else if statusErr != nil {
+			lastErr = statusErr
+		} else {
+			lastErr = fmt.Errorf("仍有 %d 个分片未同步", len(need))
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if round < 5 {
+			if err := waitTaskRetry(ctx, t, "upload missing slices", round+1); err != nil {
+				return err
+			}
+		}
+	}
+	return fmt.Errorf("补传未完成分片失败: %w", lastErr)
+}
+
+// maxInflightUploadBytes caps the total bytes in flight to Baidu. Big slices
+// (VIP/SVIP tiers) at the full window make every request crawl on a limited
+// uplink until Baidu forcibly closes the slow connection — and each kill wastes
+// a whole slice worth of resent bytes. Throughput is uplink-bound either way,
+// so fewer, faster requests are strictly safer.
+const maxInflightUploadBytes = 64 << 20
+
+// pushSlices uploads the given slices to Baidu with a window of concurrent
+// connections, reporting each success to the server (bitmap + live meter).
+func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, sliceSize int64, seqs []int) error {
+	f, err := os.Open(t.LocalPath)
+	if err != nil {
+		return fmt.Errorf("读取本地文件失败: %v", err)
+	}
+	defer f.Close()
+
+	conc := d.opts.Window
+	if byBytes := int(maxInflightUploadBytes / sliceSize); byBytes < conc {
+		conc = byBytes
+	}
+	if conc < 2 {
+		conc = 2
+	}
+
+	inner, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var pushErr error
+	t.logf("slice batch started count=%d concurrency=%d slice_size=%d", len(seqs), conc, sliceSize)
+
+	for _, seq := range seqs {
+		if inner.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(seq int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			off := int64(seq) * sliceSize
+			length := sliceSize
+			if off+length > t.Size {
+				length = t.Size - off
+			}
+			buf := make([]byte, length)
+			if _, err := f.ReadAt(buf, off); err != nil {
+				mu.Lock()
+				pushErr = fmt.Errorf("读取本地文件失败: %v", err)
+				mu.Unlock()
+				cancel()
+				return
+			}
+			attempt := seq // stagger start so concurrent slices spread across servers
+			if err := retryTask(inner, t, 5, fmt.Sprintf("upload slice seq=%d", seq), func() error {
+				server := ses.pickServer(attempt)
+				attempt++
+				return d.baidu.UploadChunkTo(inner, server, ses.AccessToken, ses.RemotePath, ses.UploadID, seq, buf)
+			}); err != nil {
+				mu.Lock()
+				pushErr = fmt.Errorf("云端同步失败: %v", err)
+				mu.Unlock()
+				cancel()
+				return
+			}
+			rep, _ := json.Marshal(map[string]any{"session_id": ses.SessionID, "seqs": []int{seq}, "bytes": length})
+			if err := retryTask(inner, t, 4, fmt.Sprintf("report slice seq=%d", seq), func() error {
+				st, _, e := d.serverJSON(inner, t.auth, http.MethodPost, "/api/agent/upload/progress", rep)
+				if e == nil && st != http.StatusOK {
+					return fmt.Errorf("server HTTP %d", st)
+				}
+				return e
+			}); err != nil {
+				mu.Lock()
+				pushErr = fmt.Errorf("进度上报失败: %v", err)
+				mu.Unlock()
+				cancel()
+				return
+			}
+			t.addDone(length)
+		}(seq)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if pushErr == nil {
+		t.logf("slice batch completed count=%d", len(seqs))
+	}
+	return pushErr
 }

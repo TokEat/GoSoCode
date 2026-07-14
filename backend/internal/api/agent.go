@@ -3,9 +3,12 @@
 // node placement, precreate/create, metadata, sessions and accounting.
 //
 // Upload:  agent init (returns uploadid + node token) -> agent pushes
-//          superfile2 itself -> reports progress -> regular stream finish.
+//
+//	superfile2 itself -> reports progress -> regular stream finish.
+//
 // Download: agent resolves {dlink, token} here, fetches from Baidu directly
-//          (it can set UA pan.baidu.com), and reports transferred bytes.
+//
+//	(it can set UA pan.baidu.com), and reports transferred bytes.
 //
 // Security note: these endpoints hand a node's access_token to the caller,
 // which equals full control of that Baidu account. They are meant for
@@ -14,12 +17,14 @@ package api
 
 import (
 	"net/http"
+	"path"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"gosocode/internal/baidu"
 	"gosocode/internal/models"
 )
 
@@ -135,7 +140,9 @@ func (s *Server) handleAgentUploadProgress(c *gin.Context) {
 			"done_bitmap": string(bm), "done_count": sess.DoneCount, "updated_at": time.Now(),
 		})
 	}
-	if in.Bytes > 0 {
+	// A client may idempotently re-send/report the same partseq after a lost
+	// response. Count bytes only when the authoritative bitmap actually changes.
+	if changed && in.Bytes > 0 {
 		s.meter.AddUp(in.Bytes)
 	}
 	c.JSON(http.StatusOK, gin.H{"done_count": sess.DoneCount, "total": sess.TotalSlices})
@@ -144,76 +151,150 @@ func (s *Server) handleAgentUploadProgress(c *gin.Context) {
 // handleAgentDownloadResolve hands the agent what it needs to download a file
 // straight from Baidu: the temporary dlink plus the node token (dlink requires
 // both the token and UA pan.baidu.com, which a CLI can set).
-// GET /api/agent/download/resolve?id=<file id>
+// GET /api/agent/download/resolve?path=<logical path>
+// The path form is used for live Baidu listings, whose item ID is a remote
+// fs_id rather than a row in the local files table. The id form remains for
+// compatibility with older metadata-backed clients.
 func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Query("id"))
-	var f models.File
-	// shared filesystem: any authenticated user may fetch any file.
-	if err := s.db.First(&f, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-		return
-	}
-	if f.Status != "ready" {
-		c.JSON(http.StatusConflict, gin.H{"error": "file not ready"})
-		return
-	}
 	ctx := c.Request.Context()
-	acc, err := s.pool.Get(ctx, f.BaiduAccountID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	var (
+		acc          *models.BaiduAccount
+		fsID         uint64
+		fallbackName string
+		fallbackSize int64
+		fileID       uint
+		err          error
+	)
+
+	if logical := c.Query("path"); logical != "" {
+		var remotePath, clean string
+		acc, remotePath, clean, err = s.resolveMount(logical)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		var token string
+		token, err = s.pool.Token(ctx, acc)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		var ref *baiduListRef
+		refErr := streamRetry(5, "agent resolve list "+clean, func() error {
+			var e error
+			ref, e = s.remoteItemByPath(c, acc, token, remotePath)
+			return e
+		})
+		if refErr != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "文件不存在"})
+			return
+		}
+		if ref.IsDir {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "不能下载文件夹"})
+			return
+		}
+		fsID, fallbackName, fallbackSize = ref.FsID, ref.Name, ref.Size
+		if fallbackName == "" {
+			fallbackName = path.Base(clean)
+		}
+	} else {
+		id, parseErr := strconv.ParseUint(c.Query("id"), 10, 64)
+		if parseErr != nil || id == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请指定文件路径"})
+			return
+		}
+		var f models.File
+		// shared filesystem: any authenticated user may fetch any file.
+		if err = s.db.First(&f, uint(id)).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		if f.Status != "ready" {
+			c.JSON(http.StatusConflict, gin.H{"error": "file not ready"})
+			return
+		}
+		acc, err = s.pool.Get(ctx, f.BaiduAccountID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		fsID, fallbackName, fallbackSize, fileID = f.FsID, path.Base(f.LogicalPath), f.Size, f.ID
 	}
+
 	token, err := s.pool.Token(ctx, acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-	metas, err := s.client.FileMetas(ctx, token, []uint64{f.FsID})
+	var metas []baidu.FileMeta
+	err = streamRetry(5, "agent resolve metas "+fallbackName, func() error {
+		if e := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); e != nil {
+			return e
+		}
+		var e error
+		metas, e = s.client.FileMetas(ctx, token, []uint64{fsID})
+		return e
+	})
 	if err != nil || len(metas) == 0 || metas[0].Dlink == "" {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "无法从云端获取下载地址: " + errString(err)})
 		return
 	}
 	name := metas[0].Filename
 	if name == "" {
-		name = "file-" + itoa(f.ID)
+		name = fallbackName
+	}
+	if name == "" {
+		name = "file-" + strconv.FormatUint(fsID, 10)
 	}
 	size := metas[0].Size
 	if size == 0 {
-		size = f.Size
+		size = fallbackSize
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"dlink": metas[0].Dlink, "access_token": token,
-		"name": name, "size": size, "ua": "pan.baidu.com", "file_id": f.ID,
+		"name": name, "size": size, "ua": "pan.baidu.com",
+		"file_id": fileID, "node_id": acc.ID, "vip_type": acc.VipType,
 	})
 }
 
 // handleAgentDownloadReport records bytes the agent moved directly from Baidu,
 // keeping traffic accounting (live meter + lifetime totals) in sync even though
 // the bytes never touched the server.
-// POST /api/agent/download/report {file_id, bytes}
+// POST /api/agent/download/report {node_id, bytes}
+// file_id is retained as a fallback for older clients.
 func (s *Server) handleAgentDownloadReport(c *gin.Context) {
 	uid := uidOf(c)
 	var in struct {
-		FileID uint  `json:"file_id" binding:"required"`
+		FileID uint  `json:"file_id"`
+		NodeID uint  `json:"node_id"`
 		Bytes  int64 `json:"bytes" binding:"required,gt=0"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	var f models.File
-	if err := s.db.First(&f, in.FileID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	nodeID := in.NodeID
+	if nodeID == 0 && in.FileID != 0 {
+		var f models.File
+		if err := s.db.First(&f, in.FileID).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		nodeID = f.BaiduAccountID
+	}
+	if nodeID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing node_id"})
+		return
+	}
+	var acc models.BaiduAccount
+	if err := s.db.First(&acc, nodeID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "storage node not found"})
 		return
 	}
 	s.meter.AddDown(in.Bytes)
 	s.db.Model(&models.User{}).Where("id = ?", uid).
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
-	s.db.Model(&models.BaiduAccount{}).Where("id = ?", f.BaiduAccountID).
+	s.db.Model(&models.BaiduAccount{}).Where("id = ?", nodeID).
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

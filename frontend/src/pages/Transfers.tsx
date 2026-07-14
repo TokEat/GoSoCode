@@ -14,20 +14,29 @@ const STATUS: Record<TransferStatus, { label: string; kind: string }> = {
 };
 
 export default function Transfers() {
-  const { transfers, pause, resume, cancel, remove, clearFinished } = useTransfers();
+  const { clientMode, transfers, pause, resume, cancel, remove, clearFinished } = useTransfers();
   const toast = useToast();
   const [history, setHistory] = useState<TransferLogItem[]>([]);
 
-  const loadHistory = () => api.transferHistory().then(setHistory).catch(() => {});
-  useEffect(() => { loadHistory(); }, []);
+  const loadHistory = () => {
+    if (clientMode) return Promise.resolve();
+    return api.transferHistory().then(setHistory).catch(() => {});
+  };
+  useEffect(() => { if (!clientMode) loadHistory(); }, [clientMode]);
   // Refresh history whenever a transfer completes.
   const doneCount = transfers.filter((t) => t.status === "done").length;
-  useEffect(() => { loadHistory(); }, [doneCount]);
+  useEffect(() => { if (!clientMode) loadHistory(); }, [clientMode, doneCount]);
 
   return (
     <div className="grid" style={{ gap: 20 }}>
+    {clientMode && (
+      <div className="client-transfer-note">
+        <span className="client-transfer-pulse" />
+        <div><b>浏览器仅显示进度</b><small>上传从本地磁盘直达云端，下载由客户端直接写入设置的本地目录。</small></div>
+      </div>
+    )}
     <Card
-      title={`传输任务 (${transfers.length})`}
+      title={`${clientMode ? "本机传输任务" : "传输任务"} (${transfers.length})`}
       action={<button className="btn ghost" onClick={() => { clearFinished(); toast("ok", "已清除完成的任务"); }}>清除已完成</button>}
     >
       <table>
@@ -82,8 +91,8 @@ export default function Transfers() {
                 </td>
                 <td>
                   <div className="row">
-                    {t.status === "running" && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
-                    {t.status === "paused" && <button className="btn ghost sm" onClick={() => resume(t.id)}>恢复</button>}
+                    {!clientMode && t.status === "running" && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
+                    {!clientMode && t.status === "paused" && <button className="btn ghost sm" onClick={() => resume(t.id)}>恢复</button>}
                     {(t.status === "running" || t.status === "paused" || t.status === "finalizing") &&
                       <button className="btn danger sm" onClick={() => cancel(t.id)}>取消</button>}
                     {(t.status === "done" || t.status === "error" || t.status === "canceled") &&
@@ -98,7 +107,7 @@ export default function Transfers() {
       </table>
     </Card>
 
-    <Card
+    {!clientMode && <Card
       title={`历史传输 (${history.length})`}
       action={<button className="btn ghost" onClick={loadHistory}>刷新</button>}
     >
@@ -119,7 +128,7 @@ export default function Transfers() {
           {history.length === 0 && <tr><td colSpan={5} className="empty">暂无历史记录</td></tr>}
         </tbody>
       </table>
-    </Card>
+    </Card>}
     </div>
   );
 }

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { auth, clientInfo, openProgressSocket } from "./lib/api";
+import { ReactNode, useEffect, useState } from "react";
+import { auth, clientInfo, ClientInfo, openProgressSocket } from "./lib/api";
 import { ToastProvider, DialogProvider } from "./ui";
 import { TransferProvider, useTransfers } from "./transfer";
 import Login from "./pages/Login";
@@ -11,6 +11,7 @@ import Users from "./pages/Users";
 import Nodes from "./pages/Nodes";
 import Traffic from "./pages/Traffic";
 import Logs from "./pages/Logs";
+import ClientSettings from "./pages/ClientSettings";
 
 export interface JobEvent {
   job_id: string; status: string; progress: number; logical_path: string; error?: string;
@@ -18,7 +19,7 @@ export interface JobEvent {
 
 type Page =
   | "overview" | "files" | "transfers" | "profile"
-  | "users" | "nodes" | "traffic" | "logs";
+  | "users" | "nodes" | "traffic" | "logs" | "client";
 
 const USER_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "overview", label: "概览", ico: "▦" },
@@ -32,15 +33,38 @@ const ADMIN_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "traffic", label: "流量检测", ico: "📈" },
   { key: "logs", label: "系统日志", ico: "📜" },
 ];
+const CLIENT_NAV: { key: Page; label: string; ico: string }[] = [
+  { key: "client", label: "客户端设置", ico: "⌁" },
+];
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(!!auth.token);
+  const [runtime, setRuntime] = useState<ClientInfo | null>(null);
+
+  useEffect(() => { clientInfo().then(setRuntime); }, []);
+
+  if (!runtime) return <div className="app-loading"><span>G</span><p>正在启动 GoSoCode…</p></div>;
+
+  const providers = (content: ReactNode) => (
+    <ToastProvider>
+      <DialogProvider>{content}</DialogProvider>
+    </ToastProvider>
+  );
+
+  if (runtime.mode === "client" && !runtime.configured) {
+    return providers(<ClientSettings info={runtime} firstRun onSaved={(next) => setRuntime(next)} />);
+  }
+
   return (
     <ToastProvider>
       <DialogProvider>
-        <TransferProvider>
+        <TransferProvider mode={runtime.mode}>
           {loggedIn
-            ? <Shell onLogout={() => { auth.clear(); setLoggedIn(false); }} />
+            ? <Shell
+                runtime={runtime}
+                onRuntimeChange={setRuntime}
+                onLogout={() => { auth.clear(); setLoggedIn(false); }}
+              />
             : <Login onDone={() => setLoggedIn(true)} />}
         </TransferProvider>
       </DialogProvider>
@@ -48,33 +72,32 @@ export default function App() {
   );
 }
 
-function Shell({ onLogout }: { onLogout: () => void }) {
+function Shell({ runtime, onRuntimeChange, onLogout }: {
+  runtime: ClientInfo;
+  onRuntimeChange: (info: ClientInfo) => void;
+  onLogout: () => void;
+}) {
   const [page, setPage] = useState<Page>("overview");
   const [jobs, setJobs] = useState<Record<string, JobEvent>>({});
-  const [clientMode, setClientMode] = useState(false);
+  const clientMode = runtime.mode === "client";
   const isAdmin = auth.role === "admin";
-  const transfers = useTransfers();
-
-  // Auto-detect whether we are bound to a local client (transfers go straight
-  // to Baidu from this machine) or to the server (browser <-> server relay).
-  useEffect(() => {
-    let alive = true;
-    clientInfo().then((info) => { if (alive) setClientMode(info.mode === "client"); });
-    return () => { alive = false; };
-  }, []);
+  const { resolveJob } = useTransfers();
 
   // Single WebSocket for the whole session; feeds live transfer progress and
   // flips a finalizing upload to done/error once the server->Baidu leg finishes.
   useEffect(() => {
+    // Client-mode progress is owned entirely by the local daemon and polled via
+    // /api/client/transfers. Do not open the server WebSocket in this mode.
+    if (clientMode) return;
     const ws = openProgressSocket((e: JobEvent) => {
       if (!e.job_id) return;
       setJobs((p) => ({ ...p, [e.job_id]: e }));
-      if (e.status === "done" || e.status === "failed") transfers.resolveJob(e.job_id, e.status, e.error);
+      if (e.status === "done" || e.status === "failed") resolveJob(e.job_id, e.status, e.error);
     });
     return () => ws.close();
-  }, [transfers]);
+  }, [clientMode, resolveJob]);
 
-  const active = [...USER_NAV, ...ADMIN_NAV].find((n) => n.key === page);
+  const active = [...USER_NAV, ...ADMIN_NAV, ...CLIENT_NAV].find((n) => n.key === page);
 
   return (
     <div className="app">
@@ -101,6 +124,14 @@ function Shell({ onLogout }: { onLogout: () => void }) {
               </div>
             ))}
           </>}
+          {clientMode && <>
+            <div className="nav-group">本地客户端</div>
+            {CLIENT_NAV.map((n) => (
+              <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} onClick={() => setPage(n.key)}>
+                <span className="ico">{n.ico}</span>{n.label}
+              </div>
+            ))}
+          </>}
         </nav>
         <div className="sidebar-foot">
           <div className="nav-item" onClick={onLogout}><span className="ico">⎋</span>退出登录</div>
@@ -111,7 +142,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         <header className="topbar">
           <h1>{active?.label}</h1>
           <div className="row">
-            {clientMode && <span className="badge green" title="传输由本机客户端直连云端，不经过平台服务器">客户端直连</span>}
+            {clientMode && <span className="badge green" title="浏览器只查看进度，文件由本机客户端直连云端">本机数据通道</span>}
             <span className={`badge ${isAdmin ? "blue" : "gray"}`}>{isAdmin ? "管理员" : "用户"}</span>
           </div>
         </header>
@@ -124,6 +155,15 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           {page === "nodes" && isAdmin && <Nodes />}
           {page === "traffic" && isAdmin && <Traffic />}
           {page === "logs" && isAdmin && <Logs />}
+          {page === "client" && clientMode && (
+            <ClientSettings
+              info={runtime}
+              onSaved={(next, serverChanged) => {
+                onRuntimeChange(next);
+                if (serverChanged) { auth.clear(); window.location.reload(); }
+              }}
+            />
+          )}
         </section>
       </main>
     </div>

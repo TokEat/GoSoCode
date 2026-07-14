@@ -17,32 +17,6 @@ type credentials struct {
 	Password string `json:"password" binding:"required,min=6"`
 }
 
-func (s *Server) handleRegister(c *gin.Context) {
-	var in credentials
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	hash, _ := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
-	// The very first registered user becomes the platform admin.
-	var count int64
-	s.db.Model(&models.User{}).Count(&count)
-	role := "user"
-	if count == 0 {
-		role = "admin"
-	}
-	u := models.User{
-		Username: in.Username, PasswordHash: string(hash), Role: role, Status: "active",
-		CreatedAt: time.Now(), UpdatedAt: time.Now(),
-	}
-	if err := s.db.Create(&u).Error; err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "username already taken"})
-		return
-	}
-	s.audit(c, u.ID, u.Username, "register", "role="+role)
-	c.JSON(http.StatusOK, gin.H{"token": s.issueToken(u.ID), "user_id": u.ID, "role": role})
-}
-
 func (s *Server) handleLogin(c *gin.Context) {
 	var in credentials
 	if err := c.ShouldBindJSON(&in); err != nil {
