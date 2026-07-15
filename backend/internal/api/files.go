@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"gosocode/internal/crypto"
 	"gosocode/internal/models"
 )
 
@@ -171,6 +173,9 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	if s.accessDenied(c, logical) {
+		return
+	}
 	ctx := c.Request.Context()
 	token, err := s.pool.Token(ctx, acc)
 	if err != nil {
@@ -187,6 +192,26 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		return
 	}
 	mount := strings.TrimSuffix(logical, "/")
+	// One query marks the direct children that carry their own password rule,
+	// so the UI can show lock badges without N lookups.
+	childPaths := make([]string, 0, len(items))
+	for _, it := range items {
+		name := it.ServerFilename
+		if name == "" {
+			name = path.Base(it.Path)
+		}
+		childPaths = append(childPaths, mount+"/"+name)
+	}
+	ruleByPath := map[string]models.AccessRule{}
+	if len(childPaths) > 0 {
+		var rules []models.AccessRule
+		s.db.Where("path IN ?", childPaths).Find(&rules)
+		for _, r := range rules {
+			ruleByPath[r.Path] = r
+		}
+	}
+	uid := uidOf(c)
+
 	out := make([]gin.H, 0, len(items))
 	for _, it := range items {
 		name := it.ServerFilename
@@ -196,13 +221,20 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		childPath := mount + "/" + name
 		mt := unixTime(it.ServerMTime)
 		ct := unixTime(it.ServerCTime)
-		out = append(out, gin.H{
+		row := gin.H{
 			"id": it.FsID, "path": childPath, "size": it.Size,
 			"status": "ready", "created_at": ct, "modified": mt,
 			"is_dir": it.IsDir == 1, "owner": acc.Nickname,
 			"node_id": acc.ID, "remote_path": it.Path,
 			"download_url": fmt.Sprintf("/api/files/remote-download?path=%s", pathEscape(childPath)),
-		})
+		}
+		if r, ok := ruleByPath[childPath]; ok {
+			row["protected"] = true
+			// free (passwordless) access is owner-only; admins manage via role
+			row["protected_own"] = r.OwnerUserID == uid
+			row["protected_by"] = r.OwnerName
+		}
+		out = append(out, row)
 	}
 	c.JSON(http.StatusOK, gin.H{"files": out})
 }
@@ -242,7 +274,58 @@ type baiduListRef struct {
 	MTime int64
 }
 
-func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string) {
+// fileByRemote finds the metadata row for a remote path on a node; nil when the
+// file was never uploaded through the platform (e.g. pre-existing Baidu data).
+func (s *Server) fileByRemote(accID uint, remotePath string) *models.File {
+	var f models.File
+	if err := s.db.Where("baidu_account_id = ? AND remote_path = ? AND status = ?", accID, remotePath, "ready").
+		Order("id desc").First(&f).Error; err != nil {
+		return nil
+	}
+	return &f
+}
+
+// fileEncKeys unwraps a file's per-file AES key and CTR IV.
+func (s *Server) fileEncKeys(f *models.File) (key, iv []byte, err error) {
+	mk := s.systemConfig().MasterKey
+	keyHex, err := cryptoutil.Unwrap(mk, f.EncKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	ivHex, err := cryptoutil.Unwrap(mk, f.EncIV)
+	if err != nil {
+		return nil, nil, err
+	}
+	if key, err = hex.DecodeString(keyHex); err != nil {
+		return nil, nil, err
+	}
+	if iv, err = hex.DecodeString(ivHex); err != nil {
+		return nil, nil, err
+	}
+	return key, iv, nil
+}
+
+// decryptedBody wraps the upstream response body with the file's CTR stream
+// when the file is stored encrypted. The stream is positioned at the byte
+// offset the upstream actually serves (Content-Range start for 206 answers).
+func (s *Server) decryptedBody(resp *http.Response, f *models.File) (io.Reader, error) {
+	if f == nil || !f.Encrypted {
+		return resp.Body, nil
+	}
+	key, iv, err := s.fileEncKeys(f)
+	if err != nil {
+		return nil, err
+	}
+	var off int64
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		if _, err := fmt.Sscanf(cr, "bytes %d-", &off); err != nil {
+			off = 0
+		}
+	}
+	return cryptoutil.NewCTRReader(resp.Body, key, iv, off)
+}
+
+func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) {
 	ctx := c.Request.Context()
 	var resp *http.Response
 	filename := fallbackName
@@ -287,6 +370,12 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 	if filename == "" {
 		filename = fmt.Sprintf("file-%d", fsID)
 	}
+	body, err := s.decryptedBody(resp, encFile)
+	if err != nil {
+		log.Printf("[download] decrypt init failed %s node=%d: %v", logLabel, acc.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法解密文件"})
+		return
+	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Accept-Ranges", "bytes")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -302,7 +391,7 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 	var n int64
 	var cerr error
 	for {
-		rn, rerr := resp.Body.Read(buf)
+		rn, rerr := body.Read(buf)
 		if rn > 0 {
 			if _, werr := c.Writer.Write(buf[:rn]); werr != nil {
 				cerr = werr
@@ -340,6 +429,9 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	if s.accessDenied(c, clean) {
+		return
+	}
 	token, err := s.pool.Token(c.Request.Context(), acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -354,7 +446,44 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能下载文件夹"})
 		return
 	}
-	s.proxyDownload(c, acc, token, ref.FsID, ref.Name, "path="+clean)
+	s.proxyDownload(c, acc, token, ref.FsID, ref.Name, "path="+clean, s.fileByRemote(acc.ID, remotePath))
+}
+
+// handleCheckAccess verifies that the caller may access a protected file or path.
+// The UI calls this before enqueueing a download so a wrong password is reported
+// immediately instead of creating a transfer that fails with a network error.
+// GET /api/files/access-check?id=<file_id>&pwd=... or ?path=<logical>&pwd=...
+func (s *Server) handleCheckAccess(c *gin.Context) {
+	if idStr := c.Query("id"); idStr != "" {
+		id, _ := strconv.Atoi(idStr)
+		var f models.File
+		if err := s.db.First(&f, id).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		if f.Status != "ready" {
+			c.JSON(http.StatusConflict, gin.H{"error": "file not ready"})
+			return
+		}
+		if s.accessDenied(c, f.LogicalPath) {
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	if p := c.Query("path"); p != "" {
+		_, _, clean, err := s.resolveMount(p)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if s.accessDenied(c, clean) {
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "id or path required"})
 }
 
 // handleDownload streams a file's bytes through the platform (proxy mode), so
@@ -372,6 +501,9 @@ func (s *Server) handleDownload(c *gin.Context) {
 	}
 	if f.Status != "ready" {
 		c.JSON(http.StatusConflict, gin.H{"error": "file not ready"})
+		return
+	}
+	if s.accessDenied(c, f.LogicalPath) {
 		return
 	}
 
@@ -431,6 +563,12 @@ func (s *Server) handleDownload(c *gin.Context) {
 	if filename == "" {
 		filename = fmt.Sprintf("file-%d", f.ID)
 	}
+	body, err := s.decryptedBody(resp, &f)
+	if err != nil {
+		log.Printf("[download] decrypt init failed file=%d node=%d: %v", f.ID, acc.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法解密文件"})
+		return
+	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Accept-Ranges", "bytes")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -450,7 +588,7 @@ func (s *Server) handleDownload(c *gin.Context) {
 	var n int64
 	var cerr error
 	for {
-		rn, rerr := resp.Body.Read(buf)
+		rn, rerr := body.Read(buf)
 		if rn > 0 {
 			if _, werr := c.Writer.Write(buf[:rn]); werr != nil {
 				cerr = werr
@@ -494,6 +632,9 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	if s.accessDenied(c, f.LogicalPath) {
+		return
+	}
 	ctx := c.Request.Context()
 	acc, err := s.pool.Get(ctx, f.BaiduAccountID)
 	if err == nil {
@@ -505,6 +646,7 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 		}
 	}
 	s.db.Model(&f).Update("status", "deleted")
+	s.dropAccessRules(cleanLogical(f.LogicalPath))
 	s.audit(c, uid, usernameOf(c), "file.delete", f.LogicalPath)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -525,7 +667,11 @@ func (s *Server) handleRenameFile(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	if s.accessDenied(c, f.LogicalPath) {
+		return
+	}
 	s.db.Model(&f).Update("logical_path", in.Path)
+	s.moveAccessRules(cleanLogical(f.LogicalPath), cleanLogical(in.Path))
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -541,6 +687,9 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 	p := cleanLogical(in.Path)
 	if p == "/" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除根目录"})
+		return
+	}
+	if s.accessDenied(c, p) {
 		return
 	}
 	acc, remotePath, _, err := s.resolveMount(p)
@@ -563,6 +712,7 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 	}
 	s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 		Update("status", "deleted")
+	s.dropAccessRules(p)
 	s.audit(c, uid, usernameOf(c), "file.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -618,6 +768,11 @@ func (s *Server) handleCreateFolder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请先进入一个挂载节点"})
 		return
 	}
+	// Creating inside a protected directory requires the access password.
+	parent := path.Dir(p)
+	if parent != "/" && s.accessDenied(c, parent) {
+		return
+	}
 	acc, remotePath, _, err := s.resolveMount(p)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -655,6 +810,14 @@ func (s *Server) handleMove(c *gin.Context) {
 	src, dst := cleanLogical(in.Src), cleanLogical(in.Dst)
 	if src == "/" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source"})
+		return
+	}
+	if s.accessDenied(c, src) {
+		return
+	}
+	// Moving into a protected directory (or creating a protected ancestor path)
+	// also requires access to the destination.
+	if dst != "/" && s.accessDenied(c, dst) {
 		return
 	}
 	if dst == src {
@@ -708,6 +871,7 @@ func (s *Server) handleMove(c *gin.Context) {
 		np := dst + strings.TrimPrefix(k.LogicalPath, src)
 		s.db.Model(&models.File{}).Where("id = ?", k.ID).Update("logical_path", np)
 	}
+	s.moveAccessRules(src, dst)
 	s.audit(c, uid, usernameOf(c), "move", src+" -> "+dst)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "moved": len(kids) + 1})
 }
@@ -728,6 +892,9 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
 		return
 	}
+	if s.accessDenied(c, p) {
+		return
+	}
 	if acc, remotePath, _, err := s.resolveMount(p); err == nil {
 		token, err := s.pool.Token(c.Request.Context(), acc)
 		if err != nil {
@@ -744,6 +911,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		}
 		s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 			Update("status", "deleted")
+		s.dropAccessRules(p)
 		s.audit(c, uid, usernameOf(c), "folder.delete", p)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 		return
@@ -763,6 +931,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		}
 		s.db.Model(&models.File{}).Where("id = ?", f.ID).Update("status", "deleted")
 	}
+	s.dropAccessRules(p)
 	s.audit(c, uid, usernameOf(c), "folder.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "count": len(items)})
 }

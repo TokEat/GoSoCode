@@ -35,6 +35,7 @@ type Task struct {
 
 	mu       sync.Mutex
 	auth     string
+	pwd      string // access password for protected files, forwarded to resolve
 	cancel   context.CancelFunc
 	lastDone int64
 	lastAt   time.Time
@@ -285,6 +286,7 @@ func (d *Daemon) handleCreateDownload(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name string `json:"name"`
 		Path string `json:"path"`
+		Pwd  string `json:"pwd"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil || in.Path == "" {
 		writeErr(w, http.StatusBadRequest, "请指定文件")
@@ -294,7 +296,7 @@ func (d *Daemon) handleCreateDownload(w http.ResponseWriter, r *http.Request) {
 	t := &Task{
 		ID: uuid.NewString(), Kind: "download", Name: in.Name,
 		RemotePath: in.Path, Status: "waiting", CreatedAt: time.Now(),
-		auth: auth, cancel: cancel,
+		auth: auth, pwd: in.Pwd, cancel: cancel,
 	}
 	d.tasks.add(t)
 	t.logf("created remote=%q", t.RemotePath)

@@ -27,14 +27,16 @@ import (
 	"time"
 
 	"gosocode/internal/baidu"
+	"gosocode/internal/crypto"
 	"gosocode/internal/webui"
 )
 
 type Options struct {
-	Server  string // initial server address (flag/env); overrides the saved config
-	Window  int    // upload in-flight slice window (this machine -> Baidu)
-	DLConns int    // parallel download connections against Baidu
-	WebUI   string // optional on-disk UI dir overriding the embedded one
+	Server     string // initial server address (flag/env); overrides the saved config
+	Window     int    // upload in-flight slice window (this machine -> Baidu)
+	DLConns    int    // parallel download connections against Baidu
+	WebUI      string // optional on-disk UI dir overriding the embedded one
+	ControlKey string // 32-byte hex key encrypting server control-plane packets
 }
 
 // Config is what the web UI can change at runtime; persisted next to the user
@@ -54,10 +56,11 @@ type localEntry struct {
 }
 
 type Daemon struct {
-	opts  Options
-	api   *http.Client
-	baidu *baidu.Client
-	tasks *taskList
+	opts    Options
+	api     *http.Client
+	baidu   *baidu.Client
+	tasks   *taskList
+	control *controlcrypto.Codec
 
 	cfgMu   sync.RWMutex
 	cfg     Config
@@ -95,11 +98,16 @@ func New(opts Options) (*Daemon, error) {
 	if opts.DLConns > 8 {
 		opts.DLConns = 8
 	}
+	control, err := controlcrypto.New(opts.ControlKey)
+	if err != nil {
+		return nil, fmt.Errorf("客户端控制面加密密钥无效: %w", err)
+	}
 	d := &Daemon{
 		opts:    opts,
 		api:     &http.Client{Timeout: 60 * time.Second},
 		baidu:   baidu.New("", ""),
 		tasks:   newTaskList(),
+		control: control,
 		cfgPath: configPath(),
 	}
 	if raw, err := os.ReadFile(d.cfgPath); err == nil {
@@ -372,21 +380,28 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 		log.Printf("[client][control] %s %s failed: not connected", method, p)
 		return 0, nil, fmt.Errorf("尚未连接服务端")
 	}
-	var rd io.Reader
-	if body != nil {
-		rd = bytes.NewReader(body)
+	if d.control == nil {
+		return 0, nil, fmt.Errorf("客户端未配置 GSC_AGENT_CONTROL_KEY，已拒绝发送控制面数据")
 	}
-	req, err := http.NewRequestWithContext(ctx, method, cfg.Server+p, rd)
+	target, err := url.Parse(p)
+	if err != nil || target.Path == "" {
+		return 0, nil, fmt.Errorf("无效的控制面路径")
+	}
+	encrypted, err := d.control.SealRequest(method, target.Path, controlcrypto.Request{
+		Authorization: auth,
+		Query:         target.RawQuery,
+		Body:          body,
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("加密控制请求失败: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, cfg.Server+target.Path, bytes.NewReader(encrypted))
 	if err != nil {
 		log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
 		return 0, nil, err
 	}
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(controlcrypto.Header, controlcrypto.Version)
 	resp, err := d.api.Do(req)
 	if err != nil {
 		log.Printf("[client][control] %s %s transport failed after=%s: %v", method, p, time.Since(started).Round(time.Millisecond), err)
@@ -397,6 +412,12 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 	if err != nil {
 		log.Printf("[client][control] %s %s read response failed HTTP=%d after=%s: %v", method, p, resp.StatusCode, time.Since(started).Round(time.Millisecond), err)
 		return resp.StatusCode, nil, err
+	}
+	if resp.Header.Get(controlcrypto.Header) == controlcrypto.Version {
+		raw, err = d.control.OpenResponse(method, target.Path, resp.StatusCode, raw)
+		if err != nil {
+			return resp.StatusCode, nil, fmt.Errorf("解密控制响应失败: %w", err)
+		}
 	}
 	// Progress reports are one per uploaded slice; keep successful ones quiet.
 	// All other control-plane operations, and every failure, remain traceable.

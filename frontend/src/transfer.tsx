@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from "react";
 import SparkMD5 from "spark-md5";
 import { auth, clientApi, ClientTask } from "./lib/api";
+import { useToast } from "./ui";
 
 const CHUNK = 4 * 1024 * 1024; // 4MB browser->server chunk (legacy store-and-forward)
 const MAX_RETRY = 5;           // consecutive-stall retries before giving up
@@ -29,6 +30,7 @@ export interface Transfer {
   status: TransferStatus;
   note?: string;  // transient message, e.g. "retrying (2/5)…"
   error?: string; // terminal failure reason
+  localPath?: string; // client-mode: final local file path (download) or source path (upload)
 }
 
 interface StreamCtl {
@@ -75,7 +77,7 @@ interface TransferApi {
   transfers: Transfer[];
   startUpload: (file: File, path: string) => void;
   startClientUpload: (localPath: string, remoteDir: string) => Promise<void>;
-  startDownload: (item: { id: number; path: string; size: number; download_url?: string }) => void | Promise<void>;
+  startDownload: (item: { id: number; path: string; size: number; download_url?: string; pwd?: string }) => void | Promise<void>;
   pause: (id: string) => void;
   resume: (id: string) => void;
   cancel: (id: string) => void;
@@ -336,6 +338,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
   if (restored.current === null) restored.current = restoreTransfers();
   const [transfers, setTransfers] = useState<Transfer[]>(restored.current.list);
   const ctls = useRef(restored.current.ctls);
+  const toast = useToast();
 
   // mirror the list to localStorage so a refresh doesn't lose it
   useEffect(() => {
@@ -435,6 +438,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       const fin = await postJSON("/api/files/upload/finish", { upload_id: ctl.uploadId });
       ctl.jobId = fin.job_id; // flips to done via resolveJob when Baidu leg completes
       fileDrop(id); // server owns the bytes now
+      toast("ok", `上传完成：${ctl.name}`);
     } catch (e: unknown) {
       if (ctl.canceled || ctl.paused) return;
       if (ctl.uploadId) {
@@ -476,6 +480,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         ctl.file = undefined;
         fileDrop(id);
         patch(id, { status: "done", transferred: ctl.total, synced: ctl.total, speed: 0, syncSpeed: 0, note: undefined });
+        toast("ok", `上传完成：${ctl.name}`);
         return;
       } catch (e) {
         const err = e as Error & { status?: number; data?: { need_seqs?: number[] } };
@@ -776,6 +781,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         chunksDrop(id);
         patch(id, { status: "done", transferred: finalSize, speed: 0, note: undefined });
         postJSON("/api/transfers/log", { kind: "download", name: ctl.name, path: ctl.path, size: finalSize }).catch(() => {});
+        toast("ok", `下载完成：${ctl.name}`);
         return;
       } catch (e: unknown) {
         if (ctl.paused || ctl.canceled) { if (ctl.paused) flushDownload(id); return; }
@@ -820,12 +826,17 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     throw new Error("当前页面未连接本地客户端");
   }, []);
 
-  const startDownload = useCallback((item: { id: number; path: string; size: number; download_url?: string }) => {
+  const startDownload = useCallback((item: { id: number; path: string; size: number; download_url?: string; pwd?: string }) => {
     const id = uid();
     const name = item.path.split("/").pop() || "download";
+    let dlUrl = item.download_url;
+    if (item.pwd) {
+      const base = dlUrl || `/api/files/${item.id}/download`;
+      dlUrl = base + (base.includes("?") ? "&" : "?") + `pwd=${encodeURIComponent(item.pwd)}`;
+    }
     ctls.current.set(id, {
       kind: "download", name, path: item.path, total: item.size, sent: 0, shown: 0, synced: 0,
-      paused: false, canceled: false, fileId: item.id, downloadUrl: item.download_url,
+      paused: false, canceled: false, fileId: item.id, downloadUrl: dlUrl,
       chunks: [], dlSeq: 0, retrying: false,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
@@ -990,6 +1001,7 @@ function taskToTransfer(task: ClientTask): Transfer {
     kind: task.kind,
     name: task.name,
     path: task.kind === "upload" ? task.remote_path : task.local_path || task.remote_path,
+    localPath: task.local_path,
     total: task.size,
     transferred: task.done,
     speed: task.speed,
@@ -1006,33 +1018,53 @@ function taskToTransfer(task: ClientTask): Transfer {
 // writes local files, talks to Baidu, and exposes lightweight task snapshots.
 function ClientTransferProvider({ children }: { children: ReactNode }) {
   const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const toast = useToast();
+  const notified = useRef(new Set<string>());
+
+  const notifyDone = useCallback((tasks: Transfer[]) => {
+    for (const t of tasks) {
+      if (t.status !== "done") continue;
+      if (notified.current.has(t.id)) continue;
+      notified.current.add(t.id);
+      if (t.kind === "download" && t.localPath) {
+        toast("ok", `下载完成：${t.name} 已保存到 ${t.localPath}`);
+      } else if (t.kind === "upload") {
+        toast("ok", `上传完成：${t.name}`);
+      }
+    }
+  }, [toast]);
 
   const refresh = useCallback(async () => {
     const tasks = await clientApi.tasks();
-    setTransfers(tasks.map(taskToTransfer));
-  }, []);
+    const list = tasks.map(taskToTransfer);
+    setTransfers(list);
+    notifyDone(list);
+  }, [notifyDone]);
 
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       try {
         const tasks = await clientApi.tasks();
-        if (alive) setTransfers(tasks.map(taskToTransfer));
+        if (!alive) return;
+        const list = tasks.map(taskToTransfer);
+        setTransfers(list);
+        notifyDone(list);
       } catch { /* login/server transitions are handled by the surrounding UI */ }
     };
     poll();
     const timer = window.setInterval(poll, 800);
     return () => { alive = false; window.clearInterval(timer); };
-  }, []);
+  }, [notifyDone]);
 
   const startClientUpload = useCallback(async (localPath: string, remoteDir: string) => {
     await clientApi.upload(localPath, remoteDir);
     await refresh();
   }, [refresh]);
 
-  const startDownload = useCallback(async (item: { id: number; path: string; size: number }) => {
+  const startDownload = useCallback(async (item: { id: number; path: string; size: number; pwd?: string }) => {
     const name = item.path.split("/").pop() || "download";
-    await clientApi.download({ path: item.path, name });
+    await clientApi.download({ path: item.path, name, pwd: item.pwd });
     await refresh();
   }, [refresh]);
 

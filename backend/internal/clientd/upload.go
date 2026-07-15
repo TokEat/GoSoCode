@@ -2,6 +2,7 @@ package clientd
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"gosocode/internal/baidu"
+	"gosocode/internal/crypto"
 )
 
 // uploadInit is the agent init response: everything needed to push slices to
@@ -29,6 +31,11 @@ type uploadInit struct {
 	// upload server base URLs from locateupload; retries rotate through them
 	// because the default server intermittently answers empty HTTP 500s.
 	servers []string
+
+	// at-rest encryption: when set, every slice is CTR-encrypted at its file
+	// offset before hashing/pushing, so Baidu only sees ciphertext.
+	encKey []byte
+	encIV  []byte
 }
 
 func (s *uploadInit) pickServer(attempt int) string {
@@ -64,15 +71,37 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		return
 	}
 	var plan struct {
-		Enabled   bool  `json:"enabled"`
-		SliceSize int64 `json:"slice_size"`
+		Enabled   bool   `json:"enabled"`
+		SliceSize int64  `json:"slice_size"`
+		Encrypt   bool   `json:"encrypt"`
+		EncKey    string `json:"enc_key"`
+		EncIV     string `json:"enc_iv"`
 	}
 	if status != http.StatusOK || json.Unmarshal(raw, &plan) != nil || !plan.Enabled || plan.SliceSize <= 0 {
 		t.fail(serverErrMsg(raw, "服务端暂无可用存储空间或流式上传未启用"))
 		return
 	}
 	sliceSize := plan.SliceSize
-	t.logf("plan ready slice_size=%d window=%d", sliceSize, d.opts.Window)
+	var encKey, encIV []byte
+	if plan.Encrypt {
+		// Prefer the server-issued per-node key (+ fresh per-file IV); fall back
+		// to a locally generated pair against older servers — either way the key
+		// actually used is reported back at init and stored server-side.
+		if k, e1 := hex.DecodeString(plan.EncKey); e1 == nil && len(k) == 32 {
+			if v, e2 := hex.DecodeString(plan.EncIV); e2 == nil && len(v) == 16 {
+				encKey, encIV = k, v
+			}
+		}
+		if encKey == nil {
+			var kerr error
+			if encKey, encIV, kerr = cryptoutil.NewFileKey(); kerr != nil {
+				t.fail("生成加密密钥失败: " + kerr.Error())
+				return
+			}
+		}
+		t.logf("server requires encrypted storage; slices will be AES-CTR encrypted locally")
+	}
+	t.logf("plan ready slice_size=%d window=%d encrypt=%v", sliceSize, d.opts.Window, plan.Encrypt)
 
 	// 2. hash + init (the node is only locked at init; if its tier implies a
 	// different slice size, re-hash once with the new value)
@@ -82,7 +111,12 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		t.setStatus("hashing")
 		t.logf("hashing local file attempt=%d slice_size=%d", attempt+1, sliceSize)
 		var size int64
-		blocks, size, err = baidu.SliceFileMD5s(t.LocalPath, sliceSize)
+		if encKey != nil {
+			// Hash the ciphertext: that is what precreate/create will verify.
+			blocks, size, err = encSliceMD5s(t.LocalPath, sliceSize, encKey, encIV)
+		} else {
+			blocks, size, err = baidu.SliceFileMD5s(t.LocalPath, sliceSize)
+		}
 		if err != nil {
 			t.fail("读取本地文件失败: " + err.Error())
 			return
@@ -95,10 +129,15 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		if ctx.Err() != nil {
 			return
 		}
-		body, _ := json.Marshal(map[string]any{
+		init := map[string]any{
 			"name": t.Name, "path": t.RemotePath, "size": size,
 			"slice_size": sliceSize, "block_list": blocks,
-		})
+		}
+		if encKey != nil {
+			init["enc_key"] = hex.EncodeToString(encKey)
+			init["enc_iv"] = hex.EncodeToString(encIV)
+		}
+		body, _ := json.Marshal(init)
 		err = retryTask(ctx, t, 5, "initialize upload session", func() error {
 			var callErr error
 			status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/agent/upload/init", body)
@@ -129,6 +168,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 			t.fail("服务端响应异常")
 			return
 		}
+		ses.encKey, ses.encIV = encKey, encIV
 		break
 	}
 	t.logf("upload session opened session=%s total_slices=%d need_slices=%d rapid=%v", ses.SessionID, ses.Total, len(ses.NeedSeqs), ses.Rapid)
@@ -205,6 +245,21 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	}
 	t.fail(finishErr)
 	t.logf("upload session retained for server-side reconciliation session=%s", ses.SessionID)
+}
+
+// encSliceMD5s hashes the file's AES-CTR ciphertext per slice, matching what
+// pushSlices actually sends when encrypted storage is enabled.
+func encSliceMD5s(path string, sliceSize int64, key, iv []byte) ([]string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	enc, err := cryptoutil.NewCTRReader(f, key, iv, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	return baidu.SliceReaderMD5s(enc, sliceSize)
 }
 
 func uploadMissingBytes(size, sliceSize int64, seqs []int) int64 {
@@ -343,6 +398,15 @@ func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, slice
 				mu.Unlock()
 				cancel()
 				return
+			}
+			if ses.encKey != nil {
+				if err := cryptoutil.XORAt(buf, ses.encKey, ses.encIV, off); err != nil {
+					mu.Lock()
+					pushErr = fmt.Errorf("加密分片失败: %v", err)
+					mu.Unlock()
+					cancel()
+					return
+				}
 			}
 			attempt := seq // stagger start so concurrent slices spread across servers
 			if err := retryTask(inner, t, 5, fmt.Sprintf("upload slice seq=%d", seq), func() error {

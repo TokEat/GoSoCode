@@ -493,15 +493,62 @@ func (s *Server) handleTraffic(c *gin.Context) {
 }
 
 func (s *Server) handleListLogs(c *gin.Context) {
-	limit := 200
-	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 && l <= 1000 {
-		limit = l
+	page := 1
+	if v, err := strconv.Atoi(c.Query("page")); err == nil && v > 0 {
+		page = v
 	}
-	var logs []models.AuditLog
-	q := s.db.Order("id desc").Limit(limit)
+	pageSize := 20
+	if v, err := strconv.Atoi(c.Query("page_size")); err == nil && v > 0 && v <= 100 {
+		pageSize = v
+	}
+	q := s.db.Model(&models.AuditLog{})
 	if action := c.Query("action"); action != "" {
 		q = q.Where("action = ?", action)
 	}
-	q.Find(&logs)
-	c.JSON(http.StatusOK, gin.H{"logs": logs})
+	var total int64
+	q.Count(&total)
+	var logs []models.AuditLog
+	q.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&logs)
+	c.JSON(http.StatusOK, gin.H{"logs": logs, "total": total, "page": page, "page_size": pageSize})
+}
+
+// ---- system settings ---------------------------------------------------------
+
+func renderSystemConfig(sc models.SystemConfig) gin.H {
+	return gin.H{"encrypt_storage": sc.EncryptStorage, "log_max_entries": sc.LogMaxEntries}
+}
+
+func (s *Server) handleGetSystemConfig(c *gin.Context) {
+	c.JSON(http.StatusOK, renderSystemConfig(s.systemConfig()))
+}
+
+func (s *Server) handleSaveSystemConfig(c *gin.Context) {
+	var in struct {
+		EncryptStorage *bool `json:"encrypt_storage"`
+		LogMaxEntries  *int  `json:"log_max_entries"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	sc := s.systemConfig()
+	if in.EncryptStorage != nil {
+		sc.EncryptStorage = *in.EncryptStorage
+	}
+	if in.LogMaxEntries != nil {
+		if *in.LogMaxEntries < 50 || *in.LogMaxEntries > 100000 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "日志保留条数需在 50-100000 之间"})
+			return
+		}
+		sc.LogMaxEntries = *in.LogMaxEntries
+	}
+	sc.ID = 1
+	sc.UpdatedAt = time.Now()
+	if err := s.db.Save(&sc).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	s.audit(c, uidOf(c), usernameOf(c), "system.config",
+		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" log_max_entries="+strconv.Itoa(sc.LogMaxEntries))
+	c.JSON(http.StatusOK, renderSystemConfig(sc))
 }

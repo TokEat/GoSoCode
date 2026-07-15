@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"gosocode/internal/baidu"
 	"gosocode/internal/config"
 	"gosocode/internal/coord"
+	"gosocode/internal/crypto"
 	"gosocode/internal/job"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
@@ -29,14 +31,15 @@ import (
 )
 
 type Server struct {
-	cfg    *config.Config
-	db     *gorm.DB
-	pool   *account.Pool
-	client *baidu.Client
-	coord  *coord.Coordinator
-	jobs   *job.Manager
-	hub    *realtime.Hub
-	meter  *metrics.Meter
+	cfg     *config.Config
+	db      *gorm.DB
+	pool    *account.Pool
+	client  *baidu.Client
+	coord   *coord.Coordinator
+	jobs    *job.Manager
+	hub     *realtime.Hub
+	meter   *metrics.Meter
+	control *crypto.Codec
 
 	// active streaming-upload sessions (per-session serialization + concurrency cap)
 	streamMu     sync.Mutex
@@ -56,9 +59,9 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baidu.Client,
-	co *coord.Coordinator, jobs *job.Manager, hub *realtime.Hub, meter *metrics.Meter) *Server {
+	co *coord.Coordinator, jobs *job.Manager, hub *realtime.Hub, meter *metrics.Meter, control *crypto.Codec) *Server {
 	srv := &Server{
-		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter,
+		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter, control: control,
 		streamStates: map[string]*streamState{},
 		oauthStates:  map[string]time.Time{},
 	}
@@ -75,6 +78,8 @@ func (s *Server) Router() *gin.Engine {
 		AllowCredentials: false,
 	}))
 	r.MaxMultipartMemory = 32 << 20
+	r.Use(s.controlCryptoMiddleware())
+	r.Use(s.failureAudit())
 
 	r.GET("/api/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
 	// mode probe: a CLI client intercepts this same path and answers mode=client,
@@ -111,10 +116,15 @@ func (s *Server) Router() *gin.Engine {
 		auth.POST("/files/stream/finish", s.handleStreamFinish)
 		auth.POST("/files/stream/cancel", s.handleStreamCancel)
 		auth.POST("/files/folder", s.handleCreateFolder)
+		// password protection ("私密") for files and directories
+		auth.GET("/files/protect", s.handleGetProtect)
+		auth.POST("/files/protect", s.handleProtect)
+		auth.POST("/files/unprotect", s.handleUnprotect)
 		auth.POST("/files/move", s.handleMove)
 		auth.POST("/files/delete-path", s.handleDeletePath)
 		auth.POST("/files/delete-folder", s.handleDeleteFolder)
 		auth.GET("/files/remote-download", s.handleRemoteDownload)
+		auth.GET("/files/access-check", s.handleCheckAccess)
 		auth.GET("/files/:id/download", s.handleDownload)
 		auth.DELETE("/files/:id", s.handleDeleteFile)
 		auth.POST("/files/:id/rename", s.handleRenameFile)
@@ -126,7 +136,7 @@ func (s *Server) Router() *gin.Engine {
 	}
 
 	// control plane for CLI clients that transfer directly against Baidu
-	agent := r.Group("/api/agent", s.authMiddleware(), s.agentGuard())
+	agent := r.Group("/api/agent", s.requireEncryptedAgentControl(), s.authMiddleware(), s.agentGuard())
 	{
 		agent.POST("/upload/init", s.handleAgentUploadInit)
 		agent.GET("/upload/session", s.handleAgentUploadSession)
@@ -157,6 +167,9 @@ func (s *Server) Router() *gin.Engine {
 
 		admin.GET("/traffic", s.handleTraffic)
 		admin.GET("/logs", s.handleListLogs)
+
+		admin.GET("/system-config", s.handleGetSystemConfig)
+		admin.PUT("/system-config", s.handleSaveSystemConfig)
 	}
 
 	r.GET("/api/ws", s.handleWS) // token passed as query param
@@ -210,6 +223,64 @@ func (s *Server) adminMiddleware() gin.HandlerFunc {
 	}
 }
 
+// captureWriter buffers the first bytes of an error response so failureAudit
+// can log the failure detail without touching successful (streaming) replies.
+type captureWriter struct {
+	gin.ResponseWriter
+	captured []byte
+}
+
+func (w *captureWriter) Write(b []byte) (int, error) {
+	if w.Status() >= 400 && len(w.captured) < 512 {
+		n := 512 - len(w.captured)
+		if n > len(b) {
+			n = len(b)
+		}
+		w.captured = append(w.captured, b[:n]...)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// failureAudit records every failed API request (status >= 400) with its
+// method, path, status and error body into the audit log, so operators can
+// inspect failures from the history page.
+func (s *Server) failureAudit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		p := c.Request.URL.Path
+		// the logs endpoint itself is excluded so browsing failures can't loop
+		if !strings.HasPrefix(p, "/api/") || p == "/api/admin/logs" {
+			c.Next()
+			return
+		}
+		w := &captureWriter{ResponseWriter: c.Writer}
+		c.Writer = w
+		c.Next()
+		status := c.Writer.Status()
+		if status < 400 {
+			return
+		}
+		var uid uint
+		if v, ok := c.Get("uid"); ok {
+			uid, _ = v.(uint)
+		}
+		username := ""
+		if v, ok := c.Get("username"); ok {
+			username, _ = v.(string)
+		}
+		detail := c.Request.Method + " " + p + " -> " + strconv.Itoa(status)
+		if body := strings.TrimSpace(string(w.captured)); body != "" {
+			detail += " " + body
+		}
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
+		s.db.Create(&models.AuditLog{
+			At: time.Now(), UserID: uid, Username: username,
+			Action: "http.error", Detail: detail, IP: c.ClientIP(),
+		})
+	}
+}
+
 // audit records a notable action for the ops log view (best-effort).
 func (s *Server) audit(c *gin.Context, userID uint, username, action, detail string) {
 	s.db.Create(&models.AuditLog{
@@ -227,6 +298,16 @@ func (s *Server) baiduConfig() models.BaiduAppConfig {
 		bc.RedirectURI = s.cfg.RedirectURI
 	}
 	return bc
+}
+
+// systemConfig returns the platform settings singleton (ID=1).
+func (s *Server) systemConfig() models.SystemConfig {
+	var sc models.SystemConfig
+	s.db.First(&sc, 1)
+	if sc.LogMaxEntries <= 0 {
+		sc.LogMaxEntries = 500
+	}
+	return sc
 }
 
 // mintOAuthState returns a fresh 32-char hex state and remembers it for 5

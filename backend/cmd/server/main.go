@@ -9,6 +9,7 @@ import (
 	"gosocode/internal/baidu"
 	"gosocode/internal/config"
 	"gosocode/internal/coord"
+	"gosocode/internal/crypto"
 	"gosocode/internal/job"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
@@ -25,6 +26,10 @@ func main() {
 	}
 
 	client := baidu.New(cfg.BaiduAppKey, cfg.BaiduSecret)
+	agentControl, err := crypto.New(cfg.AgentControlKey)
+	if err != nil {
+		log.Fatalf("agent control encryption: %v", err)
+	}
 
 	// Baidu app credentials live in the DB (editable from the admin UI). Seed the
 	// singleton row from env on first run, then load it into the client.
@@ -50,7 +55,7 @@ func main() {
 	}
 	hub := realtime.NewHub()
 	meter := metrics.New()
-	jobs := job.NewManager(db, pool, client, co, hub, meter, cfg.Workers)
+	jobs := job.NewManager(db, pool, client, co, hub, meter, cfg.Workers, cfg.KeysDir)
 
 	// Live traffic feed: push the meter snapshot to admin WebSocket connections
 	// every 2s so the monitoring page doesn't need to poll for realtime stats.
@@ -62,7 +67,7 @@ func main() {
 		}
 	}()
 
-	srv := api.NewServer(cfg, db, pool, client, co, jobs, hub, meter)
+	srv := api.NewServer(cfg, db, pool, client, co, jobs, hub, meter, agentControl)
 	log.Printf("gosocode backend listening on %s", cfg.Addr)
 	if err := srv.Router().Run(cfg.Addr); err != nil {
 		log.Fatalf("server: %v", err)

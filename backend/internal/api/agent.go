@@ -16,6 +16,7 @@
 package api
 
 import (
+	"encoding/hex"
 	"net/http"
 	"path"
 	"strconv"
@@ -53,13 +54,17 @@ func (s *Server) handleAgentUploadInit(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "流式上传未启用", "fallback": true})
 		return
 	}
+	if s.systemConfig().EncryptStorage && in.EncKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "系统已启用加密存储，当前客户端版本不支持，请更新客户端"})
+		return
+	}
 	// No streamActive cap: agent sessions consume no server memory, so they are
 	// not registered in streamStates either.
 	sess, token, need, rapid, ok := s.openStreamSession(c, in)
 	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	s.agentJSON(c, http.StatusOK, gin.H{
 		"session_id": sess.ID, "upload_id": sess.UploadID,
 		"need_seqs": need, "rapid": rapid,
 		"slice_size": sess.SliceSize, "total": sess.TotalSlices, "window": s.cfg.AgentWindow,
@@ -88,7 +93,7 @@ func (s *Server) handleAgentUploadSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	s.agentJSON(c, http.StatusOK, gin.H{
 		"session_id": sess.ID, "upload_id": sess.UploadID,
 		"need_seqs": needSeqs(sess.DoneBitmap), "slice_size": sess.SliceSize,
 		"total": sess.TotalSlices, "size": sess.Size, "block_list": sess.BlockList,
@@ -145,7 +150,7 @@ func (s *Server) handleAgentUploadProgress(c *gin.Context) {
 	if changed && in.Bytes > 0 {
 		s.meter.AddUp(in.Bytes)
 	}
-	c.JSON(http.StatusOK, gin.H{"done_count": sess.DoneCount, "total": sess.TotalSlices})
+	s.agentJSON(c, http.StatusOK, gin.H{"done_count": sess.DoneCount, "total": sess.TotalSlices})
 }
 
 // handleAgentDownloadResolve hands the agent what it needs to download a file
@@ -163,6 +168,7 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		fallbackName string
 		fallbackSize int64
 		fileID       uint
+		encFile      *models.File
 		err          error
 	)
 
@@ -171,6 +177,9 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		acc, remotePath, clean, err = s.resolveMount(logical)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if s.accessDenied(c, clean) {
 			return
 		}
 		var token string
@@ -197,6 +206,7 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		if fallbackName == "" {
 			fallbackName = path.Base(clean)
 		}
+		encFile = s.fileByRemote(acc.ID, remotePath)
 	} else {
 		id, parseErr := strconv.ParseUint(c.Query("id"), 10, 64)
 		if parseErr != nil || id == 0 {
@@ -213,12 +223,17 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "file not ready"})
 			return
 		}
+		if s.accessDenied(c, f.LogicalPath) {
+			return
+		}
 		acc, err = s.pool.Get(ctx, f.BaiduAccountID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 		fsID, fallbackName, fallbackSize, fileID = f.FsID, path.Base(f.LogicalPath), f.Size, f.ID
+		ff := f
+		encFile = &ff
 	}
 
 	token, err := s.pool.Token(ctx, acc)
@@ -250,11 +265,24 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 	if size == 0 {
 		size = fallbackSize
 	}
-	c.JSON(http.StatusOK, gin.H{
+	out := gin.H{
 		"dlink": metas[0].Dlink, "access_token": token,
 		"name": name, "size": size, "ua": "pan.baidu.com",
 		"file_id": fileID, "node_id": acc.ID, "vip_type": acc.VipType,
-	})
+	}
+	// Encrypted at rest: hand the per-file key to the (trusted) agent so it can
+	// decrypt the ranged segments it fetches straight from Baidu.
+	if encFile != nil && encFile.Encrypted {
+		key, iv, kerr := s.fileEncKeys(encFile)
+		if kerr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "无法读取文件加密密钥"})
+			return
+		}
+		out["encrypted"] = true
+		out["enc_key"] = hex.EncodeToString(key)
+		out["enc_iv"] = hex.EncodeToString(iv)
+	}
+	s.agentJSON(c, http.StatusOK, out)
 }
 
 // handleAgentDownloadReport records bytes the agent moved directly from Baidu,
@@ -296,5 +324,5 @@ func (s *Server) handleAgentDownloadReport(c *gin.Context) {
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
 	s.db.Model(&models.BaiduAccount{}).Where("id = ?", nodeID).
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	s.agentJSON(c, http.StatusOK, gin.H{"ok": true})
 }

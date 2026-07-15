@@ -29,6 +29,8 @@ import (
 	"gorm.io/gorm"
 
 	"gosocode/internal/baidu"
+	"gosocode/internal/crypto"
+	"gosocode/internal/keystore"
 	"gosocode/internal/models"
 )
 
@@ -138,16 +140,22 @@ func (s *Server) handleStreamPlan(c *gin.Context) {
 	// Agent (CLI) sessions push slices to Baidu themselves, so the server-memory
 	// concurrency cap does not apply to them.
 	agent := c.Query("agent") == "1"
+	sc := s.systemConfig()
 	// Empty files (and disabled/full stream) fall back to store-and-forward.
-	if !s.cfg.StreamEnabled || size <= 0 || (!agent && s.streamActive() >= s.cfg.StreamMaxConcurrent) {
-		c.JSON(http.StatusOK, gin.H{"enabled": false})
+	// Encrypted storage also forces the browser onto store-and-forward: the
+	// streaming path hashes plaintext slices, but the server must only ever
+	// push ciphertext to Baidu. Agents encrypt locally, so they may stream.
+	if !s.cfg.StreamEnabled || size <= 0 ||
+		(!agent && sc.EncryptStorage) ||
+		(!agent && s.streamActive() >= s.cfg.StreamMaxConcurrent) {
+		s.controlJSON(c, http.StatusOK, gin.H{"enabled": false})
 		return
 	}
 	var acc *models.BaiduAccount
 	if p := c.Query("path"); p != "" {
 		a, _, _, err := s.resolveMount(p)
 		if err != nil || (a.QuotaTotal > 0 && a.QuotaTotal-a.QuotaUsed < size) {
-			c.JSON(http.StatusOK, gin.H{"enabled": false})
+			s.controlJSON(c, http.StatusOK, gin.H{"enabled": false})
 			return
 		}
 		acc = a
@@ -155,17 +163,35 @@ func (s *Server) handleStreamPlan(c *gin.Context) {
 		var err error
 		acc, err = s.pool.PeekForSize(c.Request.Context(), size)
 		if err != nil {
-			c.JSON(http.StatusOK, gin.H{"enabled": false})
+			s.controlJSON(c, http.StatusOK, gin.H{"enabled": false})
 			return
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{
+	out := gin.H{
 		"enabled":    true,
 		"slice_size": baidu.SliceSizeForVip(acc.VipType),
 		"node_id":    acc.ID,
 		"node_tier":  acc.VipType,
 		"window":     s.cfg.StreamWindow,
-	})
+		"encrypt":    sc.EncryptStorage, // agents must encrypt slices locally
+	}
+	if agent && sc.EncryptStorage {
+		// One key per storage node (double-stored server-side); the IV is fresh
+		// per file. The agent encrypts with these before hashing.
+		key, err := keystore.NodeKey(s.db, sc.MasterKey, s.cfg.KeysDir, acc.ID)
+		if err != nil {
+			s.controlJSON(c, http.StatusInternalServerError, gin.H{"error": "无法获取节点加密密钥: " + err.Error()})
+			return
+		}
+		iv, err := cryptoutil.NewIV()
+		if err != nil {
+			s.controlJSON(c, http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out["enc_key"] = hex.EncodeToString(key)
+		out["enc_iv"] = hex.EncodeToString(iv)
+	}
+	s.controlJSON(c, http.StatusOK, out)
 }
 
 // streamInitReq is the shared request body of the browser and agent init
@@ -176,6 +202,10 @@ type streamInitReq struct {
 	Size      int64    `json:"size" binding:"required,gt=0"`
 	SliceSize int64    `json:"slice_size" binding:"required,gt=0"`
 	BlockList []string `json:"block_list" binding:"required,min=1"`
+	// Agent-only: the per-file key/IV (hex) the client encrypted with. Stored
+	// wrapped on the File record so server-proxied downloads can decrypt.
+	EncKey string `json:"enc_key"`
+	EncIV  string `json:"enc_iv"`
 }
 
 // handleStreamInit picks the node for real, runs precreate (which also detects
@@ -191,10 +221,15 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "流式上传未启用", "fallback": true})
 		return
 	}
+	if s.systemConfig().EncryptStorage {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "已启用加密存储，请使用普通上传", "fallback": true})
+		return
+	}
 	if s.streamActive() >= s.cfg.StreamMaxConcurrent {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "流式上传并发已满", "fallback": true})
 		return
 	}
+	in.EncKey, in.EncIV = "", "" // browser sessions never carry key material
 
 	sess, _, need, rapid, ok := s.openStreamSession(c, in)
 	if !ok {
@@ -282,6 +317,24 @@ func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *mode
 		LogicalPath: logical, RemotePath: remote,
 		Size: in.Size, Status: "uploading",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if in.EncKey != "" || in.EncIV != "" {
+		key, kerr := hex.DecodeString(in.EncKey)
+		ivb, verr := hex.DecodeString(in.EncIV)
+		if kerr != nil || verr != nil || len(key) != 32 || len(ivb) != 16 {
+			release()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "加密密钥格式无效"})
+			return
+		}
+		mk := s.systemConfig().MasterKey
+		wk, e1 := cryptoutil.Wrap(mk, in.EncKey)
+		wiv, e2 := cryptoutil.Wrap(mk, in.EncIV)
+		if e1 != nil || e2 != nil {
+			release()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "无法保存加密密钥"})
+			return
+		}
+		f.Encrypted, f.EncKey, f.EncIV = true, wk, wiv
 	}
 	if err := s.db.Create(&f).Error; err != nil {
 		release()

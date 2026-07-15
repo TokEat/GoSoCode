@@ -1,5 +1,5 @@
-import { ReactNode, useEffect, useState } from "react";
-import { auth, clientInfo, ClientInfo, openProgressSocket } from "./lib/api";
+import { ReactNode, useEffect, useRef, useState } from "react";
+import { auth, api, clientInfo, ClientInfo, openProgressSocket } from "./lib/api";
 import { ToastProvider, DialogProvider } from "./ui";
 import { TransferProvider, useTransfers } from "./transfer";
 import Login from "./pages/Login";
@@ -11,6 +11,7 @@ import Users from "./pages/Users";
 import Nodes from "./pages/Nodes";
 import Traffic from "./pages/Traffic";
 import Logs from "./pages/Logs";
+import Settings from "./pages/Settings";
 import ClientSettings from "./pages/ClientSettings";
 
 export interface JobEvent {
@@ -19,7 +20,7 @@ export interface JobEvent {
 
 type Page =
   | "overview" | "files" | "transfers" | "profile"
-  | "users" | "nodes" | "traffic" | "logs" | "client";
+  | "users" | "nodes" | "traffic" | "logs" | "settings" | "client";
 
 const USER_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "overview", label: "概览", ico: "▦" },
@@ -32,6 +33,7 @@ const ADMIN_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "nodes", label: "网盘账号", ico: "🖴" },
   { key: "traffic", label: "流量检测", ico: "📈" },
   { key: "logs", label: "系统日志", ico: "📜" },
+  { key: "settings", label: "系统设置", ico: "⚙" },
 ];
 const CLIENT_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "client", label: "客户端设置", ico: "⌁" },
@@ -83,8 +85,12 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
   const isAdmin = auth.role === "admin";
   const { resolveJob } = useTransfers();
 
+  const resolvedJobs = useRef(new Set<string>());
+
   // Single WebSocket for the whole session; feeds live transfer progress and
   // flips a finalizing upload to done/error once the server->Baidu leg finishes.
+  // We also poll /api/jobs as a fallback so a missed WS event (e.g. reload,
+  // reconnect) does not leave legacy uploads stuck at "云端处理中".
   useEffect(() => {
     // Client-mode progress is owned entirely by the local daemon and polled via
     // /api/client/transfers. Do not open the server WebSocket in this mode.
@@ -92,9 +98,28 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
     const ws = openProgressSocket((e: JobEvent) => {
       if (!e.job_id) return;
       setJobs((p) => ({ ...p, [e.job_id]: e }));
-      if (e.status === "done" || e.status === "failed") resolveJob(e.job_id, e.status, e.error);
+      if (e.status === "done" || e.status === "failed") {
+        resolvedJobs.current.add(e.job_id);
+        resolveJob(e.job_id, e.status, e.error);
+      }
     });
-    return () => ws.close();
+
+    const pollJobs = async () => {
+      try {
+        const jobs = await api.listJobs();
+        for (const j of jobs) {
+          if (j.Status !== "done" && j.Status !== "failed") continue;
+          if (resolvedJobs.current.has(j.ID)) continue;
+          resolvedJobs.current.add(j.ID);
+          setJobs((p) => ({ ...p, [j.ID]: { job_id: j.ID, status: j.Status, progress: j.Progress, logical_path: "", error: j.Error } }));
+          resolveJob(j.ID, j.Status === "done" ? "done" : "failed", j.Error);
+        }
+      } catch { /* ignore */ }
+    };
+    const timer = setInterval(pollJobs, 3000);
+    pollJobs();
+
+    return () => { ws.close(); clearInterval(timer); };
   }, [clientMode, resolveJob]);
 
   const active = [...USER_NAV, ...ADMIN_NAV, ...CLIENT_NAV].find((n) => n.key === page);
@@ -155,6 +180,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
           {page === "nodes" && isAdmin && <Nodes />}
           {page === "traffic" && isAdmin && <Traffic />}
           {page === "logs" && isAdmin && <Logs />}
+          {page === "settings" && isAdmin && <Settings />}
           {page === "client" && clientMode && (
             <ClientSettings
               info={runtime}

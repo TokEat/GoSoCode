@@ -2,6 +2,7 @@ package clientd
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gosocode/internal/crypto"
 )
 
 const (
@@ -22,12 +25,15 @@ const (
 )
 
 type dlInfo struct {
-	Dlink   string `json:"dlink"`
-	Token   string `json:"access_token"`
-	Name    string `json:"name"`
-	Size    int64  `json:"size"`
-	NodeID  uint   `json:"node_id"`
-	VipType int    `json:"vip_type"`
+	Dlink     string `json:"dlink"`
+	Token     string `json:"access_token"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	NodeID    uint   `json:"node_id"`
+	VipType   int    `json:"vip_type"`
+	Encrypted bool   `json:"encrypted"`
+	EncKey    string `json:"enc_key"`
+	EncIV     string `json:"enc_iv"`
 }
 
 // downloadConnsForTier keeps ordinary accounts conservative while still
@@ -76,7 +82,7 @@ func (s *dlSource) refresh(ctx context.Context, stale *dlInfo) error {
 	var info *dlInfo
 	err := retryTask(ctx, s.task, 5, "refresh cloud download link", func() error {
 		var e error
-		info, _, e = s.d.resolve(ctx, s.auth, s.path)
+		info, _, e = s.d.resolve(ctx, s.auth, s.path, s.task.pwd)
 		return e
 	})
 	if err != nil {
@@ -86,9 +92,12 @@ func (s *dlSource) refresh(ctx context.Context, stale *dlInfo) error {
 	return nil
 }
 
-func (d *Daemon) resolve(ctx context.Context, auth, logicalPath string) (*dlInfo, []byte, error) {
-	status, raw, err := d.serverJSON(ctx, auth, http.MethodGet,
-		"/api/agent/download/resolve?path="+url.QueryEscape(logicalPath), nil)
+func (d *Daemon) resolve(ctx context.Context, auth, logicalPath, pwd string) (*dlInfo, []byte, error) {
+	q := "/api/agent/download/resolve?path=" + url.QueryEscape(logicalPath)
+	if pwd != "" {
+		q += "&pwd=" + url.QueryEscape(pwd)
+	}
+	status, raw, err := d.serverJSON(ctx, auth, http.MethodGet, q, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -111,12 +120,26 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 	var info *dlInfo
 	err := retryTask(ctx, t, 5, "resolve cloud download source", func() error {
 		var e error
-		info, _, e = d.resolve(ctx, t.auth, logicalPath)
+		info, _, e = d.resolve(ctx, t.auth, logicalPath, t.pwd)
 		return e
 	})
 	if err != nil {
 		t.fail(err.Error())
 		return
+	}
+	// Encrypted at rest: decrypt each fetched segment locally with the per-file
+	// key the (trusted) server handed us.
+	var encKey, encIV []byte
+	if info.Encrypted {
+		encKey, err = hex.DecodeString(info.EncKey)
+		if err == nil {
+			encIV, err = hex.DecodeString(info.EncIV)
+		}
+		if err != nil || len(encKey) != 32 || len(encIV) != 16 {
+			t.fail("文件加密密钥无效")
+			return
+		}
+		t.logf("encrypted file; segments will be decrypted locally")
 	}
 	t.set(func(t *Task) {
 		if info.Name != "" {
@@ -203,6 +226,11 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 						data, err := src.fetchSegment(ctx, s0, e0, func(current int64) {
 							setSegmentProgress(i, current)
 						})
+						if err == nil && encKey != nil {
+							if err = cryptoutil.XORAt(data, encKey, encIV, s0); err != nil {
+								err = fmt.Errorf("解密分段失败: %v", err)
+							}
+						}
 						if err == nil {
 							_, err = f.WriteAt(data, s0)
 							if err != nil {

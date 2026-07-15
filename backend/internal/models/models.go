@@ -19,6 +19,7 @@ type BaiduAccount struct {
 	BytesUp      int64  // bytes uploaded through this node
 	BytesDown    int64  // bytes downloaded through this node
 	VipType      int    // 0 normal / 1 VIP / 2 SVIP; decides upload slice size (4/16/32MB)
+	EncKey       string `gorm:"size:512"`               // node encryption key, wrapped with the master key (backup copy lives in KeysDir)
 	Status       string `gorm:"size:32;default:active"` // active | disabled | banned
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
@@ -46,6 +47,31 @@ type BaiduAppConfig struct {
 	SecretKey   string `gorm:"size:128"`
 	SignKey     string `gorm:"size:128"`
 	RedirectURI string `gorm:"size:512"`
+	UpdatedAt   time.Time
+}
+
+// SystemConfig is the singleton (ID=1) holding platform-wide settings managed
+// from the admin UI. MasterKey wraps per-file encryption keys and stored access
+// passwords; it is generated once and never leaves the server.
+type SystemConfig struct {
+	ID             uint   `gorm:"primaryKey"`
+	EncryptStorage bool   `gorm:"default:false"` // new uploads are AES-encrypted at rest
+	MasterKey      string `gorm:"size:128"`      // hex, 32 bytes
+	LogMaxEntries  int    `gorm:"default:500"`   // audit log retention cap
+	UpdatedAt      time.Time
+}
+
+// AccessRule protects a logical path (file or directory) with a password. Only
+// the rule owner accesses freely; everyone else — admins included — must
+// present the password. Owner and admins may view/manage the password itself.
+type AccessRule struct {
+	ID          uint   `gorm:"primaryKey"`
+	Path        string `gorm:"size:1024;uniqueIndex"` // logical path
+	IsDir       bool   `gorm:"default:false"`
+	OwnerUserID uint   `gorm:"index"`
+	OwnerName   string `gorm:"size:64"`
+	PasswordEnc string `gorm:"size:512"` // wrapped with SystemConfig.MasterKey
+	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
 
@@ -83,6 +109,9 @@ type File struct {
 	FsID           uint64 `gorm:"index"`
 	Size           int64
 	MD5            string `gorm:"size:64"`
+	Encrypted      bool   `gorm:"default:false"`             // stored bytes are AES-256-CTR ciphertext
+	EncKey         string `gorm:"size:512"`                  // per-file key, wrapped with the master key
+	EncIV          string `gorm:"size:512"`                  // per-file CTR IV, wrapped with the master key
 	IsDir          bool   `gorm:"default:false"`             // metadata-only folder marker
 	Status         string `gorm:"size:32;default:uploading"` // uploading/ready/deleted
 	CreatedAt      time.Time

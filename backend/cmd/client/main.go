@@ -15,14 +15,15 @@ import (
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	server := flag.String("server", os.Getenv("GSC_SERVER"), "服务端地址，例如 http://192.168.1.10:8080；留空则在网页中设置")
-	listen := flag.String("listen", ":8190", "本地监听地址")
+	listen := flag.String("listen", "127.0.0.1:8190", "本地监听地址")
+	controlKey := flag.String("control-key", os.Getenv("GSC_AGENT_CONTROL_KEY"), "客户端控制面加密密钥（与服务端 GSC_AGENT_CONTROL_KEY 一致）")
 	window := flag.Int("window", 8, "上传并发分片窗口（本机直连百度）")
 	dlConns := flag.Int("dl-conns", 4, "下载并发连接数（本机直连百度，最多 8）")
 	webui := flag.String("webui", "", "本地静态 Web UI 目录；留空使用内嵌页面")
 	flag.Parse()
 
 	d, err := clientd.New(clientd.Options{
-		Server: *server, Window: *window, DLConns: *dlConns, WebUI: *webui,
+		Server: *server, Window: *window, DLConns: *dlConns, WebUI: *webui, ControlKey: *controlKey,
 	})
 	if err != nil {
 		log.Fatalf("客户端启动失败: %v", err)

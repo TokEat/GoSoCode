@@ -19,8 +19,8 @@ Web UI 通过 `GET /api/client/info` 自动识别绑定对象：服务端答 `{"
 go run ./cmd/server                        # :8080；GSC_WEBUI 指向前端 dist 可直接托管页面
 
 # 客户端
-go run ./cmd/client -server http://<服务端>:8080 [-listen :8090] [-window 8] [-dl-conns 4] [-webui <dist目录>]
-# 然后浏览器访问 http://localhost:8090（-webui 留空时页面由服务端代理提供）
+GSC_AGENT_CONTROL_KEY=$(openssl rand -hex 32) go run ./cmd/client -server http://<服务端>:8080 [-listen 127.0.0.1:8190] [-control-key <同一密钥>] [-window 8] [-dl-conns 4] [-webui <dist目录>]
+# 然后浏览器访问 http://localhost:8190（-webui 留空时页面由服务端代理提供）
 ```
 
 前端开发时把 vite 代理指向客户端即可体验 client 模式：`VITE_API_TARGET=http://localhost:8090 npm run dev`。
@@ -62,6 +62,7 @@ agent 接口会把节点的 `access_token` 交给客户端——**等同于该�
 
 - 客户端模式只适合**自部署 / 受信成员**场景，不适合完全开放注册的平台；
 - 可用 `GSC_AGENT_ENABLED=0` 整体关闭 agent 接口（客户端会退化为无法上传下载）；
+- agent 接口会下发百度 `access_token`，因此服务端与客户端必须配置相同的 `GSC_AGENT_CONTROL_KEY`（`openssl rand -hex 32` 生成）。客户端控制请求的 JWT、参数和正文，以及 agent 响应中的 `access_token`/文件密钥均使用 AES-256-GCM 加密；生产环境仍建议部署 HTTPS。
 - 依旧只使用官方 OpenAPI（superfile2 / dlink），不触碰 BDUSS 等封号高危路径。
 
 ## 配置
@@ -69,6 +70,7 @@ agent 接口会把节点的 `access_token` 交给客户端——**等同于该�
 | 环境变量 / 参数 | 默认 | 说明 |
 |---|---|---|
 | `GSC_AGENT_ENABLED` | `1` | 服务端 agent 接口开关 |
+| `GSC_AGENT_CONTROL_KEY` | _(空)_ | 64 位十六进制密钥；必须同时设置在服务端和 CLI 客户端，未设置时 agent 接口拒绝请求 |
 | `GSC_AGENT_WINDOW` | `8` | agent init 响应中的建议上传窗口 |
 | `GSC_WEBUI` | `webui` | 服务端静态 Web UI 目录（存在才生效，SPA 回退 index.html） |
 | client `-window` | `8` | 上传并发分片窗口（覆盖 plan 的 window） |

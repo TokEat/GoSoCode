@@ -3,7 +3,9 @@
 export interface FileItem {
   id: number; path: string; size: number; status: string; created_at: string; modified: string; is_dir: boolean; owner: string;
   node_id?: number; remote_path?: string; download_url?: string; mount?: boolean;
+  protected?: boolean; protected_own?: boolean; protected_by?: string;
 }
+export interface ProtectInfo { protected: boolean; owner?: string; is_dir?: boolean; password?: string; }
 export interface Storage { total: number; used: number; free: number; }
 export interface TransferLogItem { ID: number; Kind: string; Name: string; Path: string; Size: number; At: string; }
 export interface JobItem { ID: string; Type: string; Status: string; Progress: number; Error: string; CreatedAt: string; }
@@ -24,10 +26,12 @@ export interface Me {
   bytes_up: number; bytes_down: number; file_count: number; created_at: string;
 }
 export interface LogItem { ID: number; At: string; Username: string; Action: string; Detail: string; IP: string; }
+export interface LogsPage { logs: LogItem[]; total: number; page: number; page_size: number; }
 export interface BaiduConfig {
   app_key: string; sign_key: string; redirect_uri: string;
   has_secret: boolean; configured: boolean;
 }
+export interface SystemConfig { encrypt_storage: boolean; log_max_entries: number; }
 export type UserInput = { username: string; password?: string; role: string; status: string };
 export interface TrafficRow { id: number; label: string; bytes_up: number; bytes_down: number; }
 export interface TrafficPoint { t: number; up: number; down: number; }
@@ -56,10 +60,16 @@ async function req(path: string, opts: RequestInit = {}) {
   const res = await fetch(`/api${path}`, { ...opts, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || res.statusText);
+    const err = new Error(body.error || res.statusText) as Error & { status?: number; protected?: boolean; owner?: string };
+    err.status = res.status;
+    err.protected = !!body.protected;
+    err.owner = body.owner;
+    throw err;
   }
   return res;
 }
+// appends ?pwd= for operations on password-protected items
+const pq = (pwd?: string) => (pwd ? `?pwd=${encodeURIComponent(pwd)}` : "");
 const json = (p: string, method: string, body?: any) =>
   req(p, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined })
     .then((r) => r.json());
@@ -72,13 +82,27 @@ export const api = {
 
   // files
   storage: (): Promise<Storage> => json("/storage", "GET"),
-  listFiles: (path = "/"): Promise<FileItem[]> => json(`/files?path=${encodeURIComponent(path)}`, "GET").then((r) => r.files),
-  createFolder: (path: string) => json("/files/folder", "POST", { path }),
-  move: (src: string, dst: string) => json("/files/move", "POST", { src, dst }),
-  deletePath: (path: string) => json("/files/delete-path", "POST", { path }),
-  deleteFolder: (path: string) => json("/files/delete-folder", "POST", { path }),
-  deleteFile: (id: number) => json(`/files/${id}`, "DELETE"),
-  renameFile: (id: number, path: string) => json(`/files/${id}/rename`, "POST", { path }),
+  listFiles: (path = "/", pwd?: string): Promise<FileItem[]> =>
+    json(`/files?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.files),
+  createFolder: (path: string, pwd?: string) => json(`/files/folder${pq(pwd)}`, "POST", { path }),
+  move: (src: string, dst: string, pwd?: string) => json(`/files/move${pq(pwd)}`, "POST", { src, dst }),
+  deletePath: (path: string, pwd?: string) => json(`/files/delete-path${pq(pwd)}`, "POST", { path }),
+  deleteFolder: (path: string, pwd?: string) => json(`/files/delete-folder${pq(pwd)}`, "POST", { path }),
+  deleteFile: (id: number, pwd?: string) => json(`/files/${id}${pq(pwd)}`, "DELETE"),
+  renameFile: (id: number, path: string, pwd?: string) => json(`/files/${id}/rename${pq(pwd)}`, "POST", { path }),
+
+  // password protection (私密)
+  getProtect: (path: string): Promise<ProtectInfo> => json(`/files/protect?path=${encodeURIComponent(path)}`, "GET"),
+  setProtect: (path: string, isDir: boolean, password: string, pwd?: string) =>
+    json(`/files/protect${pq(pwd)}`, "POST", { path, is_dir: isDir, password }),
+  unprotect: (path: string, pwd?: string) => json(`/files/unprotect${pq(pwd)}`, "POST", { path }),
+  checkAccess: (id?: number, path?: string, pwd?: string): Promise<{ ok: boolean }> => {
+    const params = new URLSearchParams();
+    if (id !== undefined) params.set("id", String(id));
+    if (path) params.set("path", path);
+    if (pwd) params.set("pwd", pwd);
+    return json(`/files/access-check?${params.toString()}`, "GET");
+  },
 
   // transfers
   listJobs: (): Promise<JobItem[]> => json("/jobs", "GET").then((r) => r.jobs),
@@ -109,7 +133,13 @@ export const api = {
 
   // admin: traffic + logs
   traffic: (interval = 30): Promise<Traffic> => json(`/admin/traffic?interval=${interval}`, "GET"),
-  logs: (): Promise<LogItem[]> => json("/admin/logs", "GET").then((r) => r.logs),
+  logs: (page = 1, pageSize = 20, action = ""): Promise<LogsPage> =>
+    json(`/admin/logs?page=${page}&page_size=${pageSize}${action ? `&action=${encodeURIComponent(action)}` : ""}`, "GET")
+      .then((r) => ({ ...r, logs: r.logs || [] })),
+
+  // admin: system settings
+  getSystemConfig: (): Promise<SystemConfig> => json("/admin/system-config", "GET"),
+  saveSystemConfig: (cfg: Partial<SystemConfig>): Promise<SystemConfig> => json("/admin/system-config", "PUT", cfg),
 };
 
 export interface ClientInfo {
@@ -159,8 +189,8 @@ export const clientApi = {
   tasks: (): Promise<ClientTask[]> => json("/client/transfers", "GET").then((r) => r.tasks),
   upload: (localPath: string, remoteDir: string): Promise<{ id: string }> =>
     json("/client/transfers/upload", "POST", { local_path: localPath, remote_dir: remoteDir }),
-  download: (file: { path: string; name: string }): Promise<{ id: string }> =>
-    json("/client/transfers/download", "POST", { path: file.path, name: file.name }),
+  download: (file: { path: string; name: string; pwd?: string }): Promise<{ id: string }> =>
+    json("/client/transfers/download", "POST", { path: file.path, name: file.name, pwd: file.pwd }),
   cancel: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}/cancel`, "POST"),
   remove: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}`, "DELETE"),
 };

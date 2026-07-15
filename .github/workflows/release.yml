@@ -118,27 +118,32 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true
 
       - name: Build GSC_CLIENT_DIR layout
         run: |
           mkdir -p client-binaries
           # bin-<os>-<arch> artifacts contain raw server/client binaries at the root.
-          for d in artifacts/bin-*/; do
-            target=$(basename "$d")
-            target="${target#bin-}"   # strip "bin-" prefix
+          for target in linux-amd64 linux-arm64 windows-amd64 windows-arm64 darwin-amd64 darwin-arm64; do
+            d="artifacts/bin-${target}"
+            test -d "$d" || { echo "missing artifact: $d" >&2; exit 1; }
             os="${target%%-*}"
             arch="${target##*-}"
             out="client-binaries/${os}-${arch}"
             mkdir -p "$out"
             for f in server client server.exe client.exe; do
-              if [ -f "${d}${f}" ]; then
-                cp "${d}${f}" "$out/"
+              if [ -f "${d}/${f}" ]; then
+                cp "${d}/${f}" "$out/"
               fi
             done
+            if [ "$os" = windows ]; then
+              test -f "$out/client.exe" || { echo "missing Windows client for $target" >&2; exit 1; }
+            else
+              test -f "$out/client" || { echo "missing client for $target" >&2; exit 1; }
+            fi
           done
           find client-binaries -type f | sort
           tar -czf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" -C client-binaries .
+          tar -tzf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" | sort
           mkdir -p release-assets
           mv "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" release-assets/
           ls -lh release-assets/

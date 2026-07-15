@@ -62,7 +62,7 @@ go run ./cmd/server
 ```bash
 # 解压后 (Windows 用 .exe)
 ./client -server http://localhost:8080
-# 默认监听 :8090，浏览器访问 http://localhost:8090 即可
+# 默认仅监听 127.0.0.1:8190，浏览器访问 http://localhost:8190 即可
 ```
 
 客户端会接管全部 UI，浏览器看到的页面就是同一个，只是上传/下载的数据走本机。
@@ -101,7 +101,7 @@ GSC_WEBUI=./frontend/dist ./server                  # 用本地 dist 替换内�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GSC_ADDR` | `:8080` | HTTP 监听地址 |
+| `GSC_ADDR` | `:8080` | HTTP 监听地址（生产环境应由 HTTPS 反向代理对外提供服务） |
 | `GSC_DB` | `gosocode.db` | SQLite 文件路径 |
 | `GSC_JWT_SECRET` | `dev-insecure-change-me` | JWT 签名密钥 (生产必改) |
 | `GSC_REDIS` | _(空)_ | Redis 地址；空 = 内存协调 (单实例) |
@@ -112,6 +112,7 @@ GSC_WEBUI=./frontend/dist ./server                  # 用本地 dist 替换内�
 | `GSC_STREAM_MAX_CONCURRENT` | `8` | 同时进行的流式上传会话数 |
 | `GSC_STREAM_WINDOW` | `3` | 流式上传飞行分片数 |
 | `GSC_AGENT_ENABLED` | `1` | 是否允许 CLI 客户端直连 (会下发 access_token) |
+| `GSC_AGENT_CONTROL_KEY` | _(空)_ | 64 位十六进制密钥；启用 CLI 直连时必须与每个客户端的同名变量一致，用于 AES-256-GCM 加密控制面报文 |
 | `GSC_AGENT_WINDOW` | `8` | 客户端飞行分片数 (本机 leg 免费可加大) |
 | `GSC_WEBUI` | `webui` | 内嵌 UI 的目录覆盖 |
 | `GSC_CLIENT_DIR` | _(空)_ | CLI 客户端二进制目录，启动后可通过 Web 下载 |
@@ -192,7 +193,7 @@ docs/
 ## 安全须知
 
 - **不要在公网裸跑默认 JWT secret**。第一件事就是改 `GSC_JWT_SECRET`。
-- `GSC_AGENT_ENABLED=1` 时，平台会向 CLI 客户端下发百度 access_token。
+- `GSC_AGENT_ENABLED=1` 时，平台会向 CLI 客户端下发百度 access_token。必须设置同一份 `GSC_AGENT_CONTROL_KEY` 到服务端与客户端，控制请求中的 JWT、参数和 agent 响应中的令牌均使用 AES-256-GCM 加密；仍建议在生产环境部署 HTTPS。
   这等于把整个百度账号的控制权交给运行客户端的人 — 仅在可信部署中开启。
 - OAuth AppKey / SecretKey 可以通过环境变量传入，**也可以在管理后台填并保存到 DB**。
   管理后台填写的优先级更高，便于不重启滚动更新。

@@ -6,6 +6,7 @@ package job
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,8 @@ import (
 	"gosocode/internal/account"
 	"gosocode/internal/baidu"
 	"gosocode/internal/coord"
+	"gosocode/internal/crypto"
+	"gosocode/internal/keystore"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 	"gosocode/internal/realtime"
@@ -34,19 +37,20 @@ type uploadTask struct {
 }
 
 type Manager struct {
-	db     *gorm.DB
-	pool   *account.Pool
-	client *baidu.Client
-	coord  *coord.Coordinator
-	hub    *realtime.Hub
-	meter  *metrics.Meter
-	queue  chan uploadTask
+	db      *gorm.DB
+	pool    *account.Pool
+	client  *baidu.Client
+	coord   *coord.Coordinator
+	hub     *realtime.Hub
+	meter   *metrics.Meter
+	queue   chan uploadTask
+	keysDir string // local backup store for per-node encryption keys
 }
 
-func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord.Coordinator, hub *realtime.Hub, meter *metrics.Meter, workers int) *Manager {
+func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord.Coordinator, hub *realtime.Hub, meter *metrics.Meter, workers int, keysDir string) *Manager {
 	m := &Manager{
 		db: db, pool: pool, client: client, coord: co, hub: hub, meter: meter,
-		queue: make(chan uploadTask, 256),
+		queue: make(chan uploadTask, 256), keysDir: keysDir,
 	}
 	if workers <= 0 {
 		workers = 4
@@ -55,7 +59,39 @@ func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord
 		go m.worker()
 	}
 	go m.uploadJanitor()
+	go m.auditJanitor()
 	return m
+}
+
+// auditJanitor trims the audit log to the configured retention cap
+// (SystemConfig.LogMaxEntries, default 500), oldest entries first.
+func (m *Manager) auditJanitor() {
+	m.trimAuditLogs()
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		m.trimAuditLogs()
+	}
+}
+
+func (m *Manager) trimAuditLogs() {
+	var sc models.SystemConfig
+	m.db.First(&sc, 1)
+	max := sc.LogMaxEntries
+	if max <= 0 {
+		max = 500
+	}
+	var count int64
+	m.db.Model(&models.AuditLog{}).Count(&count)
+	if count <= int64(max) {
+		return
+	}
+	var cutoff models.AuditLog
+	if err := m.db.Model(&models.AuditLog{}).Order("id desc").Offset(max - 1).First(&cutoff).Error; err != nil {
+		return
+	}
+	res := m.db.Where("id < ?", cutoff.ID).Delete(&models.AuditLog{})
+	log.Printf("[janitor] audit log trimmed deleted=%d kept<=%d", res.RowsAffected, max)
 }
 
 // uploadJanitor reaps abandoned resumable-upload sessions (browser closed mid
@@ -162,6 +198,19 @@ func (m *Manager) runUpload(t uploadTask) {
 		return
 	}
 
+	// At-rest encryption: swap the temp file for its AES-256-CTR ciphertext
+	// before hashing, so Baidu only ever sees encrypted bytes. CTR preserves
+	// the size, so all placement/quota math done so far stays valid.
+	var sc models.SystemConfig
+	m.db.First(&sc, 1)
+	if sc.EncryptStorage && t.size > 0 {
+		if err := m.encryptTemp(&t, sc.MasterKey, acc.ID, job.FileID); err != nil {
+			m.fail(t, err)
+			return
+		}
+		defer os.Remove(t.tmpPath) // ciphertext temp (the original is already gone)
+	}
+
 	// Slice size follows the node's VIP tier (4/16/32MB).
 	sliceSize := baidu.SliceSizeForVip(acc.VipType)
 
@@ -242,6 +291,66 @@ func (m *Manager) runUpload(t uploadTask) {
 	})
 
 	m.setStatus(t, "done", 100, "")
+}
+
+// encryptTemp streams t.tmpPath through AES-256-CTR into a fresh temp file,
+// replaces t.tmpPath with it, and records the wrapped key material on the File
+// row so downloads can decrypt. The key is the target node's account key
+// (one per node, double-stored in DB + KeysDir); the IV is fresh per file.
+func (m *Manager) encryptTemp(t *uploadTask, masterKey string, accID, fileID uint) error {
+	key, err := keystore.NodeKey(m.db, masterKey, m.keysDir, accID)
+	if err != nil {
+		return err
+	}
+	iv, err := cryptoutil.NewIV()
+	if err != nil {
+		return err
+	}
+	src, err := os.Open(t.tmpPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	enc, err := cryptoutil.NewCTRReader(src, key, iv, 0)
+	if err != nil {
+		return err
+	}
+	dst, err := os.CreateTemp("", "gsc-enc-*")
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, enc); err != nil {
+		dst.Close()
+		os.Remove(dst.Name())
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(dst.Name())
+		return err
+	}
+
+	wk, err := cryptoutil.Wrap(masterKey, hex.EncodeToString(key))
+	if err != nil {
+		os.Remove(dst.Name())
+		return err
+	}
+	wiv, err := cryptoutil.Wrap(masterKey, hex.EncodeToString(iv))
+	if err != nil {
+		os.Remove(dst.Name())
+		return err
+	}
+	if err := m.db.Model(&models.File{}).Where("id = ?", fileID).Updates(map[string]any{
+		"encrypted": true, "enc_key": wk, "enc_iv": wiv, "updated_at": time.Now(),
+	}).Error; err != nil {
+		os.Remove(dst.Name())
+		return err
+	}
+
+	src.Close()
+	os.Remove(t.tmpPath)
+	t.tmpPath = dst.Name()
+	log.Printf("[job] upload encrypted at rest job=%s path=%s", t.jobID, t.logical)
+	return nil
 }
 
 // streamChunks reads the temp file one sliceSize block at a time and uploads

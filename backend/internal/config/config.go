@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 )
 
@@ -23,10 +24,12 @@ type Config struct {
 	StreamMaxConcurrent int  // max simultaneous streaming-upload sessions (memory guard)
 	StreamWindow        int  // in-flight slice window advertised to clients
 
-	AgentEnabled bool   // allow CLI clients to transfer directly against Baidu
-	AgentWindow  int    // in-flight slice window advertised to CLI clients (bigger: localhost leg is free)
-	WebUIDir     string // if the dir exists, serve the built web UI from it
-	ClientDir    string // if set, serves CLI client binaries at /api/client/download/<os>/<arch>
+	AgentEnabled    bool   // allow CLI clients to transfer directly against Baidu
+	AgentWindow     int    // in-flight slice window advertised to CLI clients (bigger: localhost leg is free)
+	AgentControlKey string // 32-byte hex key encrypting CLI control-plane packets
+	WebUIDir        string // if the dir exists, serve the built web UI from it
+	ClientDir       string // if set, serves CLI client binaries at /api/client/download/<os>/<arch>
+	KeysDir         string // local backup copies of per-node encryption keys (second store besides the DB)
 }
 
 func env(key, def string) string {
@@ -53,10 +56,12 @@ func Load() *Config {
 		StreamMaxConcurrent: envInt("GSC_STREAM_MAX_CONCURRENT", 8),
 		StreamWindow:        envInt("GSC_STREAM_WINDOW", 3),
 
-		AgentEnabled: env("GSC_AGENT_ENABLED", "1") != "0",
-		AgentWindow:  envInt("GSC_AGENT_WINDOW", 8),
-		WebUIDir:     env("GSC_WEBUI", "webui"),
-		ClientDir:    env("GSC_CLIENT_DIR", ""),
+		AgentEnabled:    env("GSC_AGENT_ENABLED", "1") != "0",
+		AgentWindow:     envInt("GSC_AGENT_WINDOW", 8),
+		AgentControlKey: env("GSC_AGENT_CONTROL_KEY", ""),
+		WebUIDir:        env("GSC_WEBUI", "webui"),
+		ClientDir:       env("GSC_CLIENT_DIR", ""),
+		KeysDir:         env("GSC_KEYS_DIR", filepath.Join(filepath.Dir(env("GSC_DB", "gosocode.db")), "gsc-keys")),
 	}
 }
 

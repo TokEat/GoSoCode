@@ -571,12 +571,18 @@ func SliceFileMD5s(path string, sliceSize int64) (blocks []string, size int64, e
 		return nil, 0, err
 	}
 	defer f.Close()
+	return SliceReaderMD5s(f, sliceSize)
+}
+
+// SliceReaderMD5s is SliceFileMD5s over an arbitrary stream, e.g. an
+// encrypting reader wrapping the file.
+func SliceReaderMD5s(r io.Reader, sliceSize int64) (blocks []string, size int64, err error) {
 	if sliceSize <= 0 {
 		sliceSize = ChunkSize
 	}
 	buf := make([]byte, sliceSize)
 	for {
-		n, rerr := io.ReadFull(f, buf)
+		n, rerr := io.ReadFull(r, buf)
 		if n > 0 {
 			sum := md5.Sum(buf[:n])
 			blocks = append(blocks, hex.EncodeToString(sum[:]))

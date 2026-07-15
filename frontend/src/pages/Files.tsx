@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, FileItem, Storage } from "../lib/api";
+import { api, auth, FileItem, Storage } from "../lib/api";
 import { Card, statusBadge, useToast, useDialog } from "../ui";
 import { humanSize, fmtTime } from "../lib/format";
 import { useTransfers } from "../transfer";
@@ -31,7 +31,7 @@ function extOf(name: string): string {
   return i > 0 ? name.slice(i + 1).toUpperCase() + " 文件" : "文件";
 }
 
-interface FolderRow { name: string; count: number; size: number; modified: string; }
+interface FolderRow { name: string; count: number; size: number; modified: string; protected?: boolean; protectedOwn?: boolean; protectedBy?: string; }
 
 // Derive folders + files directly under `cwd`. Explicit empty dirs (is_dir) are
 // merged in so they show even with no children.
@@ -54,6 +54,7 @@ function buildListing(files: FileItem[], cwd: string) {
       if (f.is_dir) {
         const r = touch(rest);
         if (f.modified > r.modified) r.modified = f.modified;
+        if (f.protected) { r.protected = true; r.protectedOwn = f.protected_own; r.protectedBy = f.protected_by; }
       } else here.push(f);
     } else {
       const r = touch(rest.slice(0, slash));
@@ -104,13 +105,52 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const dialog = useDialog();
   const transfers = useTransfers();
 
-  const askDelete = async (label: string, fn: () => Promise<any>, ok: string) => {
+  const askDelete = async (label: string, p: string, fn: (pwd?: string) => Promise<any>, ok: string) => {
     if (await dialog.confirm({ title: "删除确认", message: `确定删除 ${label} 吗?此操作不可撤销。`, danger: true, confirmLabel: "删除" })) {
-      run(fn(), ok);
+      runProtected(p, fn, ok);
     }
   };
 
-  const refresh = () => api.listFiles(cwd).then(setFiles).catch(() => {});
+  // Session-memory access passwords, keyed by logical path (no trailing slash).
+  // pwdFor also matches ancestors, so entering a protected dir once unlocks
+  // downloads/operations inside it.
+  const pwds = useRef(new Map<string, string>());
+  function pwdFor(p: string): string | undefined {
+    let cur = fullPath(p).replace(/\/+$/, "");
+    while (cur) {
+      const v = pwds.current.get(cur);
+      if (v) return v;
+      const i = cur.lastIndexOf("/");
+      if (i <= 0) break;
+      cur = cur.slice(0, i);
+    }
+    return undefined;
+  }
+
+  const refresh = async () => {
+    try {
+      setFiles(await api.listFiles(cwd, pwdFor(cwd)));
+    } catch (e: any) {
+      if (!e?.protected) return;
+      const pwd = await dialog.prompt({
+        title: "私密目录",
+        message: e.owner ? `该目录由「${e.owner}」设置了访问密码` : undefined,
+        placeholder: "请输入访问密码",
+      });
+      if (pwd && pwd.trim()) {
+        const key = normDir(cwd).replace(/\/+$/, "") || "/";
+        try {
+          const list = await api.listFiles(cwd, pwd.trim());
+          pwds.current.set(key, pwd.trim());
+          setFiles(list);
+          return;
+        } catch (e2: any) {
+          toast("err", e2.message || "访问密码错误");
+        }
+      }
+      setCwd(parentDir(cwd));
+    }
+  };
   const refreshStorage = () => api.storage().then(setStorage).catch(() => {});
   useEffect(() => { refresh(); refreshStorage(); }, [cwd]);
 
@@ -130,9 +170,33 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     setMenu({ x: e.clientX, y: e.clientY, target });
   }
 
-  async function run(p: Promise<any>, ok: string) {
-    try { await p; toast("ok", ok); refresh(); refreshStorage(); }
-    catch (e: any) { toast("err", e.message); }
+  async function runProtected(p: string, action: (pwd?: string) => Promise<any>, ok: string) {
+    const cached = pwdFor(p);
+    try {
+      await action(cached);
+      toast("ok", ok);
+      refresh(); refreshStorage();
+      return;
+    } catch (e: any) {
+      if (!e?.protected) {
+        toast("err", e.message || "操作失败");
+        return;
+      }
+      const pwd = await dialog.prompt({
+        title: "私密内容",
+        message: e.owner ? `该内容（或父目录）由「${e.owner}」设置了访问密码` : undefined,
+        placeholder: "请输入访问密码",
+      });
+      if (!pwd || !pwd.trim()) return;
+      try {
+        await action(pwd.trim());
+        pwds.current.set(fullPath(p).replace(/\/+$/, "") || "/", pwd.trim());
+        toast("ok", ok);
+        refresh(); refreshStorage();
+      } catch (e2: any) {
+        toast("err", e2?.status === 403 ? "访问密码错误" : (e2.message || "操作失败"));
+      }
+    }
   }
 
   // ---- actions -------------------------------------------------------------
@@ -174,12 +238,36 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     if (cwd === "/") { toast("info", "请先进入一个挂载节点"); return; }
     const name = await dialog.prompt({ title: "新建文件夹", placeholder: "文件夹名称" });
     if (!name || !name.trim()) return;
-    run(api.createFolder(normDir(cwd) + name.trim()), "文件夹已创建");
+    runProtected(cwd, (pwd) => api.createFolder(normDir(cwd) + name.trim(), pwd), "文件夹已创建");
   }
 
   async function doDownload(item: FileItem) {
+    let pwd = pwdFor(item.path);
+    if (item.protected && !item.protected_own && !pwd) {
+      const entered = await dialog.prompt({
+        title: "私密文件",
+        message: item.protected_by ? `该文件由「${item.protected_by}」设置了访问密码` : undefined,
+        placeholder: "请输入访问密码",
+      });
+      if (!entered || !entered.trim()) return;
+      pwd = entered.trim();
+    }
+    // Verify the password before creating a transfer so a wrong password is
+    // reported immediately instead of appearing as a network error.
+    if (pwd) {
+      try {
+        // Remote-download items use the Baidu fs_id as id and must be checked by path.
+        const checkId = item.download_url ? undefined : item.id;
+        await api.checkAccess(checkId, item.path, pwd);
+        if (item.protected && !item.protected_own) pwds.current.set(fullPath(item.path), pwd);
+      } catch (e: any) {
+        if (e?.status === 403) toast("err", "访问密码错误");
+        else toast("err", e?.message || "访问校验失败");
+        return;
+      }
+    }
     try {
-      await transfers.startDownload(item);
+      await transfers.startDownload({ ...item, pwd });
       toast("info", transfers.clientMode
         ? "本机下载任务已创建，可在「传输管理」查看进度"
         : "已加入下载队列，可在「传输管理」查看进度");
@@ -188,42 +276,95 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     }
   }
 
-  async function doRename(path: string) {
-    const cur = baseName(path);
+  async function doRename(p: string) {
+    const cur = baseName(p);
     const name = await dialog.prompt({ title: "重命名", defaultValue: cur, placeholder: "新名称" });
     if (!name || !name.trim() || name.trim() === cur) return;
-    run(api.move(path, parentDir(path) + name.trim()), "已重命名");
+    runProtected(p, (pwd) => api.move(p, parentDir(p) + name.trim(), pwd), "已重命名");
   }
 
   function paste(targetDir: string) {
     if (!clip) return;
     const dst = normDir(targetDir) + baseName(clip.path);
-    run(api.move(clip.path, dst), "已粘贴").then(() => setClip(null));
+    runProtected(clip.path, (pwd) => api.move(clip.path, dst, pwd), "已粘贴").then(() => setClip(null));
+  }
+
+  // ---- password protection (私密) -------------------------------------------
+
+  async function setPassword(p: string, isDir: boolean) {
+    const newPwd = await dialog.prompt({ title: "设为私密", placeholder: "访问密码（4-64 个字符）" });
+    if (!newPwd || !newPwd.trim()) return;
+    runProtected(p, (pwd) => api.setProtect(p, isDir, newPwd.trim(), pwd), "已设置访问密码，其他用户需输入密码才能访问");
+  }
+
+  async function removeProtect(p: string) {
+    if (await dialog.confirm({ title: "取消私密", message: `确定移除 ${baseName(p)} 的访问密码吗？`, confirmLabel: "移除" })) {
+      runProtected(p, (pwd) => api.unprotect(p, pwd), "已取消私密");
+    }
+  }
+
+  async function viewPassword(p: string, isDir: boolean) {
+    try {
+      const info = await api.getProtect(p);
+      if (!info.protected) { toast("info", "该项未设置密码"); refresh(); return; }
+      if (info.password === undefined) { toast("err", "只有设置者本人或管理员可以查看密码"); return; }
+      const next = await dialog.prompt({
+        title: `访问密码（设置者：${info.owner || "未知"}）`,
+        defaultValue: info.password,
+        placeholder: "修改后确认即可更新密码",
+      });
+      if (next && next.trim() && next.trim() !== info.password) {
+        runProtected(p, (pwd) => api.setProtect(p, isDir, next.trim(), pwd), "访问密码已更新");
+      }
+    } catch (e: any) {
+      toast("err", e.message);
+    }
   }
 
   // ---- context menu items --------------------------------------------------
 
   function menuItems(t: Target): (MenuItem | "div")[] {
     const wrap = (fn: () => void) => () => { closeMenu(); fn(); };
+    // owner accesses passwordless; admin still needs the password to access
+    // but can always view/manage it, so both get the manage menu items.
+    const canManage = (own?: boolean) => own || auth.role === "admin";
     if (t.kind === "file") {
       const it = t.item;
+      const fp = fullPath(it.path);
+      const protect: (MenuItem | "div")[] = it.protected
+        ? canManage(it.protected_own)
+          ? [{ label: "查看/修改密码", onClick: wrap(() => viewPassword(fp, false)) },
+             { label: "取消私密", onClick: wrap(() => removeProtect(fp)) }]
+          : []
+        : [{ label: "设为私密…", onClick: wrap(() => setPassword(fp, false)) }];
       return [
         { label: "下载", onClick: wrap(() => doDownload(it)), disabled: it.status !== "ready" },
-        { label: "剪切", onClick: wrap(() => setClip({ path: fullPath(it.path), isDir: false })) },
-        { label: "重命名", onClick: wrap(() => doRename(fullPath(it.path))) },
+        { label: "剪切", onClick: wrap(() => setClip({ path: fp, isDir: false })) },
+        { label: "重命名", onClick: wrap(() => doRename(fp)) },
+        ...protect,
         "div",
-        { label: "删除", danger: true, onClick: wrap(() => askDelete(baseName(it.path), () => api.deletePath(it.path), "已删除")) },
+        { label: "删除", danger: true, onClick: wrap(() => askDelete(baseName(it.path), it.path, (pwd) => api.deletePath(it.path, pwd), "已删除")) },
       ];
     }
     if (t.kind === "folder") {
       const atRoot = cwd === "/";
+      const row = folderRows.find((d) => d.name === t.name);
+      const protect: (MenuItem | "div")[] = atRoot
+        ? []
+        : row?.protected
+          ? canManage(row.protectedOwn)
+            ? [{ label: "查看/修改密码", onClick: wrap(() => viewPassword(t.path, true)) },
+               { label: "取消私密", onClick: wrap(() => removeProtect(t.path)) }]
+            : []
+          : [{ label: "设为私密…", onClick: wrap(() => setPassword(t.path, true)) }];
       return [
         { label: "打开", onClick: wrap(() => enter(t.name)) },
         { label: "剪切", onClick: wrap(() => setClip({ path: t.path, isDir: true })), disabled: atRoot },
         { label: "粘贴到此", onClick: wrap(() => paste(t.path)), disabled: !clip || atRoot },
         { label: "重命名", onClick: wrap(() => doRename(t.path)), disabled: atRoot },
+        ...protect,
         "div",
-        { label: "删除", danger: true, disabled: atRoot, onClick: wrap(() => askDelete(`文件夹 ${t.name} 及其内容`, () => api.deleteFolder(t.path), "已删除")) },
+        { label: "删除", danger: true, disabled: atRoot, onClick: wrap(() => askDelete(`文件夹 ${t.name} 及其内容`, t.path, (pwd) => api.deleteFolder(t.path, pwd), "已删除")) },
       ];
     }
     return [
@@ -292,7 +433,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                 <tr key={"d:" + d.name} className="row-folder" style={cutPath === dp ? { opacity: 0.5 } : undefined}
                   onDoubleClick={() => enter(d.name)}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
-                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span></div></td>
+                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}</div></td>
                   <td className="muted">{humanSize(d.size)}</td>
                   <td className="muted">{d.modified ? fmtTime(d.modified) : "—"}</td>
                   <td className="muted">文件夹 ({d.count})</td>
@@ -305,7 +446,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
               return (
                 <tr key={"f:" + f.id} style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
-                  <td><div className="name-cell"><FileIcon /> <span>{name}</span> {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>} {f.status !== "ready" && statusBadge(f.status)}</div></td>
                   <td className="muted">{humanSize(f.size)}</td>
                   <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
                   <td className="muted">{extOf(name)}</td>
@@ -313,7 +454,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                     <div className="row">
                       {f.status === "ready" && <button className="btn ghost sm" onClick={() => doDownload(f)}>下载</button>}
                       <button className="btn ghost sm" onClick={() => doRename(fullPath(f.path))}>重命名</button>
-                      <button className="btn danger sm" onClick={() => askDelete(name, () => api.deletePath(f.path), "已删除")}>删除</button>
+                      <button className="btn danger sm" onClick={() => askDelete(name, f.path, (pwd) => api.deletePath(f.path, pwd), "已删除")}>删除</button>
                     </div>
                   </td>
                 </tr>
