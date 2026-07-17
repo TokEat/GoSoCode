@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"gosocode/internal/baidu"
-	"gosocode/internal/crypto"
+	cryptoutil "gosocode/internal/crypto"
 )
 
 // uploadInit is the agent init response: everything needed to push slices to

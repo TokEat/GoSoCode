@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"gosocode/internal/baidu"
-	"gosocode/internal/crypto"
+	controlcrypto "gosocode/internal/crypto"
 	"gosocode/internal/webui"
 )
 

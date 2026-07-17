@@ -7,3 +7,4 @@ dist/
 .DS_Store
 *.tsbuildinfo
 backend/gosocode.db
+backend/gsc-keys/

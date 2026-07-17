@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gosocode/internal/crypto"
+	cryptoutil "gosocode/internal/crypto"
 )
 
 const (

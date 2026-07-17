@@ -288,11 +288,11 @@ func (s *Server) fileByRemote(accID uint, remotePath string) *models.File {
 // fileEncKeys unwraps a file's per-file AES key and CTR IV.
 func (s *Server) fileEncKeys(f *models.File) (key, iv []byte, err error) {
 	mk := s.systemConfig().MasterKey
-	keyHex, err := cryptoutil.Unwrap(mk, f.EncKey)
+	keyHex, err := crypto.Unwrap(mk, f.EncKey)
 	if err != nil {
 		return nil, nil, err
 	}
-	ivHex, err := cryptoutil.Unwrap(mk, f.EncIV)
+	ivHex, err := crypto.Unwrap(mk, f.EncIV)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -322,7 +322,7 @@ func (s *Server) decryptedBody(resp *http.Response, f *models.File) (io.Reader, 
 			off = 0
 		}
 	}
-	return cryptoutil.NewCTRReader(resp.Body, key, iv, off)
+	return crypto.NewCTRReader(resp.Body, key, iv, off)
 }
 
 func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) {

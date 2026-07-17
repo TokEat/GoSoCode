@@ -2,12 +2,16 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -112,8 +116,12 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -121,7 +129,7 @@ jobs:
 
       - name: Build GSC_CLIENT_DIR layout
         run: |
-          mkdir -p client-binaries
+          mkdir -p client-binaries release-assets
           # bin-<os>-<arch> artifacts contain raw server/client binaries at the root.
           for target in linux-amd64 linux-arm64 windows-amd64 windows-arm64 darwin-amd64 darwin-arm64; do
             d="artifacts/bin-${target}"
@@ -130,27 +138,35 @@ jobs:
             arch="${target##*-}"
             out="client-binaries/${os}-${arch}"
             mkdir -p "$out"
-            for f in server client server.exe client.exe; do
-              if [ -f "${d}/${f}" ]; then
-                cp "${d}/${f}" "$out/"
-              fi
-            done
             if [ "$os" = windows ]; then
+              cp "$d/client.exe" "$out/client.exe"
+              cp "$d/server.exe" "release-assets/gosocode-server-${target}.exe"
               test -f "$out/client.exe" || { echo "missing Windows client for $target" >&2; exit 1; }
             else
+              cp "$d/client" "$out/client"
+              cp "$d/server" "release-assets/gosocode-server-${target}"
               test -f "$out/client" || { echo "missing client for $target" >&2; exit 1; }
             fi
           done
           find client-binaries -type f | sort
-          tar -czf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" -C client-binaries .
-          tar -tzf "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" | sort
-          mkdir -p release-assets
-          mv "gosocode-client-binaries-${{ github.ref_name }}.tar.gz" release-assets/
+          tar -czf "gosocode-client-binaries-latest.tar.gz" -C client-binaries .
+          tar -tzf "gosocode-client-binaries-latest.tar.gz" | sort
+          mv "gosocode-client-binaries-latest.tar.gz" release-assets/
           ls -lh release-assets/
+
+      - name: Update latest tag
+        run: |
+          git tag -f latest "$GITHUB_SHA"
+          git push origin refs/tags/latest --force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Latest build
           generate_release_notes: true
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
           files: release-assets/*

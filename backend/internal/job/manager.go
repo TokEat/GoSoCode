@@ -302,7 +302,7 @@ func (m *Manager) encryptTemp(t *uploadTask, masterKey string, accID, fileID uin
 	if err != nil {
 		return err
 	}
-	iv, err := cryptoutil.NewIV()
+	iv, err := crypto.NewIV()
 	if err != nil {
 		return err
 	}
@@ -311,7 +311,7 @@ func (m *Manager) encryptTemp(t *uploadTask, masterKey string, accID, fileID uin
 		return err
 	}
 	defer src.Close()
-	enc, err := cryptoutil.NewCTRReader(src, key, iv, 0)
+	enc, err := crypto.NewCTRReader(src, key, iv, 0)
 	if err != nil {
 		return err
 	}
@@ -329,12 +329,12 @@ func (m *Manager) encryptTemp(t *uploadTask, masterKey string, accID, fileID uin
 		return err
 	}
 
-	wk, err := cryptoutil.Wrap(masterKey, hex.EncodeToString(key))
+	wk, err := crypto.Wrap(masterKey, hex.EncodeToString(key))
 	if err != nil {
 		os.Remove(dst.Name())
 		return err
 	}
-	wiv, err := cryptoutil.Wrap(masterKey, hex.EncodeToString(iv))
+	wiv, err := crypto.Wrap(masterKey, hex.EncodeToString(iv))
 	if err != nil {
 		os.Remove(dst.Name())
 		return err

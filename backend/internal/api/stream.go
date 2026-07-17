@@ -183,7 +183,7 @@ func (s *Server) handleStreamPlan(c *gin.Context) {
 			s.controlJSON(c, http.StatusInternalServerError, gin.H{"error": "无法获取节点加密密钥: " + err.Error()})
 			return
 		}
-		iv, err := cryptoutil.NewIV()
+		iv, err := crypto.NewIV()
 		if err != nil {
 			s.controlJSON(c, http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -327,8 +327,8 @@ func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *mode
 			return
 		}
 		mk := s.systemConfig().MasterKey
-		wk, e1 := cryptoutil.Wrap(mk, in.EncKey)
-		wiv, e2 := cryptoutil.Wrap(mk, in.EncIV)
+		wk, e1 := crypto.Wrap(mk, in.EncKey)
+		wiv, e2 := crypto.Wrap(mk, in.EncIV)
 		if e1 != nil || e2 != nil {
 			release()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "无法保存加密密钥"})
