@@ -61,7 +61,16 @@ body {
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
   overflow: hidden;
+  transition: width 0.22s ease;
 }
+.sidebar.collapsed { width: 66px; }
+.sidebar.collapsed .brand { padding-left: 0; padding-right: 0; justify-content: center; }
+.sidebar.collapsed .brand > div { display: none; }
+.sidebar.collapsed .nav { padding: 4px 8px; }
+.sidebar.collapsed .nav-group { visibility: hidden; padding: 8px 0 0; }
+.sidebar.collapsed .nav-item { justify-content: center; padding: 10px 0; }
+.sidebar.collapsed .nav-item .label { display: none; }
+.sidebar.collapsed .sidebar-foot { padding: 10px 8px 12px; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 22px 18px 18px; }
 .brand .logo {
   width: 40px; height: 40px; flex-shrink: 0; border-radius: 13px;
@@ -100,6 +109,36 @@ body {
 .topbar h1 { font-size: 21px; font-weight: 750; margin: 0; letter-spacing: -0.01em; }
 .content { flex: 1; overflow-y: auto; padding: 8px 6px 20px; }
 .content > * { animation: rise 0.3s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* bottom transfer drawer (docked in .main below .content) */
+.transfer-drawer {
+  flex-shrink: 0; margin: 0 6px 6px;
+  background: var(--panel);
+  backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  animation: rise 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.transfer-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 12px; cursor: pointer; user-select: none;
+}
+.transfer-drawer-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.transfer-drawer-body {
+  max-height: 176px; overflow-y: auto;
+  border-top: 1px solid var(--border);
+  padding: 6px 12px 10px;
+}
+.transfer-drawer-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12.5px; }
+.drawer-kind { width: 18px; text-align: center; font-weight: 700; flex-shrink: 0; }
+.drawer-kind.upload { color: #6366f1; }
+.drawer-kind.download { color: #16a34a; }
+.drawer-name { flex: 0 0 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.drawer-bar { flex: 1; height: 6px; }
+.drawer-pct { width: 42px; text-align: right; color: var(--muted); flex-shrink: 0; }
+.drawer-info { width: 110px; text-align: right; color: var(--muted); flex-shrink: 0; }
 
 @keyframes rise {
   from { opacity: 0; transform: translateY(10px); }

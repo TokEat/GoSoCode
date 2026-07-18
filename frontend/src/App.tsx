@@ -13,6 +13,7 @@ import Traffic from "./pages/Traffic";
 import Logs from "./pages/Logs";
 import Settings from "./pages/Settings";
 import ClientSettings from "./pages/ClientSettings";
+import TransferDrawer from "./TransferDrawer";
 
 export interface JobEvent {
   job_id: string; status: string; progress: number; logical_path: string; error?: string;
@@ -77,6 +78,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
   onLogout: () => void;
 }) {
   const [page, setPage] = useState<Page>("overview");
+  const [collapsed, setCollapsed] = useState(false);
   const [jobs, setJobs] = useState<Record<string, JobEvent>>({});
   const clientMode = runtime.mode === "client";
   const isAdmin = auth.role === "admin";
@@ -124,7 +126,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
 
   return (
     <div className="app">
-      <aside className="sidebar">
+      <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
         <div className="brand">
           <span className="logo">G</span>
           <div>
@@ -135,27 +137,30 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
         <nav className="nav">
           <div className="nav-group">工作台</div>
           {USER_NAV.map((n) => (
-            <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} onClick={() => setPage(n.key)}>
-              <span className="ico">{n.ico}</span>{n.label}
+            <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} title={n.label} onClick={() => setPage(n.key)}>
+              <span className="ico">{n.ico}</span><span className="label">{n.label}</span>
             </div>
           ))}
           {isAdmin && <>
             <div className="nav-group">管理后台</div>
             {ADMIN_NAV.map((n) => (
-              <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} onClick={() => setPage(n.key)}>
-                <span className="ico">{n.ico}</span>{n.label}
+              <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} title={n.label} onClick={() => setPage(n.key)}>
+                <span className="ico">{n.ico}</span><span className="label">{n.label}</span>
               </div>
             ))}
           </>}
           {clientMode && <>
             <div className="nav-group">本地客户端</div>
-            <div className={`nav-item ${page === "client" ? "active" : ""}`} onClick={() => setPage("client")}>
-              <span className="ico">⌁</span>客户端设置
+            <div className={`nav-item ${page === "client" ? "active" : ""}`} title="客户端设置" onClick={() => setPage("client")}>
+              <span className="ico">⌁</span><span className="label">客户端设置</span>
             </div>
           </>}
         </nav>
         <div className="sidebar-foot">
-          <div className="nav-item" onClick={onLogout}><span className="ico">⎋</span>退出登录</div>
+          <div className="nav-item" title={collapsed ? "展开边栏" : "收起边栏"} onClick={() => setCollapsed(!collapsed)}>
+            <span className="ico">{collapsed ? "»" : "«"}</span><span className="label">收起边栏</span>
+          </div>
+          <div className="nav-item" title="退出登录" onClick={onLogout}><span className="ico">⎋</span><span className="label">退出登录</span></div>
         </div>
       </aside>
 
@@ -169,7 +174,11 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
         </header>
         <section className="content">
           {page === "overview" && <Overview isAdmin={isAdmin} clientMode={clientMode} goto={setPage} />}
-          {page === "files" && <Files jobs={jobs} />}
+          {/* Files stays mounted so the browsed directory (and entered
+              passwords) survive switching to other pages and back. */}
+          <div style={{ display: page === "files" ? undefined : "none" }}>
+            <Files jobs={jobs} />
+          </div>
           {page === "transfers" && <Transfers />}
           {page === "profile" && <Profile />}
           {page === "users" && isAdmin && <Users />}
@@ -187,6 +196,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
             />
           )}
         </section>
+        <TransferDrawer hidden={page === "transfers"} onViewAll={() => setPage("transfers")} />
       </main>
     </div>
   );
