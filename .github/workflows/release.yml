@@ -4,13 +4,15 @@ on:
   push:
     branches:
       - master
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-latest
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -149,17 +151,29 @@ jobs:
             fi
           done
           find client-binaries -type f | sort
-          tar -czf "gosocode-client-binaries-latest.tar.gz" -C client-binaries .
-          tar -tzf "gosocode-client-binaries-latest.tar.gz" | sort
-          mv "gosocode-client-binaries-latest.tar.gz" release-assets/
+
+          # Per-platform client archives for end users (zip on Windows,
+          # tar.gz elsewhere), plus the combined GSC_CLIENT_DIR bundle the
+          # server unpacks to serve /api/client/download.
+          for target in linux-amd64 linux-arm64 windows-amd64 windows-arm64 darwin-amd64 darwin-arm64; do
+            os="${target%%-*}"
+            if [ "$os" = windows ]; then
+              (cd "client-binaries/${target}" && zip -q "../../release-assets/gosocode-client-${target}.zip" client.exe)
+            else
+              tar -czf "release-assets/gosocode-client-${target}.tar.gz" -C "client-binaries/${target}" client
+            fi
+          done
+          tar -czf "release-assets/gosocode-client-binaries.tar.gz" -C client-binaries .
           ls -lh release-assets/
 
       - name: Update latest tag
+        if: github.ref_type != 'tag'
         run: |
           git tag -f latest "$GITHUB_SHA"
           git push origin refs/tags/latest --force
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (rolling latest)
+        if: github.ref_type != 'tag'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -169,4 +183,14 @@ jobs:
           prerelease: true
           make_latest: false
           overwrite_files: true
+          files: release-assets/*
+
+      - name: Create GitHub Release (version tag)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
           files: release-assets/*

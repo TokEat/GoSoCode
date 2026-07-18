@@ -142,14 +142,19 @@ GSC_WEBUI=./frontend/dist ./server                  # 用本地 dist 替换内�
 
 ## 客户端二进制分发
 
-项目自带 GitHub Actions 发布流水线 (`.github/workflows/release.yml`)。推送 tag 自动:
+项目自带 GitHub Actions 发布流水线 (`.github/workflows/release.yml`)。推送 `v*` tag 自动:
 
-1. 交叉编译 6 个平台二进制
-2. 同时输出按平台打包的 tar.gz / zip 和一份 `gosocode-client-binaries-<tag>.tar.gz`
-3. 附件附加到 GitHub Release
+1. 交叉编译 6 个平台的服务端 + 客户端二进制
+2. 输出各平台服务端程序 (`gosocode-server-<os>-<arch>`)、按平台打包的客户端
+   tar.gz / zip (`gosocode-client-<os>-<arch>.*`) 和一份合并的
+   `gosocode-client-binaries.tar.gz`
+3. 创建对应版本的 GitHub Release 并附加以上产物
 
-运营侧只要把那份 `client-binaries` tarball 解压到 `GSC_CLIENT_DIR` 指向的目录，
-Web 端的 `客户端设置` 页面就会自动出现下载按钮。
+(推送 master 分支则滚动更新预发布的 `latest` Release，产物相同。)
+
+运营侧只要把那份 `gosocode-client-binaries.tar.gz` 解压到 `GSC_CLIENT_DIR`
+指向的目录（或服务端启动目录下的 `client-bin/`），Web 端 `概览` 页面就会自动
+出现下载按钮，并按浏览器 UA 推荐当前平台的客户端。
 
 下载流程见 [docs/client-mode.md](docs/client-mode.md)。
 
