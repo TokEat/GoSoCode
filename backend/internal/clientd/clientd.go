@@ -102,6 +102,11 @@ func New(opts Options) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("客户端控制面加密密钥无效: %w", err)
 	}
+	if control != nil {
+		log.Printf("[client] 控制面加密已启用")
+	} else {
+		log.Printf("[client] 未配置控制面加密密钥，控制面以明文发送（服务端如设置了 GSC_AGENT_CONTROL_KEY 需用 -control-key 保持一致）")
+	}
 	d := &Daemon{
 		opts:    opts,
 		api:     &http.Client{Timeout: 60 * time.Second},
@@ -385,28 +390,38 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 		log.Printf("[client][control] %s %s failed: not connected", method, p)
 		return 0, nil, fmt.Errorf("尚未连接服务端")
 	}
-	if d.control == nil {
-		return 0, nil, fmt.Errorf("客户端未配置 GSC_AGENT_CONTROL_KEY，已拒绝发送控制面数据")
-	}
 	target, err := url.Parse(p)
 	if err != nil || target.Path == "" {
 		return 0, nil, fmt.Errorf("无效的控制面路径")
 	}
-	encrypted, err := d.control.SealRequest(method, target.Path, controlcrypto.Request{
-		Authorization: auth,
-		Query:         target.RawQuery,
-		Body:          body,
-	})
-	if err != nil {
-		return 0, nil, fmt.Errorf("加密控制请求失败: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, cfg.Server+target.Path, bytes.NewReader(encrypted))
-	if err != nil {
-		log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
-		return 0, nil, err
+	var req *http.Request
+	if d.control != nil {
+		encrypted, sealErr := d.control.SealRequest(method, target.Path, controlcrypto.Request{
+			Authorization: auth,
+			Query:         target.RawQuery,
+			Body:          body,
+		})
+		if sealErr != nil {
+			return 0, nil, fmt.Errorf("加密控制请求失败: %w", sealErr)
+		}
+		req, err = http.NewRequestWithContext(ctx, method, cfg.Server+target.Path, bytes.NewReader(encrypted))
+		if err != nil {
+			log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
+			return 0, nil, err
+		}
+		req.Header.Set(controlcrypto.Header, controlcrypto.Version)
+	} else {
+		// No control key configured: plaintext control plane (trusted
+		// deployment). A server with GSC_AGENT_CONTROL_KEY set rejects these
+		// calls with a clear configuration hint.
+		req, err = http.NewRequestWithContext(ctx, method, cfg.Server+p, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
+			return 0, nil, err
+		}
+		req.Header.Set("Authorization", auth)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(controlcrypto.Header, controlcrypto.Version)
 	resp, err := d.api.Do(req)
 	if err != nil {
 		log.Printf("[client][control] %s %s transport failed after=%s: %v", method, p, time.Since(started).Round(time.Millisecond), err)
@@ -419,6 +434,9 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 		return resp.StatusCode, nil, err
 	}
 	if resp.Header.Get(controlcrypto.Header) == controlcrypto.Version {
+		if d.control == nil {
+			return resp.StatusCode, nil, fmt.Errorf("服务端返回了加密控制响应，客户端需用相同的 GSC_AGENT_CONTROL_KEY 启动（-control-key）")
+		}
 		raw, err = d.control.OpenResponse(method, target.Path, resp.StatusCode, raw)
 		if err != nil {
 			return resp.StatusCode, nil, fmt.Errorf("解密控制响应失败: %w", err)

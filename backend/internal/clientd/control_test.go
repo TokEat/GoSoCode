@@ -58,3 +58,41 @@ func TestServerJSONEncryptsControlRequestAndDecryptsResponse(t *testing.T) {
 		t.Fatalf("unexpected response status=%d body=%s", status, raw)
 	}
 }
+
+func TestServerJSONPlaintextWithoutControlKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(controlcrypto.Header) != "" {
+			t.Fatal("unexpected control encryption marker on plaintext request")
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Fatalf("missing authorization header: %q", r.Header.Get("Authorization"))
+		}
+		if r.URL.RawQuery != "path=%2Fprivate" {
+			t.Fatalf("unexpected query: %q", r.URL.RawQuery)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != `{"size":42}` {
+			t.Fatalf("unexpected body: %s", raw)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	daemon := &Daemon{
+		api:   server.Client(),
+		cfg:   Config{Server: server.URL},
+		proxy: &httputil.ReverseProxy{},
+	}
+	status, raw, err := daemon.serverJSON(context.Background(), "Bearer test-token", http.MethodPost,
+		"/api/agent/upload/init?path=%2Fprivate", []byte(`{"size":42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusOK || string(raw) != `{"ok":true}` {
+		t.Fatalf("unexpected response status=%d body=%s", status, raw)
+	}
+}

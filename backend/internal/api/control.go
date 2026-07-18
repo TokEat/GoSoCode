@@ -22,7 +22,11 @@ func (s *Server) controlCryptoMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if c.GetHeader(crypto.Header) != crypto.Version || s.control == nil {
+		if s.control == nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "服务端未配置 GSC_AGENT_CONTROL_KEY，无法解密控制请求；请移除客户端 -control-key 或在服务端配置相同密钥"})
+			return
+		}
+		if c.GetHeader(crypto.Header) != crypto.Version {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "无效的客户端控制面加密配置"})
 			return
 		}
@@ -45,14 +49,18 @@ func (s *Server) controlCryptoMiddleware() gin.HandlerFunc {
 	}
 }
 
+// requireEncryptedAgentControl enforces control-plane encryption only when
+// the server has a key configured; without GSC_AGENT_CONTROL_KEY the agent
+// control plane runs in plaintext (trusted deployments, matching a client
+// started without -control-key).
 func (s *Server) requireEncryptedAgentControl() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s.control == nil {
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "客户端直连需要配置 GSC_AGENT_CONTROL_KEY"})
+			c.Next()
 			return
 		}
 		if encrypted, _ := c.Get(encryptedControlContextKey); encrypted != true {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "客户端直连必须使用加密控制协议"})
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "服务端已启用控制面加密，客户端需用相同的 GSC_AGENT_CONTROL_KEY 启动（-control-key）"})
 			return
 		}
 		c.Next()
@@ -60,6 +68,10 @@ func (s *Server) requireEncryptedAgentControl() gin.HandlerFunc {
 }
 
 func (s *Server) agentJSON(c *gin.Context, status int, value any) {
+	if s.control == nil {
+		c.JSON(status, value)
+		return
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "编码加密控制响应失败"})
