@@ -5,12 +5,28 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 
 	"gosocode/internal/clientd"
 )
+
+// consoleURL turns a listen address into an address a browser can open
+// (wildcard/empty hosts become 127.0.0.1).
+func consoleURL(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "http://" + listen
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -29,7 +45,16 @@ func main() {
 		log.Fatalf("客户端启动失败: %v", err)
 	}
 
-	log.Printf("本地入口 http://localhost%s（上传/下载由本机直连百度执行，浏览器仅查看进度）", *listen)
+	// Web console entry gets its own banner so it stands out from the
+	// surrounding timestamped logs.
+	fmt.Fprintf(log.Writer(), "\n"+
+		"============================================================\n"+
+		"  GoSoCode 本地客户端已启动\n"+
+		"\n"+
+		"  Web 控制台:  %s\n"+
+		"\n"+
+		"  上传/下载由本机直连百度执行，浏览器仅查看进度\n"+
+		"============================================================\n\n", consoleURL(*listen))
 	if err := http.ListenAndServe(*listen, d.Handler()); err != nil {
 		log.Fatalf("client: %v", err)
 	}

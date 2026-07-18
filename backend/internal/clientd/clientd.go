@@ -121,7 +121,7 @@ func New(opts Options) (*Daemon, error) {
 	}
 	if d.cfg.Server != "" {
 		if err := d.connect(d.cfg.Server); err != nil {
-			log.Printf("[client] 暂时无法连接服务端 %s: %v（可在网页中重新设置）", d.cfg.Server, err)
+			log.Printf("[client] 服务端 %s 暂不可达，可稍后在网页中重新设置", d.cfg.Server)
 		} else {
 			log.Printf("[client] 已连接服务端 %s", d.cfg.Server)
 			d.saveConfig()
@@ -138,6 +138,7 @@ func (d *Daemon) connect(server string) error {
 	log.Printf("[client][config] checking server=%s", server)
 	u, err := url.Parse(server)
 	if err != nil || u.Scheme == "" || u.Host == "" {
+		log.Printf("[client][config] invalid server address %q", server)
 		return fmt.Errorf("无效的服务端地址（示例: http://192.168.1.10:8080）")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
