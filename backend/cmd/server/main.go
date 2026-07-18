@@ -1,7 +1,9 @@
 package main
 
 import (
+	"flag"
 	"log"
+	"os"
 	"time"
 
 	"gosocode/internal/account"
@@ -18,7 +20,21 @@ import (
 )
 
 func main() {
+	clientDir := flag.String("client-dir", "", "client 二进制目录（布局 <os>-<arch>/client[.exe]）；默认取 GSC_CLIENT_DIR，其次 ./client-bin")
+	flag.Parse()
+
 	cfg := config.Load()
+	if *clientDir != "" {
+		cfg.ClientDir = *clientDir
+	} else if cfg.ClientDir == "" {
+		cfg.ClientDir = "client-bin"
+	}
+	if st, err := os.Stat(cfg.ClientDir); err != nil || !st.IsDir() {
+		log.Printf("client 下载未启用（目录 %s 不存在）", cfg.ClientDir)
+		cfg.ClientDir = ""
+	} else {
+		log.Printf("client 下载目录: %s", cfg.ClientDir)
+	}
 
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {

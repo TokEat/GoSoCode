@@ -2,33 +2,6 @@ import { useEffect, useState } from "react";
 import { clientApi, ClientInfo, clientDownloads, clientDownloadUrl, ClientDownloadInfo } from "../lib/api";
 import { Card, useToast } from "../ui";
 
-// Detects the current browser platform and maps it to one of the 6 binaries
-// built by .github/workflows/release.yml. Falls back gracefully on unknown
-// platforms (returns null and lets the UI show the full picker).
-function detectPlatform(): { os: string; arch: string } | null {
-  const ua = navigator.userAgent || "";
-  const uaData = (navigator as any).userAgentData as { platforms?: string[] } | undefined;
-  const platform = (uaData?.platforms?.[0] || (navigator as any).platform || "").toLowerCase();
-
-  let os = "";
-  if (/windows/i.test(platform) || /win/i.test(ua.split(" ")[0] || "")) os = "windows";
-  else if (/mac|darwin/i.test(platform)) os = "darwin";
-  else if (/linux|x11/i.test(platform) || /linux/i.test(ua)) os = "linux";
-  if (!os) return null;
-
-  let arch = "";
-  // navigator.userAgentData doesn't expose arch; fall back to UA + screen.
-  if (/arm64|aarch64/i.test(ua)) arch = "arm64";
-  else if (/wow64|win64|x64|amd64/i.test(ua) || (navigator as any).userAgent?.includes("x86_64") || (navigator as any).userAgent?.includes("x64")) arch = "amd64";
-  // Apple Silicon: navigator.platform is "MacIntel" with arm64 in UA — already caught above.
-  // iOS / iPadOS are not supported (no CLI client binaries).
-  if (!arch) {
-    // Default: most users are on amd64. Power users on Linux arm64 should override manually.
-    arch = "amd64";
-  }
-  return { os, arch };
-}
-
 function humanSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -142,15 +115,17 @@ export default function ClientSettings({ info, firstRun = false, onSaved }: Prop
   );
 }
 
-function ClientDownloadCard() {
+export function ClientDownloadCard() {
   const [info, setInfo] = useState<ClientDownloadInfo | null>(null);
-  const [detected] = useState(() => detectPlatform());
 
   useEffect(() => {
     clientDownloads().then(setInfo);
   }, []);
 
   if (!info || !info.enabled) return null;
+
+  // Platform detection is server-side (User-Agent based, arch defaults to amd64).
+  const detected = info.detected || null;
 
   const matched =
     detected && info.platforms.find((p) => p.os === detected.os && p.arch === detected.arch && !p.missing);

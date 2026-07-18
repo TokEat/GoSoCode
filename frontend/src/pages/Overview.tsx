@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { api, Me } from "../lib/api";
 import { Stat, Card } from "../ui";
 import { humanSize } from "../lib/format";
+import { ClientDownloadCard } from "./ClientSettings";
 
-export default function Overview({ isAdmin, goto }: { isAdmin: boolean; goto: (p: any) => void }) {
+export default function Overview({ isAdmin, clientMode = false, goto }: { isAdmin: boolean; clientMode?: boolean; goto: (p: any) => void }) {
   const [me, setMe] = useState<Me | null>(null);
 
   useEffect(() => { api.me().then(setMe).catch(() => {}); }, []);
@@ -29,6 +30,8 @@ export default function Overview({ isAdmin, goto }: { isAdmin: boolean; goto: (p
           {isAdmin && <button className="btn ghost" onClick={() => goto("nodes")}>管理存储节点</button>}
         </div>
       </Card>
+
+      {!clientMode && <ClientDownloadCard />}
     </div>
   );
 }

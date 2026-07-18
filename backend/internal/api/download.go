@@ -25,6 +25,38 @@ var clientPlatforms = []struct{ OS, Arch, Bin string }{
 type clientDownloadInfo struct {
 	Enabled   bool                `json:"enabled"`
 	Platforms []clientDownloadRow `json:"platforms"`
+	Detected  *detectedPlatform   `json:"detected,omitempty"`
+}
+
+type detectedPlatform struct {
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
+}
+
+// detectPlatformFromUA maps the browser User-Agent to one of the shipped
+// (os, arch) targets. Arch defaults to amd64: browser UAs rarely expose it
+// (e.g. Apple Silicon reports Intel). Mobile OSes return nil (no CLI client).
+func detectPlatformFromUA(ua string) *detectedPlatform {
+	ua = strings.ToLower(ua)
+	var osName string
+	switch {
+	// iOS/Android UAs also contain "mac os"/"linux" — check them first.
+	case strings.Contains(ua, "iphone"), strings.Contains(ua, "ipad"), strings.Contains(ua, "android"):
+		return nil
+	case strings.Contains(ua, "windows"):
+		osName = "windows"
+	case strings.Contains(ua, "mac os"), strings.Contains(ua, "macintosh"), strings.Contains(ua, "darwin"):
+		osName = "darwin"
+	case strings.Contains(ua, "linux"), strings.Contains(ua, "x11"):
+		osName = "linux"
+	default:
+		return nil
+	}
+	arch := "amd64"
+	if strings.Contains(ua, "arm64") || strings.Contains(ua, "aarch64") {
+		arch = "arm64"
+	}
+	return &detectedPlatform{OS: osName, Arch: arch}
 }
 
 type clientDownloadRow struct {
@@ -52,7 +84,11 @@ func (s *Server) handleClientDownloadInfo(c *gin.Context) {
 		}
 		rows = append(rows, row)
 	}
-	c.JSON(http.StatusOK, clientDownloadInfo{Enabled: true, Platforms: rows})
+	c.JSON(http.StatusOK, clientDownloadInfo{
+		Enabled:   true,
+		Platforms: rows,
+		Detected:  detectPlatformFromUA(c.GetHeader("User-Agent")),
+	})
 }
 
 // handleClientDownload serves the CLI client binary for the requested

@@ -35,9 +35,6 @@ const ADMIN_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "logs", label: "系统日志", ico: "📜" },
   { key: "settings", label: "系统设置", ico: "⚙" },
 ];
-const CLIENT_NAV: { key: Page; label: string; ico: string }[] = [
-  { key: "client", label: "客户端设置", ico: "⌁" },
-];
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(!!auth.token);
@@ -122,7 +119,8 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
     return () => { ws.close(); clearInterval(timer); };
   }, [clientMode, resolveJob]);
 
-  const active = [...USER_NAV, ...ADMIN_NAV, ...CLIENT_NAV].find((n) => n.key === page);
+  const active = [...USER_NAV, ...ADMIN_NAV].find((n) => n.key === page);
+  const activeLabel = page === "client" ? "客户端设置" : active?.label;
 
   return (
     <div className="app">
@@ -151,11 +149,9 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
           </>}
           {clientMode && <>
             <div className="nav-group">本地客户端</div>
-            {CLIENT_NAV.map((n) => (
-              <div key={n.key} className={`nav-item ${page === n.key ? "active" : ""}`} onClick={() => setPage(n.key)}>
-                <span className="ico">{n.ico}</span>{n.label}
-              </div>
-            ))}
+            <div className={`nav-item ${page === "client" ? "active" : ""}`} onClick={() => setPage("client")}>
+              <span className="ico">⌁</span>客户端设置
+            </div>
           </>}
         </nav>
         <div className="sidebar-foot">
@@ -165,14 +161,14 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
 
       <main className="main">
         <header className="topbar">
-          <h1>{active?.label}</h1>
+          <h1>{activeLabel}</h1>
           <div className="row">
             {clientMode && <span className="badge green" title="浏览器只查看进度，文件由本机客户端直连云端">本机数据通道</span>}
             <span className={`badge ${isAdmin ? "blue" : "gray"}`}>{isAdmin ? "管理员" : "用户"}</span>
           </div>
         </header>
         <section className="content">
-          {page === "overview" && <Overview isAdmin={isAdmin} goto={setPage} />}
+          {page === "overview" && <Overview isAdmin={isAdmin} clientMode={clientMode} goto={setPage} />}
           {page === "files" && <Files jobs={jobs} />}
           {page === "transfers" && <Transfers />}
           {page === "profile" && <Profile />}

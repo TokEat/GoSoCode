@@ -199,6 +199,9 @@ export const clientApi = {
 export interface ClientDownloadInfo {
   enabled: boolean;
   platforms: { os: string; arch: string; size: number; missing?: boolean }[];
+  // Server-side platform detection from the request User-Agent (arch defaults
+  // to amd64). Absent for mobile/unknown platforms.
+  detected?: { os: string; arch: string };
 }
 export async function clientDownloads(): Promise<ClientDownloadInfo> {
   try {

@@ -213,6 +213,10 @@ func (d *Daemon) Handler() http.Handler {
 func (d *Daemon) handleClientAPI(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/api/client")
 	switch {
+	// Binary downloads are served by the server (GSC_CLIENT_DIR); proxy them
+	// so the download card also works when browsing through the local client.
+	case strings.HasPrefix(p, "/download"):
+		d.handleAPI(w, r)
 	case p == "/info" && r.Method == http.MethodGet:
 		d.handleInfo(w, r)
 	case p == "/config" && r.Method == http.MethodPut:

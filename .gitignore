@@ -8,3 +8,4 @@ dist/
 *.tsbuildinfo
 backend/gosocode.db
 backend/gsc-keys/
+client-bin/
