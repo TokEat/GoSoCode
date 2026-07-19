@@ -15,16 +15,17 @@ function Legend() {
   );
 }
 
-// RateChart draws the live per-second throughput as two area lines (SVG, no deps).
+// RateChart draws the live per-second throughput as two area lines (SVG, no
+// deps) with a labelled Y axis (rate units follow the current peak).
 function RateChart({ points }: { points: TrafficPoint[] }) {
-  const W = 600, H = 160, PAD = 4;
+  const W = 600, H = 160, PADL = 54, PADR = 6, PADT = 8, PADB = 4;
   const max = Math.max(1, ...points.map((p) => Math.max(p.up, p.down)));
-  const x = (i: number) => PAD + (i / Math.max(1, points.length - 1)) * (W - 2 * PAD);
-  const y = (v: number) => H - PAD - (v / max) * (H - 2 * PAD);
+  const x = (i: number) => PADL + (i / Math.max(1, points.length - 1)) * (W - PADL - PADR);
+  const y = (v: number) => H - PADB - (v / max) * (H - PADT - PADB);
   const line = (get: (p: TrafficPoint) => number) =>
     points.map((p, i) => `${x(i).toFixed(1)},${y(get(p)).toFixed(1)}`).join(" ");
   const area = (get: (p: TrafficPoint) => number) =>
-    `${PAD},${H - PAD} ${line(get)} ${W - PAD},${H - PAD}`;
+    `${PADL},${H - PADB} ${line(get)} ${W - PADR},${H - PADB}`;
   const fmtT = (t: number) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
   return (
     <div>
@@ -33,9 +34,16 @@ function RateChart({ points }: { points: TrafficPoint[] }) {
         <span style={{ fontSize: 12, color: "#7a8194" }}>峰值 {humanRate(max)}</span>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: 160, display: "block", background: "rgba(255,255,255,0.45)", borderRadius: 8 }}>
-        {[0.25, 0.5, 0.75].map((r) => (
-          <line key={r} x1={PAD} x2={W - PAD} y1={H * r} y2={H * r} stroke="#e2e8f0" strokeWidth="1" />
-        ))}
+        {[0.25, 0.5, 0.75, 1].map((r) => {
+          const gy = y(max * r);
+          return (
+            <g key={r}>
+              <line x1={PADL} x2={W - PADR} y1={gy} y2={gy} stroke="#e2e8f0" strokeWidth="1" />
+              <text x={PADL - 6} y={gy + 3} fontSize="9" fill="#94a3b8" textAnchor="end">{humanRate(max * r)}</text>
+            </g>
+          );
+        })}
+        <text x={PADL - 6} y={H - PADB} fontSize="9" fill="#94a3b8" textAnchor="end">0</text>
         <polygon points={area((p) => p.down)} fill={DOWN_COLOR} opacity="0.12" />
         <polyline points={line((p) => p.down)} fill="none" stroke={DOWN_COLOR} strokeWidth="1.5" />
         <polygon points={area((p) => p.up)} fill={UP_COLOR} opacity="0.12" />
@@ -43,7 +51,7 @@ function RateChart({ points }: { points: TrafficPoint[] }) {
       </svg>
       {points.length > 0 && (
         <div className="row" style={{ justifyContent: "space-between", fontSize: 11, color: "#94a3b8", marginTop: 2 }}>
-          <span>{fmtT(points[0].t)}</span>
+          <span style={{ marginLeft: `${(PADL / W) * 100}%` }}>{fmtT(points[0].t)}</span>
           <span>{fmtT(points[points.length - 1].t)}</span>
         </div>
       )}
@@ -51,14 +59,17 @@ function RateChart({ points }: { points: TrafficPoint[] }) {
   );
 }
 
-// HourlyChart draws the last-24h per-hour totals as grouped bars. The data
-// comes from the persisted transfer log, so it survives server restarts.
+// HourlyChart draws the last-24h per-hour totals as grouped bars with a
+// labelled Y axis (per-hour volume). The data comes from the persisted
+// transfer log, so it survives server restarts.
 function HourlyChart({ points }: { points: TrafficPoint[] }) {
-  const W = 600, H = 160, PAD = 4, GAP = 2;
+  const W = 600, H = 160, PADL = 54, PADR = 6, PADT = 8, PADB = 4, GAP = 2;
   const max = Math.max(1, ...points.map((p) => Math.max(p.up, p.down)));
-  const group = (W - 2 * PAD) / Math.max(1, points.length);
+  const baseY = H - PADB - 12; // bars sit above the hour-label band
+  const plotH = baseY - PADT;
+  const group = (W - PADL - PADR) / Math.max(1, points.length);
   const barW = Math.max(2, (group - GAP) / 2);
-  const h = (v: number) => (v / max) * (H - 2 * PAD - 14);
+  const h = (v: number) => (v / max) * plotH;
   const hourOf = (t: number) => new Date(t * 1000).getHours();
   return (
     <div>
@@ -67,12 +78,22 @@ function HourlyChart({ points }: { points: TrafficPoint[] }) {
         <span style={{ fontSize: 12, color: "#7a8194" }}>最高 {humanSize(max)}/时</span>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: 160, display: "block", background: "rgba(255,255,255,0.45)", borderRadius: 8 }}>
+        {[0.25, 0.5, 0.75, 1].map((r) => {
+          const gy = baseY - plotH * r;
+          return (
+            <g key={r}>
+              <line x1={PADL} x2={W - PADR} y1={gy} y2={gy} stroke="#e2e8f0" strokeWidth="1" />
+              <text x={PADL - 6} y={gy + 3} fontSize="9" fill="#94a3b8" textAnchor="end">{humanSize(max * r)}</text>
+            </g>
+          );
+        })}
+        <text x={PADL - 6} y={baseY + 3} fontSize="9" fill="#94a3b8" textAnchor="end">0</text>
         {points.map((p, i) => {
-          const gx = PAD + i * group;
+          const gx = PADL + i * group;
           return (
             <g key={p.t}>
-              <rect x={gx} y={H - PAD - 12 - h(p.up)} width={barW} height={h(p.up)} fill={UP_COLOR} rx="1" />
-              <rect x={gx + barW + 1} y={H - PAD - 12 - h(p.down)} width={barW} height={h(p.down)} fill={DOWN_COLOR} rx="1" />
+              <rect x={gx} y={baseY - h(p.up)} width={barW} height={h(p.up)} fill={UP_COLOR} rx="1" />
+              <rect x={gx + barW + 1} y={baseY - h(p.down)} width={barW} height={h(p.down)} fill={DOWN_COLOR} rx="1" />
               {hourOf(p.t) % 4 === 0 && (
                 <text x={gx + barW} y={H - 3} fontSize="9" fill="#94a3b8" textAnchor="middle">{hourOf(p.t)}时</text>
               )}

@@ -47,7 +47,13 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
                 <span className="drawer-name" title={t.path}>{t.name}</span>
                 <div className="bar drawer-bar"><span style={{ width: `${pct}%`, background: color }} /></div>
                 <span className="drawer-pct">{pct}%</span>
-                <span className="drawer-info">{t.status === "running" ? humanRate(t.speed) : LABEL[t.status]}</span>
+                <span className="drawer-info" title={t.error || t.note || undefined}>
+                  {t.status === "error"
+                    ? (t.error || LABEL.error)
+                    : t.status === "running"
+                      ? (t.speed > 0 ? humanRate(t.speed) : (t.note || LABEL.running))
+                      : LABEL[t.status]}
+                </span>
               </div>
             );
           })}

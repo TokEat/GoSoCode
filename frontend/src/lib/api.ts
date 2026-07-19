@@ -162,6 +162,8 @@ export interface ClientTask {
   size: number;
   done: number;
   status: "waiting" | "hashing" | "running" | "done" | "error" | "canceled";
+  // Human-readable current phase from the daemon, e.g. 云端合并处理中 / 网络波动重试
+  detail?: string;
   error?: string;
   speed: number;
   created_at: string;

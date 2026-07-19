@@ -138,7 +138,10 @@ body {
 .drawer-name { flex: 0 0 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .drawer-bar { flex: 1; height: 6px; }
 .drawer-pct { width: 42px; text-align: right; color: var(--muted); flex-shrink: 0; }
-.drawer-info { width: 110px; text-align: right; color: var(--muted); flex-shrink: 0; }
+.drawer-info {
+  width: 170px; text-align: right; color: var(--muted); flex-shrink: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 @keyframes rise {
   from { opacity: 0; transform: translateY(10px); }

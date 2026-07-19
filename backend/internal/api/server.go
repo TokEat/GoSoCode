@@ -2,6 +2,7 @@
 package api
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
@@ -41,6 +42,12 @@ type Server struct {
 	meter   *metrics.Meter
 	control *crypto.Codec
 
+	// negotiated control-plane encryption: server ECDH key pair generated at
+	// startup and the per-client sessions derived from /api/agent/handshake
+	handshakePriv *ecdh.PrivateKey
+	ctrlSessMu    sync.Mutex
+	ctrlSessions  map[string]*controlSession
+
 	// active streaming-upload sessions (per-session serialization + concurrency cap)
 	streamMu     sync.Mutex
 	streamStates map[string]*streamState
@@ -63,7 +70,13 @@ func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baid
 	srv := &Server{
 		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter, control: control,
 		streamStates: map[string]*streamState{},
+		ctrlSessions: map[string]*controlSession{},
 		oauthStates:  map[string]time.Time{},
+	}
+	if key, err := crypto.GenerateHandshakeKey(); err == nil {
+		srv.handshakePriv = key
+	} else {
+		log.Printf("control handshake keypair generation failed (negotiated control encryption disabled): %v", err)
 	}
 	go srv.streamPartialJanitor()
 	return srv
@@ -134,6 +147,10 @@ func (s *Server) Router() *gin.Engine {
 		auth.POST("/transfers/log", s.handleLogTransfer)
 		auth.GET("/transfers/log", s.handleListTransferLog)
 	}
+
+	// key negotiation for the CLI control plane: reachable after login, before
+	// any encrypted /api/agent call (the agent group below requires encryption)
+	r.POST("/api/agent/handshake", s.authMiddleware(), s.agentGuard(), s.handleAgentHandshake)
 
 	// control plane for CLI clients that transfer directly against Baidu
 	agent := r.Group("/api/agent", s.requireEncryptedAgentControl(), s.authMiddleware(), s.agentGuard())

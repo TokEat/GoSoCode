@@ -14,8 +14,8 @@ const (
 )
 
 type bucket struct {
-	sec        int64
-	up, down   int64
+	sec      int64
+	up, down int64
 }
 
 type Meter struct {

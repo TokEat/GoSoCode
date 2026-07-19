@@ -187,14 +187,7 @@ func (c *Client) GetQuota(ctx context.Context, token string) (*Quota, error) {
 // SliceSizeForVip maps a Baidu account tier to its maximum superfile2 slice
 // size: normal 4MB, VIP 16MB, SVIP 32MB. Bigger slices mean fewer requests.
 func SliceSizeForVip(vipType int) int64 {
-	switch {
-	case vipType >= 2:
-		return 32 << 20
-	case vipType == 1:
-		return 16 << 20
-	default:
-		return ChunkSize
-	}
+	return LimitsForVip(vipType).SliceSize
 }
 
 // UserInfo describes the netdisk account, notably its VIP tier.
@@ -325,6 +318,31 @@ func (c *Client) UploadChunk(ctx context.Context, token, remotePath, uploadID st
 // UploadChunkTo is UploadChunk against a specific upload server base URL from
 // LocateUpload; empty means the default server.
 func (c *Client) UploadChunkTo(ctx context.Context, server, token, remotePath, uploadID string, partseq int, chunk []byte) error {
+	return c.UploadChunkToProgress(ctx, server, token, remotePath, uploadID, partseq, chunk, nil)
+}
+
+// progressReader reports cumulative bytes handed to the HTTP transport —
+// close enough for live speed display (bytes may still sit in TCP buffers,
+// same as a browser's upload.onprogress).
+type progressReader struct {
+	r    io.Reader
+	sent int64
+	fn   func(sent int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.sent += int64(n)
+		p.fn(p.sent)
+	}
+	return n, err
+}
+
+// UploadChunkToProgress is UploadChunkTo with a streaming progress callback
+// (cumulative request-body bytes, slightly above len(chunk) due to multipart
+// framing; nil disables reporting).
+func (c *Client) UploadChunkToProgress(ctx context.Context, server, token, remotePath, uploadID string, partseq int, chunk []byte, onProgress func(sent int64)) error {
 	if server == "" {
 		server = pcsDefaultServer
 	}
@@ -347,7 +365,15 @@ func (c *Client) UploadChunkTo(ctx context.Context, server, token, remotePath, u
 	q.Set("uploadid", uploadID)
 	q.Set("partseq", strconv.Itoa(partseq))
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server+"/rest/2.0/pcs/superfile2?"+q.Encode(), &buf)
+	total := int64(buf.Len())
+	var reqBody io.Reader = &buf
+	if onProgress != nil {
+		reqBody = &progressReader{r: &buf, fn: onProgress}
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server+"/rest/2.0/pcs/superfile2?"+q.Encode(), reqBody)
+	// the wrapped reader hides the length from net/http; keep it explicit so
+	// the request is not sent chunked
+	req.ContentLength = total
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -48,9 +48,9 @@ func (m *memLocker) Lock(ctx context.Context, key string, _ time.Duration) (func
 // ---- in-memory Limiter: token bucket per key -------------------------------
 
 type memLimiter struct {
-	mu     sync.Mutex
-	qps    int
-	byKey  map[string]*rate.Limiter
+	mu    sync.Mutex
+	qps   int
+	byKey map[string]*rate.Limiter
 }
 
 func newMemLimiter(qps int) *memLimiter {

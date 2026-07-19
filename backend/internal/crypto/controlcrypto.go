@@ -32,8 +32,8 @@ type Request struct {
 }
 
 // New creates an AES-256-GCM codec from a 64-character hexadecimal key.
-// An empty key returns nil so callers can keep the CLI feature disabled until
-// both sides have been configured with the same secret.
+// An empty key returns nil so callers fall back to the negotiated (ECDH)
+// control encryption instead of a static shared secret.
 func New(keyHex string) (*Codec, error) {
 	if keyHex == "" {
 		return nil, nil
@@ -41,6 +41,14 @@ func New(keyHex string) (*Codec, error) {
 	key, err := hex.DecodeString(keyHex)
 	if err != nil || len(key) != 32 {
 		return nil, fmt.Errorf("control key must be 64 hexadecimal characters")
+	}
+	return NewFromKey(key)
+}
+
+// NewFromKey creates an AES-256-GCM codec from a raw 32-byte key.
+func NewFromKey(key []byte) (*Codec, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("control key must be 32 bytes")
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {

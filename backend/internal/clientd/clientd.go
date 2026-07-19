@@ -11,6 +11,7 @@ package clientd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -56,11 +57,17 @@ type localEntry struct {
 }
 
 type Daemon struct {
-	opts    Options
-	api     *http.Client
-	baidu   *baidu.Client
-	tasks   *taskList
-	control *controlcrypto.Codec
+	opts  Options
+	api   *http.Client
+	baidu *baidu.Client
+	tasks *taskList
+
+	// control-plane encryption: a static codec from -control-key, or a
+	// per-session codec negotiated with /api/agent/handshake after login
+	controlMu      sync.Mutex
+	control        *controlcrypto.Codec
+	controlStatic  bool
+	controlSession string
 
 	cfgMu   sync.RWMutex
 	cfg     Config
@@ -103,17 +110,18 @@ func New(opts Options) (*Daemon, error) {
 		return nil, fmt.Errorf("客户端控制面加密密钥无效: %w", err)
 	}
 	if control != nil {
-		log.Printf("[client] 控制面加密已启用")
+		log.Printf("[client] 控制面加密已启用（静态密钥 -control-key）")
 	} else {
-		log.Printf("[client] 未配置控制面加密密钥，控制面以明文发送（服务端如设置了 GSC_AGENT_CONTROL_KEY 需用 -control-key 保持一致）")
+		log.Printf("[client] 控制面密钥将在登录后与服务端自动协商（ECDH）")
 	}
 	d := &Daemon{
-		opts:    opts,
-		api:     &http.Client{Timeout: 60 * time.Second},
-		baidu:   baidu.New("", ""),
-		tasks:   newTaskList(),
-		control: control,
-		cfgPath: configPath(),
+		opts:          opts,
+		api:           &http.Client{Timeout: 60 * time.Second},
+		baidu:         baidu.New("", ""),
+		tasks:         newTaskList(),
+		control:       control,
+		controlStatic: control != nil,
+		cfgPath:       configPath(),
 	}
 	if raw, err := os.ReadFile(d.cfgPath); err == nil {
 		_ = json.Unmarshal(raw, &d.cfg)
@@ -178,6 +186,9 @@ func (d *Daemon) connect(server string) error {
 	d.cfg.Server = server
 	d.proxy = proxy
 	d.cfgMu.Unlock()
+	// A negotiated control session belongs to one server instance; drop it so
+	// the next control call re-negotiates against the (possibly new) server.
+	d.invalidateControl()
 	log.Printf("[client][config] connected server=%s", server)
 	return nil
 }
@@ -381,9 +392,93 @@ func (d *Daemon) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 // ---- server control-plane helpers -----------------------------------------
 
+// ensureControl returns the control-plane codec, negotiating a session key
+// with the server (ECDH via /api/agent/handshake) on first use when no static
+// -control-key is configured. Requires a logged-in user's Authorization.
+func (d *Daemon) ensureControl(ctx context.Context, auth string) (*controlcrypto.Codec, string, error) {
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if d.control != nil {
+		return d.control, d.controlSession, nil
+	}
+	cfg := d.config()
+	priv, err := controlcrypto.GenerateHandshakeKey()
+	if err != nil {
+		return nil, "", err
+	}
+	clientPub := priv.PublicKey().Bytes()
+	payload, _ := json.Marshal(map[string]string{"client_pub": base64.StdEncoding.EncodeToString(clientPub)})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Server+"/api/agent/handshake", bytes.NewReader(payload))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Authorization", auth)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.api.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("服务端拒绝密钥协商 (HTTP %d): %s", resp.StatusCode, serverErrMsg(raw, "unknown"))
+	}
+	var out struct {
+		SessionID string `json:"session_id"`
+		ServerPub string `json:"server_pub"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.SessionID == "" || out.ServerPub == "" {
+		return nil, "", fmt.Errorf("无效的密钥协商响应")
+	}
+	serverPub, err := base64.StdEncoding.DecodeString(out.ServerPub)
+	if err != nil {
+		return nil, "", fmt.Errorf("无效的服务端公钥")
+	}
+	codec, err := controlcrypto.DeriveSessionCodec(priv, serverPub, serverPub, clientPub)
+	if err != nil {
+		return nil, "", err
+	}
+	d.control, d.controlSession = codec, out.SessionID
+	shortID := out.SessionID
+	if len(shortID) > 8 {
+		shortID = shortID[:8] + "…"
+	}
+	log.Printf("[client][control] 已与服务端协商控制面密钥 session=%s", shortID)
+	return codec, out.SessionID, nil
+}
+
+// invalidateControl drops a negotiated session codec (static keys stay) so
+// the next control call re-runs the handshake.
+func (d *Daemon) invalidateControl() {
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if d.controlStatic {
+		return
+	}
+	d.control = nil
+	d.controlSession = ""
+}
+
 // serverJSON performs a control-plane call against the server, forwarding the
-// user's Authorization so everything runs as the requesting user.
+// user's Authorization so everything runs as the requesting user. All control
+// traffic is encrypted: with the static -control-key codec, or a session key
+// negotiated on first use. An expired/unknown session (e.g. after a server
+// restart) is renegotiated once transparently.
 func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []byte) (int, []byte, error) {
+	status, raw, err := d.serverJSONOnce(ctx, auth, method, p, body)
+	if err == nil && status == http.StatusUnauthorized &&
+		strings.Contains(serverErrMsg(raw, ""), "控制面会话") {
+		log.Printf("[client][control] %s %s session expired; renegotiating", method, p)
+		d.invalidateControl()
+		return d.serverJSONOnce(ctx, auth, method, p, body)
+	}
+	return status, raw, err
+}
+
+func (d *Daemon) serverJSONOnce(ctx context.Context, auth, method, p string, body []byte) (int, []byte, error) {
 	started := time.Now()
 	cfg := d.config()
 	if !d.connected() {
@@ -394,34 +489,29 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 	if err != nil || target.Path == "" {
 		return 0, nil, fmt.Errorf("无效的控制面路径")
 	}
-	var req *http.Request
-	if d.control != nil {
-		encrypted, sealErr := d.control.SealRequest(method, target.Path, controlcrypto.Request{
-			Authorization: auth,
-			Query:         target.RawQuery,
-			Body:          body,
-		})
-		if sealErr != nil {
-			return 0, nil, fmt.Errorf("加密控制请求失败: %w", sealErr)
-		}
-		req, err = http.NewRequestWithContext(ctx, method, cfg.Server+target.Path, bytes.NewReader(encrypted))
-		if err != nil {
-			log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
-			return 0, nil, err
-		}
-		req.Header.Set(controlcrypto.Header, controlcrypto.Version)
-	} else {
-		// No control key configured: plaintext control plane (trusted
-		// deployment). A server with GSC_AGENT_CONTROL_KEY set rejects these
-		// calls with a clear configuration hint.
-		req, err = http.NewRequestWithContext(ctx, method, cfg.Server+p, bytes.NewReader(body))
-		if err != nil {
-			log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
-			return 0, nil, err
-		}
-		req.Header.Set("Authorization", auth)
+	codec, session, err := d.ensureControl(ctx, auth)
+	if err != nil {
+		log.Printf("[client][control] %s %s key negotiation failed: %v", method, p, err)
+		return 0, nil, fmt.Errorf("控制面密钥协商失败: %w", err)
+	}
+	encrypted, err := codec.SealRequest(method, target.Path, controlcrypto.Request{
+		Authorization: auth,
+		Query:         target.RawQuery,
+		Body:          body,
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("加密控制请求失败: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, cfg.Server+target.Path, bytes.NewReader(encrypted))
+	if err != nil {
+		log.Printf("[client][control] %s %s build request failed: %v", method, p, err)
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(controlcrypto.Header, controlcrypto.Version)
+	if session != "" {
+		req.Header.Set(controlcrypto.SessionHeader, session)
+	}
 	resp, err := d.api.Do(req)
 	if err != nil {
 		log.Printf("[client][control] %s %s transport failed after=%s: %v", method, p, time.Since(started).Round(time.Millisecond), err)
@@ -434,10 +524,7 @@ func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []
 		return resp.StatusCode, nil, err
 	}
 	if resp.Header.Get(controlcrypto.Header) == controlcrypto.Version {
-		if d.control == nil {
-			return resp.StatusCode, nil, fmt.Errorf("服务端返回了加密控制响应，客户端需用相同的 GSC_AGENT_CONTROL_KEY 启动（-control-key）")
-		}
-		raw, err = d.control.OpenResponse(method, target.Path, resp.StatusCode, raw)
+		raw, err = codec.OpenResponse(method, target.Path, resp.StatusCode, raw)
 		if err != nil {
 			return resp.StatusCode, nil, fmt.Errorf("解密控制响应失败: %w", err)
 		}

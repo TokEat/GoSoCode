@@ -29,6 +29,7 @@ type Task struct {
 	Size       int64
 	Done       int64
 	Status     string // waiting | hashing | running | done | error | canceled
+	Detail     string // human-readable current phase (云端合并处理中 / 网络波动重试 / …)
 	Error      string
 	Speed      int64 // bytes/s, sampled at poll time
 	CreatedAt  time.Time
@@ -51,6 +52,7 @@ type TaskView struct {
 	Size       int64     `json:"size"`
 	Done       int64     `json:"done"`
 	Status     string    `json:"status"`
+	Detail     string    `json:"detail,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	Speed      int64     `json:"speed"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -65,6 +67,16 @@ func (t *Task) set(fn func(*Task)) {
 func (t *Task) logf(format string, args ...any) {
 	prefix := fmt.Sprintf("[client][task=%s][%s] ", t.ID, t.Kind)
 	log.Printf(prefix+format, args...)
+}
+
+// setDetail publishes the human-readable current phase to the web UI.
+// Last-writer-wins; phase transitions and terminal states overwrite/clear it.
+// Not logged: the surrounding operations already emit their own log lines and
+// per-slice/per-percent updates would flood the log.
+func (t *Task) setDetail(msg string) {
+	t.mu.Lock()
+	t.Detail = msg
+	t.mu.Unlock()
 }
 
 func (t *Task) setStatus(status string) {
@@ -97,6 +109,7 @@ func (t *Task) fail(msg string) {
 		t.Status = "error"
 		t.Error = msg
 	}
+	t.Detail = ""
 	t.mu.Unlock()
 	if changed {
 		t.logf("status %s -> error: %s (local=%q remote=%q)", old, msg, t.LocalPath, t.RemotePath)
@@ -112,6 +125,7 @@ func retryTask(ctx context.Context, t *Task, attempts int, operation string, fn 
 		if err = fn(); err == nil {
 			if i > 0 {
 				t.logf("%s recovered on attempt %d/%d", operation, i+1, attempts)
+				t.setDetail("")
 			}
 			return nil
 		}
@@ -132,6 +146,7 @@ func waitTaskRetry(ctx context.Context, t *Task, operation string, round int) er
 		delay = 15 * time.Second
 	}
 	t.logf("%s retrying after %s", operation, delay)
+	t.setDetail(fmt.Sprintf("网络波动，%s 后自动重试…", delay))
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -195,6 +210,11 @@ func (l *taskList) snapshot() []TaskView {
 			if dt := now.Sub(t.lastAt).Seconds(); dt >= 0.5 {
 				inst := int64(float64(t.Done-t.lastDone) / dt)
 				t.Speed = (t.Speed + inst) / 2
+				// A stalled transfer decays the EMA geometrically; snap the
+				// tail to 0 instead of showing a bogus few-hundred-B/s crawl.
+				if inst == 0 && t.Speed < 4096 {
+					t.Speed = 0
+				}
 				t.lastDone, t.lastAt = t.Done, now
 			}
 		} else {
@@ -206,7 +226,7 @@ func (l *taskList) snapshot() []TaskView {
 		cp := TaskView{
 			ID: t.ID, Kind: t.Kind, Name: t.Name, LocalPath: t.LocalPath,
 			RemotePath: t.RemotePath, Size: t.Size, Done: t.Done,
-			Status: t.Status, Error: t.Error, Speed: t.Speed, CreatedAt: t.CreatedAt,
+			Status: t.Status, Detail: t.Detail, Error: t.Error, Speed: t.Speed, CreatedAt: t.CreatedAt,
 		}
 		t.mu.Unlock()
 		out = append(out, cp)

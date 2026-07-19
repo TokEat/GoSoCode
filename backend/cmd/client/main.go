@@ -32,9 +32,9 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	server := flag.String("server", os.Getenv("GSC_SERVER"), "服务端地址，例如 http://192.168.1.10:8080；留空则在网页中设置")
 	listen := flag.String("listen", "127.0.0.1:8190", "本地监听地址")
-	controlKey := flag.String("control-key", os.Getenv("GSC_AGENT_CONTROL_KEY"), "客户端控制面加密密钥（与服务端 GSC_AGENT_CONTROL_KEY 一致）")
-	window := flag.Int("window", 8, "上传并发分片窗口（本机直连百度）")
-	dlConns := flag.Int("dl-conns", 4, "下载并发连接数（本机直连百度，最多 8）")
+	controlKey := flag.String("control-key", os.Getenv("GSC_AGENT_CONTROL_KEY"), "可选：静态控制面密钥（与服务端 GSC_AGENT_CONTROL_KEY 一致）；默认登录后自动与服务端协商密钥")
+	window := flag.Int("window", 8, "上传并发分片窗口（按账号等级自动限制：普通 8 / 会员 6 / 超级会员 4，分片越大窗口越小）")
+	dlConns := flag.Int("dl-conns", 10, "下载并发连接数（按账号等级自动限制：普通 4 / 会员 8 / 超级会员 10；百度同一下载链接每 IP 最多 10 并发）")
 	webui := flag.String("webui", "", "本地静态 Web UI 目录；留空使用内嵌页面")
 	flag.Parse()
 

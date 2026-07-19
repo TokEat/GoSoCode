@@ -12,23 +12,29 @@ import (
 	"gosocode/internal/baidu"
 )
 
-func TestDownloadConnsForTier(t *testing.T) {
+func TestLimitsForVipTiers(t *testing.T) {
 	tests := []struct {
-		name      string
-		requested int
-		vipType   int
-		want      int
+		name    string
+		vipType int
+		slice   int64
+		window  int
+		conns   int
+		seg     int64
 	}{
-		{"normal is capped at two", 8, 0, 2},
-		{"normal can request one", 1, 0, 1},
-		{"vip is capped at four", 8, 1, 4},
-		{"svip accepts configured eight", 8, 2, 8},
-		{"invalid request becomes one", 0, 2, 1},
+		{"normal", 0, 4 << 20, 8, 4, 4 << 20},
+		{"vip", 1, 16 << 20, 6, 8, 8 << 20},
+		{"svip", 2, 32 << 20, 4, 10, 16 << 20},
+		{"svip higher levels use svip profile", 5, 32 << 20, 4, 10, 16 << 20},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := downloadConnsForTier(tt.requested, tt.vipType); got != tt.want {
-				t.Fatalf("downloadConnsForTier(%d, %d) = %d, want %d", tt.requested, tt.vipType, got, tt.want)
+			lim := baidu.LimitsForVip(tt.vipType)
+			if lim.SliceSize != tt.slice || lim.UploadWindow != tt.window || lim.DownloadConns != tt.conns || lim.DownloadSeg != tt.seg {
+				t.Fatalf("LimitsForVip(%d) = %+v", tt.vipType, lim)
+			}
+			// tier must be recoverable from the planned slice size
+			if got := baidu.LimitsForSliceSize(lim.SliceSize); got != lim {
+				t.Fatalf("LimitsForSliceSize(%d) = %+v, want %+v", lim.SliceSize, got, lim)
 			}
 		})
 	}

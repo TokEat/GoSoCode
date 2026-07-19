@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gosocode/internal/baidu"
@@ -52,6 +54,7 @@ func (s *uploadInit) pickServer(attempt int) string {
 func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	// 1. plan: which slice size to hash with (node tier dependent)
 	t.logf("planning upload with server")
+	t.setDetail("正在向服务端申请上传计划")
 	q := url.Values{}
 	q.Set("size", strconv.FormatInt(t.Size, 10))
 	q.Set("path", t.RemotePath)
@@ -109,14 +112,10 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	var blocks []string
 	for attempt := 0; ; attempt++ {
 		t.setStatus("hashing")
+		t.setDetail("正在计算文件指纹")
 		t.logf("hashing local file attempt=%d slice_size=%d", attempt+1, sliceSize)
 		var size int64
-		if encKey != nil {
-			// Hash the ciphertext: that is what precreate/create will verify.
-			blocks, size, err = encSliceMD5s(t.LocalPath, sliceSize, encKey, encIV)
-		} else {
-			blocks, size, err = baidu.SliceFileMD5s(t.LocalPath, sliceSize)
-		}
+		blocks, size, err = sliceMD5sWithProgress(t, sliceSize, encKey, encIV)
 		if err != nil {
 			t.fail("读取本地文件失败: " + err.Error())
 			return
@@ -137,6 +136,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 			init["enc_key"] = hex.EncodeToString(encKey)
 			init["enc_iv"] = hex.EncodeToString(encIV)
 		}
+		t.setDetail("正在创建云端上传会话")
 		body, _ := json.Marshal(init)
 		err = retryTask(ctx, t, 5, "initialize upload session", func() error {
 			var callErr error
@@ -184,6 +184,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	t.setStatus("running")
 	if ses.Rapid {
 		t.logf("rapid upload hit; no slice transfer needed")
+		t.setDetail("秒传命中，无需传输数据")
 		t.set(func(t *Task) { t.Done = t.Size })
 	} else {
 		if servers, err := d.baidu.LocateUpload(ctx, ses.AccessToken, ses.RemotePath, ses.UploadID); err != nil || len(servers) == 0 {
@@ -206,12 +207,14 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	finishErr := "云端保存未完成"
 	for attempt := 0; attempt < 5; attempt++ {
 		t.logf("finishing cloud file attempt=%d/5 session=%s", attempt+1, ses.SessionID)
+		t.setDetail("云端合并处理中…")
 		body, _ := json.Marshal(map[string]string{"session_id": ses.SessionID})
 		status, raw, err = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/files/stream/finish", body)
 		if err != nil {
 			finishErr = "无法连接服务端: " + err.Error()
 		} else if status == http.StatusOK {
 			t.set(func(t *Task) { t.Done = t.Size })
+			t.setDetail("")
 			t.setStatus("done")
 			t.logf("completed remote=%q bytes=%d", t.RemotePath, t.Size)
 			return
@@ -247,19 +250,49 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	t.logf("upload session retained for server-side reconciliation session=%s", ses.SessionID)
 }
 
-// encSliceMD5s hashes the file's AES-CTR ciphertext per slice, matching what
-// pushSlices actually sends when encrypted storage is enabled.
-func encSliceMD5s(path string, sliceSize int64, key, iv []byte) ([]string, int64, error) {
-	f, err := os.Open(path)
+// countReader reports cumulative bytes read; used for hashing progress.
+type countReader struct {
+	r  io.Reader
+	n  int64
+	fn func(int64)
+}
+
+func (c *countReader) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	if n > 0 {
+		c.n += int64(n)
+		c.fn(c.n)
+	}
+	return n, err
+}
+
+// sliceMD5sWithProgress hashes the file per slice (the AES-CTR ciphertext when
+// encryption is on — that is what precreate/create will verify), publishing a
+// percentage to the task detail as it scans.
+func sliceMD5sWithProgress(t *Task, sliceSize int64, key, iv []byte) ([]string, int64, error) {
+	f, err := os.Open(t.LocalPath)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer f.Close()
-	enc, err := cryptoutil.NewCTRReader(f, key, iv, 0)
-	if err != nil {
-		return nil, 0, err
+	var src io.Reader = f
+	if key != nil {
+		if src, err = cryptoutil.NewCTRReader(f, key, iv, 0); err != nil {
+			return nil, 0, err
+		}
 	}
-	return baidu.SliceReaderMD5s(enc, sliceSize)
+	lastPct := -1
+	cr := &countReader{r: src, fn: func(read int64) {
+		if t.Size <= 0 {
+			return
+		}
+		// every 5% to keep the phase log readable
+		if pct := int(read * 100 / t.Size); pct <= 100 && (lastPct < 0 || pct-lastPct >= 5) {
+			lastPct = pct
+			t.setDetail(fmt.Sprintf("正在计算文件指纹 %d%%", pct))
+		}
+	}}
+	return baidu.SliceReaderMD5s(cr, sliceSize)
 }
 
 func uploadMissingBytes(size, sliceSize int64, seqs []int) int64 {
@@ -345,12 +378,10 @@ func (d *Daemon) syncUploadMissing(ctx context.Context, t *Task, ses *uploadInit
 	return fmt.Errorf("补传未完成分片失败: %w", lastErr)
 }
 
-// maxInflightUploadBytes caps the total bytes in flight to Baidu. Big slices
-// (VIP/SVIP tiers) at the full window make every request crawl on a limited
-// uplink until Baidu forcibly closes the slow connection — and each kill wastes
-// a whole slice worth of resent bytes. Throughput is uplink-bound either way,
-// so fewer, faster requests are strictly safer.
-const maxInflightUploadBytes = 64 << 20
+// ulStallTimeout aborts a slice attempt when no request bytes move for this
+// long (the Baidu HTTP client has no timeout; packet loss can freeze a
+// connection forever otherwise).
+const ulStallTimeout = 30 * time.Second
 
 // pushSlices uploads the given slices to Baidu with a window of concurrent
 // connections, reporting each success to the server (bitmap + live meter).
@@ -361,12 +392,17 @@ func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, slice
 	}
 	defer f.Close()
 
+	// Per-tier window (inferred from the planned slice size): bounds bytes in
+	// flight so big-slice tiers don't trickle too many parallel requests on a
+	// limited uplink, while small-slice tiers get enough parallelism to beat
+	// Baidu's per-connection throttle.
+	lim := baidu.LimitsForSliceSize(sliceSize)
 	conc := d.opts.Window
-	if byBytes := int(maxInflightUploadBytes / sliceSize); byBytes < conc {
-		conc = byBytes
+	if conc > lim.UploadWindow {
+		conc = lim.UploadWindow
 	}
-	if conc < 2 {
-		conc = 2
+	if conc < 1 {
+		conc = 1
 	}
 
 	inner, cancel := context.WithCancel(ctx)
@@ -375,7 +411,26 @@ func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, slice
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var pushErr error
+	var doneSlices int32
 	t.logf("slice batch started count=%d concurrency=%d slice_size=%d", len(seqs), conc, sliceSize)
+	// Replace the "创建云端上传会话" phase immediately; the per-slice update
+	// below only fires when a whole slice completes, which can take a while.
+	t.setDetail(fmt.Sprintf("正在上传：云端已同步 %d/%d 分片", ses.Total-len(seqs), ses.Total))
+
+	// Streaming per-slice progress so speed/ETA move during a slice, not only
+	// when one completes (big VIP slices otherwise leave the meter at 0 for
+	// most of the transfer). A retried slice rolls its partial bytes back.
+	var progressMu sync.Mutex
+	sliceSent := map[int]int64{}
+	setSliceProgress := func(seq int, current int64) {
+		progressMu.Lock()
+		delta := current - sliceSent[seq]
+		sliceSent[seq] = current
+		progressMu.Unlock()
+		if delta != 0 {
+			t.addDone(delta)
+		}
+	}
 
 	for _, seq := range seqs {
 		if inner.Err() != nil {
@@ -412,7 +467,24 @@ func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, slice
 			if err := retryTask(inner, t, 5, fmt.Sprintf("upload slice seq=%d", seq), func() error {
 				server := ses.pickServer(attempt)
 				attempt++
-				return d.baidu.UploadChunkTo(inner, server, ses.AccessToken, ses.RemotePath, ses.UploadID, seq, buf)
+				setSliceProgress(seq, 0) // reset partial bytes from a failed attempt
+				// Stall watchdog: no request bytes for ulStallTimeout aborts
+				// this attempt so a frozen connection is retried.
+				attemptCtx, cancelAttempt := context.WithCancel(inner)
+				defer cancelAttempt()
+				watchdog := time.AfterFunc(ulStallTimeout, cancelAttempt)
+				defer watchdog.Stop()
+				err := d.baidu.UploadChunkToProgress(attemptCtx, server, ses.AccessToken, ses.RemotePath, ses.UploadID, seq, buf, func(sent int64) {
+					watchdog.Reset(ulStallTimeout)
+					if sent > length {
+						sent = length // exclude multipart framing overhead
+					}
+					setSliceProgress(seq, sent)
+				})
+				if err != nil && inner.Err() == nil && attemptCtx.Err() != nil {
+					err = fmt.Errorf("上传连接停滞超过 %s，断开重试", ulStallTimeout)
+				}
+				return err
 			}); err != nil {
 				mu.Lock()
 				pushErr = fmt.Errorf("云端同步失败: %v", err)
@@ -434,7 +506,9 @@ func (d *Daemon) pushSlices(ctx context.Context, t *Task, ses *uploadInit, slice
 				cancel()
 				return
 			}
-			t.addDone(length)
+			setSliceProgress(seq, length)
+			synced := ses.Total - len(seqs) + int(atomic.AddInt32(&doneSlices, 1))
+			t.setDetail(fmt.Sprintf("正在上传：云端已同步 %d/%d 分片", synced, ses.Total))
 		}(seq)
 	}
 	wg.Wait()

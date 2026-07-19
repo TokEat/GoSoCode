@@ -14,14 +14,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gosocode/internal/baidu"
 	cryptoutil "gosocode/internal/crypto"
 )
 
 const (
-	dlSegSize     = 8 << 20  // per-connection segment
 	dlReportAt    = 32 << 20 // report transferred bytes to the server this often
 	dlRetryEach   = 5        // attempts per segment (with dlink re-resolve)
 	dlRetryRounds = 6        // reconciliation rounds that only retry missing segments
+
+	// dlStallTimeout aborts a segment attempt when no bytes arrive for this
+	// long (the Baidu HTTP client has no timeout, so a dead connection would
+	// otherwise hang the worker forever).
+	dlStallTimeout = 30 * time.Second
 )
 
 type dlInfo struct {
@@ -34,25 +39,6 @@ type dlInfo struct {
 	Encrypted bool   `json:"encrypted"`
 	EncKey    string `json:"enc_key"`
 	EncIV     string `json:"enc_iv"`
-}
-
-// downloadConnsForTier keeps ordinary accounts conservative while still
-// allowing two ranged connections. Paid tiers may use more, but never beyond
-// the operator's -dl-conns setting.
-func downloadConnsForTier(requested, vipType int) int {
-	limit := 2
-	if vipType == 1 {
-		limit = 4
-	} else if vipType >= 2 {
-		limit = 8
-	}
-	if requested < 1 {
-		requested = 1
-	}
-	if requested > limit {
-		requested = limit
-	}
-	return requested
 }
 
 // dlSource holds the resolved dlink and refreshes it when a segment hits a
@@ -117,6 +103,7 @@ func (d *Daemon) resolve(ctx context.Context, auth, logicalPath, pwd string) (*d
 // rename into the configured download directory.
 func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 	t.logf("resolving cloud download source path=%q", logicalPath)
+	t.setDetail("正在解析云端下载地址")
 	var info *dlInfo
 	err := retryTask(ctx, t, 5, "resolve cloud download source", func() error {
 		var e error
@@ -180,12 +167,25 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 
 	if info.Size > 0 {
 		src := &dlSource{d: d, auth: t.auth, path: logicalPath, task: t, info: info}
-		nseg := int((info.Size + dlSegSize - 1) / dlSegSize)
-		conns := downloadConnsForTier(d.opts.DLConns, info.VipType)
+		// Per-tier tuning: segment size and connection count follow the node
+		// account's vip level (never beyond the operator's -dl-conns).
+		lim := baidu.LimitsForVip(info.VipType)
+		segSize := lim.DownloadSeg
+		conns := d.opts.DLConns
+		if conns < 1 {
+			conns = 1
+		}
+		if conns > lim.DownloadConns {
+			conns = lim.DownloadConns
+		}
+		nseg := int((info.Size + segSize - 1) / segSize)
 		if conns > nseg {
 			conns = nseg
 		}
-		t.logf("segment download started segments=%d concurrency=%d requested_concurrency=%d segment_size=%d", nseg, conns, d.opts.DLConns, dlSegSize)
+		t.logf("segment download started tier=%s segments=%d concurrency=%d requested_concurrency=%d segment_size=%d",
+			baidu.TierName(info.VipType), nseg, conns, d.opts.DLConns, segSize)
+		t.setDetail("并行分段下载中")
+		var doneSegs int32
 		progress := make([]int64, nseg)
 		var progressMu sync.Mutex
 		setSegmentProgress := func(i int, current int64) {
@@ -218,8 +218,8 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 							return
 						}
 						i := pending[at]
-						s0 := int64(i) * dlSegSize
-						e0 := s0 + dlSegSize - 1
+						s0 := int64(i) * segSize
+						e0 := s0 + segSize - 1
 						if e0 > info.Size-1 {
 							e0 = info.Size - 1
 						}
@@ -245,6 +245,7 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 							continue
 						}
 						completed[i] = true
+						t.setDetail(fmt.Sprintf("并行分段下载中：%d/%d 分段完成", atomic.AddInt32(&doneSegs, 1), nseg))
 						if atomic.AddInt64(&reported, int64(len(data))) >= dlReportAt {
 							d.reportDown(t.auth, info.NodeID, atomic.SwapInt64(&reported, 0))
 						}
@@ -252,8 +253,8 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 				}()
 			}
 			wg.Wait()
-			if ctx.Err() != nil { // user cancel
-				t.logf("download workers stopped by cancellation")
+			if ctx.Err() != nil { // canceled via the cancel API (web UI 取消按钮)
+				t.logf("download canceled; workers stopped, partial file removed")
 				cleanup(false)
 				return
 			}
@@ -265,6 +266,7 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 			}
 			if len(pending) > 0 && round < dlRetryRounds-1 {
 				t.logf("download round incomplete; preserving %d completed segments and retrying %d missing segments", nseg-len(pending), len(pending))
+				t.setDetail(fmt.Sprintf("网络波动：正在补传 %d 个缺失分段", len(pending)))
 				if err := waitTaskRetry(ctx, t, "download missing segments", round+1); err != nil {
 					cleanup(false)
 					return
@@ -282,12 +284,14 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 		t.logf("all download segments written bytes=%d", info.Size)
 	}
 
+	t.setDetail("正在保存本地文件")
 	cleanup(true)
 	if err := os.Rename(part, target); err != nil {
 		t.fail("保存本地文件失败: " + err.Error())
 		return
 	}
 	t.set(func(t *Task) { t.LocalPath = target })
+	t.setDetail("")
 	t.setStatus("done")
 	t.logf("completed remote=%q local=%q bytes=%d", t.RemotePath, target, info.Size)
 
@@ -299,7 +303,8 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 }
 
 // fetchSegment reads one ranged segment from Baidu, re-resolving the dlink on
-// upstream errors (it may have expired mid-download).
+// upstream errors (it may have expired mid-download). A canceled task returns
+// ctx.Err() immediately without logging attempts as failures.
 func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64, onProgress func(int64)) ([]byte, error) {
 	rng := fmt.Sprintf("bytes=%d-%d", s0, e0)
 	wantLen := e0 - s0 + 1
@@ -314,55 +319,74 @@ func (s *dlSource) fetchSegment(ctx context.Context, s0, e0 int64, onProgress fu
 			case <-time.After(time.Duration(300*(1<<attempt)) * time.Millisecond):
 			}
 		}
-		info := s.get()
-		resp, err := s.d.baidu.OpenDownload(ctx, info.Token, info.Dlink, rng)
-		if err != nil {
-			lastErr = err
-			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
-			continue
+		data, err := s.fetchSegmentOnce(ctx, rng, s0, wantLen, onProgress)
+		if err == nil {
+			return data, nil
 		}
-		if resp.StatusCode >= 400 {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("云端返回 HTTP %d", resp.StatusCode)
-			if err := s.refresh(ctx, info); err != nil {
-				lastErr = fmt.Errorf("云端直链失效且无法刷新: %w", err)
-			}
-			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
-			continue
+		if ctx.Err() != nil {
+			// Task canceled mid-read: not a network failure, exit quietly.
+			onProgress(0)
+			return nil, ctx.Err()
 		}
-		// 200 instead of 206 means Range was ignored; only usable from offset 0.
-		if resp.StatusCode == http.StatusOK && s0 != 0 {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("云端不支持分段下载")
-			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
-			continue
-		}
-		data := make([]byte, wantLen)
-		var received int64
-		var readErr error
-		for received < wantLen {
-			n, e := resp.Body.Read(data[received:])
-			if n > 0 {
-				received += int64(n)
-				onProgress(received)
-			}
-			if e != nil {
-				if e != io.EOF {
-					readErr = e
-				}
-				break
-			}
-		}
-		resp.Body.Close()
-		if readErr != nil || received != wantLen {
-			lastErr = fmt.Errorf("读取云端数据不完整: received=%d want=%d error=%v", received, wantLen, readErr)
-			s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
-			continue
-		}
-		return data, nil
+		lastErr = err
+		s.task.logf("segment range=%s failed attempt=%d/%d: %v", rng, attempt+1, dlRetryEach, lastErr)
+		s.task.setDetail(fmt.Sprintf("网络波动：分段重试中 (%d/%d)", attempt+1, dlRetryEach))
 	}
 	onProgress(0)
 	return nil, lastErr
+}
+
+func (s *dlSource) fetchSegmentOnce(ctx context.Context, rng string, s0, wantLen int64, onProgress func(int64)) ([]byte, error) {
+	info := s.get()
+	// Stall watchdog: cancel this attempt when no bytes arrive for
+	// dlStallTimeout so a dead connection is retried instead of hanging.
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+	watchdog := time.AfterFunc(dlStallTimeout, cancelAttempt)
+	defer watchdog.Stop()
+
+	resp, err := s.d.baidu.OpenDownload(attemptCtx, info.Token, info.Dlink, rng)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		resp.Body.Close()
+		err := fmt.Errorf("云端返回 HTTP %d", resp.StatusCode)
+		if rerr := s.refresh(ctx, info); rerr != nil {
+			err = fmt.Errorf("云端直链失效且无法刷新: %w", rerr)
+		}
+		return nil, err
+	}
+	// 200 instead of 206 means Range was ignored; only usable from offset 0.
+	if resp.StatusCode == http.StatusOK && s0 != 0 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("云端不支持分段下载")
+	}
+	data := make([]byte, wantLen)
+	var received int64
+	var readErr error
+	for received < wantLen {
+		n, e := resp.Body.Read(data[received:])
+		if n > 0 {
+			received += int64(n)
+			watchdog.Reset(dlStallTimeout)
+			onProgress(received)
+		}
+		if e != nil {
+			if e != io.EOF {
+				readErr = e
+			}
+			break
+		}
+	}
+	resp.Body.Close()
+	if readErr != nil || received != wantLen {
+		if ctx.Err() == nil && attemptCtx.Err() != nil {
+			return nil, fmt.Errorf("连接停滞超过 %s（已读 %d/%d 字节），断开重试", dlStallTimeout, received, wantLen)
+		}
+		return nil, fmt.Errorf("读取云端数据不完整: received=%d want=%d error=%v", received, wantLen, readErr)
+	}
+	return data, nil
 }
 
 // reportDown tells the server how many bytes moved directly (traffic

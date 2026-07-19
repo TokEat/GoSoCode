@@ -991,11 +991,12 @@ function taskToTransfer(task: ClientTask): Transfer {
   const status: TransferStatus = active
     ? "running"
     : task.status === "done" ? "done" : task.status === "error" ? "error" : "canceled";
-  const note = task.status === "waiting"
-    ? "等待本地客户端调度"
-    : task.status === "hashing"
-      ? "正在本机计算文件指纹"
-      : undefined;
+  const note = task.detail
+    || (task.status === "waiting"
+      ? "等待本地客户端调度"
+      : task.status === "hashing"
+        ? "正在本机计算文件指纹"
+        : undefined);
   return {
     id: task.id,
     kind: task.kind,
