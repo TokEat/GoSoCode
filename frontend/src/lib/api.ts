@@ -4,6 +4,7 @@ export interface FileItem {
   id: number; path: string; size: number; status: string; created_at: string; modified: string; is_dir: boolean; owner: string;
   node_id?: number; remote_path?: string; download_url?: string; mount?: boolean;
   protected?: boolean; protected_own?: boolean; protected_by?: string;
+  encrypted?: boolean;
 }
 export interface ProtectInfo { protected: boolean; owner?: string; is_dir?: boolean; password?: string; }
 export interface Storage { total: number; used: number; free: number; }

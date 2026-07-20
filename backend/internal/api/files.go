@@ -210,6 +210,18 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			ruleByPath[r.Path] = r
 		}
 	}
+	// Same trick for at-rest encryption: the flag lives in the local File
+	// metadata, so one IN query marks encrypted children for the UI badge.
+	encByPath := map[string]bool{}
+	if len(childPaths) > 0 {
+		var encPaths []string
+		s.db.Model(&models.File{}).
+			Where("logical_path IN ? AND encrypted = ? AND status <> ?", childPaths, true, "deleted").
+			Pluck("logical_path", &encPaths)
+		for _, p := range encPaths {
+			encByPath[p] = true
+		}
+	}
 	uid := uidOf(c)
 
 	out := make([]gin.H, 0, len(items))
@@ -233,6 +245,9 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			// free (passwordless) access is owner-only; admins manage via role
 			row["protected_own"] = r.OwnerUserID == uid
 			row["protected_by"] = r.OwnerName
+		}
+		if encByPath[childPath] {
+			row["encrypted"] = true
 		}
 		out = append(out, row)
 	}

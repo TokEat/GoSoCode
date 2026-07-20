@@ -446,7 +446,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
               return (
                 <tr key={"f:" + f.id} style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
-                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>} {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>} {f.status !== "ready" && statusBadge(f.status)}</div></td>
                   <td className="muted">{humanSize(f.size)}</td>
                   <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
                   <td className="muted">{extOf(name)}</td>
