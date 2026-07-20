@@ -157,7 +157,17 @@ function pickFile(): Promise<File | null> {
 // frontend and backend in sync across refreshes/interruptions: uploads resume
 // without re-picking the file, downloads resume from the stored byte offset.
 
-const STORE_KEY = "gsc_transfers_v1";
+// Persistence is namespaced per user (JWT `sub`) so that on a shared browser
+// another account never sees or resumes someone else's transfers.
+function ownerId(): string {
+  try {
+    const t = auth.token;
+    if (!t) return "anon";
+    const payload = JSON.parse(atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return String(payload.sub ?? "anon");
+  } catch { return "anon"; }
+}
+const storeKey = () => `gsc_transfers_v1:${ownerId()}`;
 
 // ---- IndexedDB helpers ------------------------------------------------------
 
@@ -211,7 +221,8 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
   const list: Transfer[] = [];
   const resumeIds: string[] = [];
   try {
-    const raw = JSON.parse(localStorage.getItem(STORE_KEY) || "[]") as PersistEntry[];
+    localStorage.removeItem("gsc_transfers_v1"); // drop the old shared (pre-isolation) store
+    const raw = JSON.parse(localStorage.getItem(storeKey()) || "[]") as PersistEntry[];
     for (const e of raw) {
       if (!e || !e.id) continue;
       const wasActive = e.status === "running" || e.status === "paused" || e.status === "finalizing";
@@ -354,7 +365,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         } : undefined,
       };
     });
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(entries)); } catch { /* quota */ }
+    try { localStorage.setItem(storeKey(), JSON.stringify(entries)); } catch { /* quota */ }
   }, [transfers]);
 
   const patch = useCallback((id: string, p: Partial<Transfer>) => {

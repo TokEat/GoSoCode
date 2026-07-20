@@ -27,6 +27,10 @@ func (s *Server) handleWS(c *gin.Context) {
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
+	if u.Status == "disabled" {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return

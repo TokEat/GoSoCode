@@ -67,7 +67,10 @@ export default function App() {
   return (
     <ToastProvider>
       <DialogProvider>
-        <TransferProvider mode={runtime.mode}>
+        {/* keyed on login state: switching accounts remounts the provider so
+            in-memory transfers reset and persistence reloads under the new
+            user's namespace (see storeKey in transfer.tsx) */}
+        <TransferProvider key={loggedIn ? "in" : "out"} mode={runtime.mode}>
           {loggedIn
             ? <Shell
                 runtime={runtime}
