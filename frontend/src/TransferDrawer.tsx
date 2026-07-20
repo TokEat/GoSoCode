@@ -41,17 +41,31 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
           {transfers.map((t) => {
             const pct = t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
             const color = t.status === "error" ? "#dc2626" : t.status === "done" ? "#16a34a" : t.status === "paused" ? "#d97706" : "#6366f1";
+            // streaming uploads carry a second progress: bytes confirmed at the cloud
+            const isStream = t.kind === "upload" && t.synced !== undefined;
+            const syncPct = isStream && t.total > 0 ? Math.min(100, Math.round(((t.synced || 0) / t.total) * 100)) : 0;
             return (
               <div key={t.id} className="transfer-drawer-row">
                 <span className={`drawer-kind ${t.kind}`}>{t.kind === "upload" ? "↑" : "↓"}</span>
                 <span className="drawer-name" title={t.path}>{t.name}</span>
-                <div className="bar drawer-bar"><span style={{ width: `${pct}%`, background: color }} /></div>
-                <span className="drawer-pct">{pct}%</span>
+                <div className="drawer-bars">
+                  <div className="bar drawer-bar"><span style={{ width: `${pct}%`, background: color }} /></div>
+                  {isStream && (
+                    <div className="bar drawer-bar drawer-bar-sync">
+                      <span style={{ width: `${syncPct}%`, background: t.status === "error" ? "#dc2626" : "#0ea5e9" }} />
+                    </div>
+                  )}
+                </div>
+                <span className="drawer-pct" title={isStream ? `已上传 ${pct}% · 云端已保存 ${syncPct}%` : undefined}>
+                  {isStream ? `${pct}%·☁${syncPct}%` : `${pct}%`}
+                </span>
                 <span className="drawer-info" title={t.error || t.note || undefined}>
                   {t.status === "error"
                     ? (t.error || LABEL.error)
                     : t.status === "running"
-                      ? (t.speed > 0 ? humanRate(t.speed) : (t.note || LABEL.running))
+                      ? (isStream
+                          ? `↑${humanRate(t.speed)} ☁${humanRate(t.syncSpeed || 0)}`
+                          : (t.speed > 0 ? humanRate(t.speed) : (t.note || LABEL.running)))
                       : LABEL[t.status]}
                 </span>
               </div>
