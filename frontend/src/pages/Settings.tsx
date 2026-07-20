@@ -70,8 +70,8 @@ export default function Settings() {
             启用统一认证登录
           </label>
           <small className="field-help">
-            开启后，登录页显示「统一认证登录」入口，普通用户只能通过 Keycloak 登录（首次登录自动创建账号，角色为普通用户）；
-            管理员仍可使用本系统密码登录，作为身份服务不可用时的逃生通道。
+            开启后，登录页显示「统一认证登录」入口，Keycloak 用户首次登录自动创建账号（角色为普通用户）；
+            系统中已有的本地用户仍可使用用户名密码登录，两种方式并存。
           </small>
         </div>
         <div className="field">

@@ -18,10 +18,19 @@ func (s *Server) handleMe(c *gin.Context) {
 	}
 	var fileCount int64
 	s.db.Model(&models.File{}).Where("owner_user_id = ? AND status != ?", u.ID, "deleted").Count(&fileCount)
+	// paths this user protected with an access password
+	var rules []models.AccessRule
+	s.db.Where("owner_user_id = ?", u.ID).Order("path asc").Find(&rules)
+	protected := make([]gin.H, 0, len(rules))
+	for _, r := range rules {
+		protected = append(protected, gin.H{"path": r.Path, "is_dir": r.IsDir, "created_at": r.CreatedAt})
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"id": u.ID, "username": u.Username, "role": u.Role, "status": u.Status,
+		"sso": u.OIDCSubject != "",
 		"bytes_up": u.BytesUp, "bytes_down": u.BytesDown,
 		"file_count": fileCount, "created_at": u.CreatedAt,
+		"protected": protected,
 	})
 }
 

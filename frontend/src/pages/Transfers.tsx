@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { api, TransferLogItem } from "../lib/api";
-import { Card, Badge, useToast } from "../ui";
+import { Card, Badge, useToast, useDialog } from "../ui";
 import { humanSize, humanRate, humanDuration, fmtTime } from "../lib/format";
 import { useTransfers, TransferStatus } from "../transfer";
+
+const HIST_PAGE_SIZE = 20;
 
 const STATUS: Record<TransferStatus, { label: string; kind: string }> = {
   running: { label: "传输中", kind: "blue" },
@@ -16,16 +18,34 @@ const STATUS: Record<TransferStatus, { label: string; kind: string }> = {
 export default function Transfers() {
   const { clientMode, transfers, pause, resume, cancel, remove, clearFinished } = useTransfers();
   const toast = useToast();
+  const dialog = useDialog();
   const [history, setHistory] = useState<TransferLogItem[]>([]);
+  const [histTotal, setHistTotal] = useState(0);
+  const [histPage, setHistPage] = useState(1);
 
-  const loadHistory = () => {
+  const loadHistory = (page = histPage) => {
     if (clientMode) return Promise.resolve();
-    return api.transferHistory().then(setHistory).catch(() => {});
+    return api.transferHistory(page, HIST_PAGE_SIZE)
+      .then((r) => { setHistory(r.logs); setHistTotal(r.total); setHistPage(page); })
+      .catch(() => {});
   };
-  useEffect(() => { if (!clientMode) loadHistory(); }, [clientMode]);
+  useEffect(() => { if (!clientMode) loadHistory(1); }, [clientMode]);
   // Refresh history whenever a transfer completes.
   const doneCount = transfers.filter((t) => t.status === "done").length;
   useEffect(() => { if (!clientMode) loadHistory(); }, [clientMode, doneCount]);
+
+  async function clearHistory() {
+    if (!(await dialog.confirm({ title: "清空历史传输", message: "确定删除全部历史传输记录吗？此操作不可撤销。", danger: true, confirmLabel: "清空" }))) return;
+    try {
+      await api.clearTransferHistory();
+      toast("ok", "历史记录已清空");
+      loadHistory(1);
+    } catch (e: any) {
+      toast("err", e.message || "清空失败");
+    }
+  }
+
+  const histPages = Math.max(1, Math.ceil(histTotal / HIST_PAGE_SIZE));
 
   return (
     <div className="grid" style={{ gap: 20 }}>
@@ -108,8 +128,13 @@ export default function Transfers() {
     </Card>
 
     {!clientMode && <Card
-      title={`历史传输 (${history.length})`}
-      action={<button className="btn ghost" onClick={loadHistory}>刷新</button>}
+      title={`历史传输 (${histTotal})`}
+      action={
+        <div className="row">
+          <button className="btn ghost" onClick={() => loadHistory()}>刷新</button>
+          <button className="btn danger sm" onClick={clearHistory} disabled={histTotal === 0}>清空历史</button>
+        </div>
+      }
     >
       <table>
         <thead>
@@ -128,6 +153,13 @@ export default function Transfers() {
           {history.length === 0 && <tr><td colSpan={5} className="empty">暂无历史记录</td></tr>}
         </tbody>
       </table>
+      {histPages > 1 && (
+        <div className="row" style={{ justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 12 }}>
+          <button className="btn ghost sm" disabled={histPage <= 1} onClick={() => loadHistory(histPage - 1)}>上一页</button>
+          <span className="muted" style={{ fontSize: 12 }}>第 {histPage} / {histPages} 页</span>
+          <button className="btn ghost sm" disabled={histPage >= histPages} onClick={() => loadHistory(histPage + 1)}>下一页</button>
+        </div>
+      )}
     </Card>}
     </div>
   );

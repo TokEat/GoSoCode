@@ -66,7 +66,7 @@ func (s *Server) handleOAuthURL(c *gin.Context) {
 		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "尚未配置百度应用 AppKey/SecretKey，请先在「百度应用配置」中填写"})
 		return
 	}
-	state := s.mintOAuthState()
+	state := s.mintOAuthState("")
 	c.JSON(http.StatusOK, gin.H{"url": s.client.AuthCodeURL(bc.RedirectURI, state), "oob": bc.RedirectURI == "oob", "state": state})
 }
 
@@ -127,7 +127,7 @@ func (s *Server) handleOAuthExchange(c *gin.Context) {
 // JWT. Instead we require the `state` parameter to be a single-use token
 // minted by handleOAuthURL — see Server.mintOAuthState / consumeOAuthState.
 func (s *Server) handleOAuthCallback(c *gin.Context) {
-	if !s.consumeOAuthState(c.Query("state")) {
+	if _, ok := s.consumeOAuthState(c.Query("state")); !ok {
 		s.oauthResult(c, false, 0, "授权已失效或 state 不合法，请回到接入页面重新发起")
 		return
 	}

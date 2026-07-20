@@ -62,7 +62,7 @@ type Server struct {
 	// who can read a leaked code from registering a node by hitting the
 	// callback with an arbitrary code.
 	oauthStatesMu sync.Mutex
-	oauthStates   map[string]time.Time
+	oauthStates   map[string]oauthStateEntry
 
 	// cached OIDC discovery document (re-fetched when the issuer changes or
 	// the cache ages out) — see oidc.go
@@ -78,7 +78,7 @@ func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baid
 		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter, control: control,
 		streamStates: map[string]*streamState{},
 		ctrlSessions: map[string]*controlSession{},
-		oauthStates:  map[string]time.Time{},
+		oauthStates:  map[string]oauthStateEntry{},
 	}
 	if key, err := crypto.GenerateHandshakeKey(); err == nil {
 		srv.handshakePriv = key
@@ -159,6 +159,7 @@ func (s *Server) Router() *gin.Engine {
 		auth.POST("/jobs/:id/cancel", s.handleCancelJob)
 		auth.POST("/transfers/log", s.handleLogTransfer)
 		auth.GET("/transfers/log", s.handleListTransferLog)
+		auth.DELETE("/transfers/log", s.handleClearTransferLog)
 	}
 
 	// key negotiation for the CLI control plane: reachable after login, before
@@ -340,40 +341,47 @@ func (s *Server) systemConfig() models.SystemConfig {
 	return sc
 }
 
+// oauthStateEntry is a single-use callback nonce; returnTo optionally records
+// where to send the browser after a successful OIDC login (client-mode SSO).
+type oauthStateEntry struct {
+	exp      time.Time
+	returnTo string
+}
+
 // mintOAuthState returns a fresh 32-char hex state and remembers it for 5
-// minutes. /api/oauth/callback only accepts a state minted here. Garbage-
+// minutes. The OAuth/OIDC callbacks only accept a state minted here. Garbage-
 // collects expired entries on every mint.
-func (s *Server) mintOAuthState() string {
+func (s *Server) mintOAuthState(returnTo string) string {
 	var raw [16]byte
 	_, _ = rand.Read(raw[:])
 	state := hex.EncodeToString(raw[:])
-	cutoff := time.Now().Add(5 * time.Minute)
+	entry := oauthStateEntry{exp: time.Now().Add(5 * time.Minute), returnTo: returnTo}
 	s.oauthStatesMu.Lock()
 	defer s.oauthStatesMu.Unlock()
-	for k, exp := range s.oauthStates {
-		if exp.Before(time.Now()) {
+	for k, e := range s.oauthStates {
+		if e.exp.Before(time.Now()) {
 			delete(s.oauthStates, k)
 		}
 	}
-	s.oauthStates[state] = cutoff
+	s.oauthStates[state] = entry
 	return state
 }
 
-// consumeOAuthState returns true exactly once for a state minted in the last
-// 5 minutes. Any further call with the same state returns false.
-func (s *Server) consumeOAuthState(state string) bool {
+// consumeOAuthState succeeds exactly once for a state minted in the last
+// 5 minutes, returning the returnTo recorded with it. Any further call with
+// the same state fails.
+func (s *Server) consumeOAuthState(state string) (string, bool) {
 	if state == "" {
-		return false
+		return "", false
 	}
 	s.oauthStatesMu.Lock()
 	defer s.oauthStatesMu.Unlock()
-	exp, ok := s.oauthStates[state]
-	if !ok || exp.Before(time.Now()) {
-		delete(s.oauthStates, state)
-		return false
-	}
+	e, ok := s.oauthStates[state]
 	delete(s.oauthStates, state)
-	return true
+	if !ok || e.exp.Before(time.Now()) {
+		return "", false
+	}
+	return e.returnTo, true
 }
 
 func itoa(u uint) string {

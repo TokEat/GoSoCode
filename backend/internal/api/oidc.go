@@ -89,6 +89,25 @@ func (s *Server) handleOIDCStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"enabled": sc.OIDCEnabled && sc.OIDCIssuer != "" && sc.OIDCClientID != ""})
 }
 
+// oidcReturnTo validates a client-mode bounce-back target. Only loopback
+// origins are accepted: the CLI client daemon always serves on the user's own
+// machine, and rejecting everything else keeps the token redirect from being
+// abused as an open redirect to an attacker-controlled host.
+func oidcReturnTo(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1":
+		return u.Scheme + "://" + u.Host + "/"
+	}
+	return ""
+}
+
 func (s *Server) handleOIDCLogin(c *gin.Context) {
 	sc := s.systemConfig()
 	if !sc.OIDCEnabled || sc.OIDCIssuer == "" || sc.OIDCClientID == "" {
@@ -100,12 +119,15 @@ func (s *Server) handleOIDCLogin(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
+	// return_to is injected by the CLI client daemon when the flow starts on
+	// its local UI: the shared server callback completes the login, then
+	// bounces the browser back to the client origin with the token.
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", sc.OIDCClientID)
 	q.Set("redirect_uri", s.oidcRedirectURI(c, sc))
 	q.Set("scope", "openid profile email")
-	q.Set("state", s.mintOAuthState())
+	q.Set("state", s.mintOAuthState(oidcReturnTo(c.Query("return_to"))))
 	sep := "?"
 	if strings.Contains(ep.AuthorizationEndpoint, "?") {
 		sep = "&"
@@ -113,34 +135,40 @@ func (s *Server) handleOIDCLogin(c *gin.Context) {
 	c.Redirect(http.StatusFound, ep.AuthorizationEndpoint+sep+q.Encode())
 }
 
-// oidcFail sends the browser back to the login page with a visible reason.
-func oidcFail(c *gin.Context, msg string) {
-	c.Redirect(http.StatusFound, "/#oidc_error="+url.QueryEscape(msg))
+// oidcFail sends the browser back to the login page (client origin when the
+// flow started there) with a visible reason.
+func oidcFail(c *gin.Context, returnTo, msg string) {
+	base := "/"
+	if returnTo != "" {
+		base = returnTo
+	}
+	c.Redirect(http.StatusFound, base+"#oidc_error="+url.QueryEscape(msg))
 }
 
 func (s *Server) handleOIDCCallback(c *gin.Context) {
-	if !s.consumeOAuthState(c.Query("state")) {
+	returnTo, ok := s.consumeOAuthState(c.Query("state"))
+	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired state"})
 		return
 	}
 	if e := c.Query("error"); e != "" {
-		oidcFail(c, "统一认证失败: "+e)
+		oidcFail(c, returnTo, "统一认证失败: "+e)
 		return
 	}
 	code := c.Query("code")
 	if code == "" {
-		oidcFail(c, "统一认证失败: 未返回授权码")
+		oidcFail(c, returnTo, "统一认证失败: 未返回授权码")
 		return
 	}
 	sc := s.systemConfig()
 	if !sc.OIDCEnabled {
-		oidcFail(c, "统一认证未启用")
+		oidcFail(c, returnTo, "统一认证未启用")
 		return
 	}
 	ctx := c.Request.Context()
 	ep, err := s.oidcDiscover(ctx, sc.OIDCIssuer)
 	if err != nil {
-		oidcFail(c, err.Error())
+		oidcFail(c, returnTo, err.Error())
 		return
 	}
 
@@ -155,7 +183,7 @@ func (s *Server) handleOIDCCallback(c *gin.Context) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := oidcHTTP.Do(req)
 	if err != nil {
-		oidcFail(c, "换取令牌失败: "+err.Error())
+		oidcFail(c, returnTo, "换取令牌失败: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -172,7 +200,7 @@ func (s *Server) handleOIDCCallback(c *gin.Context) {
 		if msg == "" {
 			msg = fmt.Sprintf("令牌端点返回 %d", resp.StatusCode)
 		}
-		oidcFail(c, "换取令牌失败: "+msg)
+		oidcFail(c, returnTo, "换取令牌失败: "+msg)
 		return
 	}
 
@@ -181,7 +209,7 @@ func (s *Server) handleOIDCCallback(c *gin.Context) {
 	uiReq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	uiResp, err := oidcHTTP.Do(uiReq)
 	if err != nil {
-		oidcFail(c, "获取用户信息失败: "+err.Error())
+		oidcFail(c, returnTo, "获取用户信息失败: "+err.Error())
 		return
 	}
 	defer uiResp.Body.Close()
@@ -192,7 +220,7 @@ func (s *Server) handleOIDCCallback(c *gin.Context) {
 		Name              string `json:"name"`
 	}
 	if err := json.NewDecoder(uiResp.Body).Decode(&claims); err != nil || claims.Sub == "" {
-		oidcFail(c, "获取用户信息失败: 无有效 sub 声明")
+		oidcFail(c, returnTo, "获取用户信息失败: 无有效 sub 声明")
 		return
 	}
 
@@ -211,18 +239,22 @@ func (s *Server) handleOIDCCallback(c *gin.Context) {
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
 		if err := s.db.Create(&u).Error; err != nil {
-			oidcFail(c, "创建用户失败: "+err.Error())
+			oidcFail(c, returnTo, "创建用户失败: "+err.Error())
 			return
 		}
 		s.audit(c, u.ID, u.Username, "user.provision.oidc", "sub="+claims.Sub)
 	}
 	if u.Status == "disabled" {
-		oidcFail(c, "账号已被禁用，请联系管理员")
+		oidcFail(c, returnTo, "账号已被禁用，请联系管理员")
 		return
 	}
 	s.audit(c, u.ID, u.Username, "login.oidc", "sub="+claims.Sub)
+	base := "/"
+	if returnTo != "" {
+		base = returnTo
+	}
 	c.Redirect(http.StatusFound,
-		"/#oidc_token="+url.QueryEscape(s.issueToken(u.ID))+"&role="+url.QueryEscape(u.Role))
+		base+"#oidc_token="+url.QueryEscape(s.issueToken(u.ID))+"&role="+url.QueryEscape(u.Role))
 }
 
 var usernameJunk = regexp.MustCompile(`[^0-9A-Za-z\p{Han}._-]+`)

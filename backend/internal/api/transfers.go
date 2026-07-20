@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,10 +30,30 @@ func (s *Server) handleLogTransfer(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// handleListTransferLog returns the caller's completed-transfer history.
+// handleListTransferLog returns one page of the caller's completed-transfer
+// history, newest first.
 func (s *Server) handleListTransferLog(c *gin.Context) {
 	uid := uidOf(c)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	size, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if size < 1 || size > 200 {
+		size = 20
+	}
+	var total int64
+	s.db.Model(&models.TransferLog{}).Where("user_id = ?", uid).Count(&total)
 	var logs []models.TransferLog
-	s.db.Where("user_id = ?", uid).Order("id desc").Limit(200).Find(&logs)
-	c.JSON(http.StatusOK, gin.H{"logs": logs})
+	s.db.Where("user_id = ?", uid).Order("id desc").
+		Offset((page - 1) * size).Limit(size).Find(&logs)
+	c.JSON(http.StatusOK, gin.H{"logs": logs, "total": total, "page": page, "page_size": size})
+}
+
+// handleClearTransferLog deletes the caller's entire transfer history.
+func (s *Server) handleClearTransferLog(c *gin.Context) {
+	uid := uidOf(c)
+	res := s.db.Where("user_id = ?", uid).Delete(&models.TransferLog{})
+	s.audit(c, uid, usernameOf(c), "transfers.clear", "deleted="+strconv.FormatInt(res.RowsAffected, 10))
+	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted": res.RowsAffected})
 }

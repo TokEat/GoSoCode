@@ -22,10 +22,7 @@ func (s *Server) handleListUsers(c *gin.Context) {
 	s.db.Order("id asc").Find(&users)
 	out := make([]gin.H, 0, len(users))
 	for _, u := range users {
-		out = append(out, gin.H{
-			"id": u.ID, "username": u.Username, "role": u.Role, "status": u.Status,
-			"bytes_up": u.BytesUp, "bytes_down": u.BytesDown, "created_at": u.CreatedAt,
-		})
+		out = append(out, renderUser(u))
 	}
 	c.JSON(http.StatusOK, gin.H{"users": out})
 }
@@ -56,6 +53,7 @@ func renderUser(u models.User) gin.H {
 	return gin.H{
 		"id": u.ID, "username": u.Username, "role": u.Role, "status": u.Status,
 		"bytes_up": u.BytesUp, "bytes_down": u.BytesDown, "created_at": u.CreatedAt,
+		"sso": u.OIDCSubject != "",
 	}
 }
 

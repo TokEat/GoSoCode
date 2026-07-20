@@ -31,7 +31,9 @@ type User struct {
 	ID           uint   `gorm:"primaryKey"`
 	Username     string `gorm:"size:64;uniqueIndex"`
 	PasswordHash string `gorm:"size:255"`
-	OIDCSubject  string `gorm:"size:128;index"`         // OIDC `sub` claim; non-empty = account provisioned via SSO
+	// explicit column name: gorm's initialism handling would otherwise map
+	// OIDCSubject to o_id_c_subject and break raw `oidc_subject = ?` lookups
+	OIDCSubject  string `gorm:"column:oidc_subject;size:128;index"` // OIDC `sub` claim; non-empty = account provisioned via SSO
 	Role         string `gorm:"size:16;default:user"`   // admin | user
 	Status       string `gorm:"size:16;default:active"` // active | disabled
 	BytesUp      int64  // lifetime uploaded bytes (traffic accounting)
@@ -60,9 +62,8 @@ type SystemConfig struct {
 	MasterKey      string `gorm:"size:128"`      // hex, 32 bytes
 	LogMaxEntries  int    `gorm:"default:500"`   // audit log retention cap
 
-	// Unified OIDC (e.g. Keycloak) single sign-on. When enabled, regular users
-	// must log in through the identity provider; local password login stays
-	// available to admins as an escape hatch.
+	// Unified OIDC (e.g. Keycloak) single sign-on. When enabled, the login
+	// page offers SSO alongside local password login; both methods coexist.
 	OIDCEnabled      bool   `gorm:"default:false"`
 	OIDCIssuer       string `gorm:"size:512"` // e.g. https://kc.example.com/realms/myrealm
 	OIDCClientID     string `gorm:"size:256"`

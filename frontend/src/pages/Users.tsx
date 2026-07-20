@@ -97,12 +97,13 @@ export default function Users() {
         </div>
       }>
         <table>
-          <thead><tr><th>编号</th><th>用户名</th><th>角色</th><th>状态</th><th>累计上传/下载</th><th>注册时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>编号</th><th>用户名</th><th>来源</th><th>角色</th><th>状态</th><th>累计上传/下载</th><th>注册时间</th><th>操作</th></tr></thead>
           <tbody>
             {users.map((u) => (
               <tr key={u.id}>
                 <td>{u.id}</td>
                 <td>{u.username}</td>
+                <td><Badge kind={u.sso ? "amber" : "gray"}>{u.sso ? "SSO 用户" : "系统用户"}</Badge></td>
                 <td><Badge kind={u.role === "admin" ? "blue" : "gray"}>{u.role === "admin" ? "管理员" : "普通用户"}</Badge></td>
                 <td>{statusBadge(u.status)}</td>
                 <td>{humanSize(u.bytes_up)} / {humanSize(u.bytes_down)}</td>
@@ -121,7 +122,7 @@ export default function Users() {
                 </td>
               </tr>
             ))}
-            {users.length === 0 && <tr><td colSpan={7} className="empty">暂无用户</td></tr>}
+            {users.length === 0 && <tr><td colSpan={8} className="empty">暂无用户</td></tr>}
           </tbody>
         </table>
       </Card>

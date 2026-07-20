@@ -21,10 +21,14 @@ export interface NodeDirectoryList { current: string; parent: string; directorie
 export interface UserItem {
   id: number; username: string; role: string; status: string;
   bytes_up: number; bytes_down: number; created_at: string;
+  sso?: boolean; // provisioned via unified OIDC login (no local password)
 }
+export interface ProtectedItem { path: string; is_dir: boolean; created_at: string; }
 export interface Me {
   id: number; username: string; role: string; status: string;
+  sso?: boolean;
   bytes_up: number; bytes_down: number; file_count: number; created_at: string;
+  protected?: ProtectedItem[];
 }
 export interface LogItem { ID: number; At: string; Username: string; Action: string; Detail: string; IP: string; }
 export interface LogsPage { logs: LogItem[]; total: number; page: number; page_size: number; }
@@ -128,7 +132,10 @@ export const api = {
   // transfers
   listJobs: (): Promise<JobItem[]> => json("/jobs", "GET").then((r) => r.jobs),
   cancelJob: (id: string) => json(`/jobs/${id}/cancel`, "POST"),
-  transferHistory: (): Promise<TransferLogItem[]> => json("/transfers/log", "GET").then((r) => r.logs),
+  transferHistory: (page = 1, pageSize = 20): Promise<{ logs: TransferLogItem[]; total: number }> =>
+    json(`/transfers/log?page=${page}&page_size=${pageSize}`, "GET")
+      .then((r) => ({ logs: r.logs || [], total: r.total || 0 })),
+  clearTransferHistory: () => json("/transfers/log", "DELETE"),
 
   // admin: users
   listUsers: (): Promise<UserItem[]> => json("/admin/users", "GET").then((r) => r.users),
