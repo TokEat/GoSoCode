@@ -36,6 +36,12 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "account disabled"})
 		return
 	}
+	// With unified SSO on, local passwords remain valid only for admins (the
+	// escape hatch if the identity provider is down or misconfigured).
+	if sc := s.systemConfig(); sc.OIDCEnabled && u.Role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "系统已启用统一认证，请使用统一认证登录"})
+		return
+	}
 	s.audit(c, u.ID, u.Username, "login", "")
 	c.JSON(http.StatusOK, gin.H{"token": s.issueToken(u.ID), "user_id": u.ID, "role": u.Role})
 }

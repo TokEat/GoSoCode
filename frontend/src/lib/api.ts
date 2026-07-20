@@ -32,7 +32,12 @@ export interface BaiduConfig {
   app_key: string; sign_key: string; redirect_uri: string;
   has_secret: boolean; configured: boolean;
 }
-export interface SystemConfig { encrypt_storage: boolean; log_max_entries: number; }
+export interface SystemConfig {
+  encrypt_storage: boolean; log_max_entries: number;
+  oidc_enabled: boolean; oidc_issuer: string; oidc_client_id: string;
+  oidc_redirect_url: string; oidc_has_secret: boolean;
+  oidc_client_secret?: string; // write-only: sent on save, never echoed back
+}
 export type UserInput = { username: string; password?: string; role: string; status: string };
 export interface TrafficRow { id: number; label: string; bytes_up: number; bytes_down: number; }
 export interface TrafficPoint { t: number; up: number; down: number; }
@@ -54,6 +59,20 @@ export const auth = {
   set(token: string, role: string) { localStorage.setItem(TOKEN, token); localStorage.setItem(ROLE, role); },
   clear() { localStorage.removeItem(TOKEN); localStorage.removeItem(ROLE); },
 };
+
+// SSO landing: after Keycloak login the server redirects to
+// /#oidc_token=...&role=... (or /#oidc_error=...). Consume it before the app
+// reads auth.token, then scrub the fragment so the token never sticks in the URL.
+(() => {
+  const h = window.location.hash;
+  if (!h.includes("oidc_token=") && !h.includes("oidc_error=")) return;
+  const p = new URLSearchParams(h.slice(1));
+  const tok = p.get("oidc_token");
+  if (tok) auth.set(tok, p.get("role") || "user");
+  const err = p.get("oidc_error");
+  if (err) sessionStorage.setItem("gsc_oidc_error", err);
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+})();
 
 async function req(path: string, opts: RequestInit = {}) {
   const headers = new Headers(opts.headers);
@@ -78,6 +97,7 @@ const json = (p: string, method: string, body?: any) =>
 export const api = {
   // auth + profile
   login: (username: string, password: string) => json("/login", "POST", { username, password }),
+  oidcStatus: (): Promise<{ enabled: boolean }> => json("/auth/oidc/status", "GET"),
   me: (): Promise<Me> => json("/me", "GET"),
   changePassword: (oldp: string, newp: string) => json("/me/password", "PUT", { old_password: oldp, new_password: newp }),
 

@@ -31,6 +31,7 @@ type User struct {
 	ID           uint   `gorm:"primaryKey"`
 	Username     string `gorm:"size:64;uniqueIndex"`
 	PasswordHash string `gorm:"size:255"`
+	OIDCSubject  string `gorm:"size:128;index"`         // OIDC `sub` claim; non-empty = account provisioned via SSO
 	Role         string `gorm:"size:16;default:user"`   // admin | user
 	Status       string `gorm:"size:16;default:active"` // active | disabled
 	BytesUp      int64  // lifetime uploaded bytes (traffic accounting)
@@ -58,7 +59,17 @@ type SystemConfig struct {
 	EncryptStorage bool   `gorm:"default:false"` // new uploads are AES-encrypted at rest
 	MasterKey      string `gorm:"size:128"`      // hex, 32 bytes
 	LogMaxEntries  int    `gorm:"default:500"`   // audit log retention cap
-	UpdatedAt      time.Time
+
+	// Unified OIDC (e.g. Keycloak) single sign-on. When enabled, regular users
+	// must log in through the identity provider; local password login stays
+	// available to admins as an escape hatch.
+	OIDCEnabled      bool   `gorm:"default:false"`
+	OIDCIssuer       string `gorm:"size:512"` // e.g. https://kc.example.com/realms/myrealm
+	OIDCClientID     string `gorm:"size:256"`
+	OIDCClientSecret string `gorm:"size:512"`
+	OIDCRedirectURL  string `gorm:"size:512"` // optional override; default derives from the request host
+
+	UpdatedAt time.Time
 }
 
 // AccessRule protects a logical path (file or directory) with a password. Only

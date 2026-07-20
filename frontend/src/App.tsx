@@ -23,6 +23,15 @@ type Page =
   | "overview" | "files" | "transfers" | "profile"
   | "users" | "nodes" | "traffic" | "logs" | "settings" | "client";
 
+const PAGES: Page[] = ["overview", "files", "transfers", "profile", "users", "nodes", "traffic", "logs", "settings", "client"];
+
+// Hash-based routing (#/files, #/transfers, …) so a refresh or a shared link
+// lands on the same page instead of resetting to the overview.
+function pageFromHash(): Page {
+  const h = window.location.hash.replace(/^#\/?/, "");
+  return PAGES.includes(h as Page) ? (h as Page) : "overview";
+}
+
 const USER_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "overview", label: "概览", ico: "▦" },
   { key: "files", label: "文件管理", ico: "🗂" },
@@ -77,11 +86,19 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
   onRuntimeChange: (info: ClientInfo) => void;
   onLogout: () => void;
 }) {
-  const [page, setPage] = useState<Page>("overview");
-  const [collapsed, setCollapsed] = useState(false);
-  const [jobs, setJobs] = useState<Record<string, JobEvent>>({});
   const clientMode = runtime.mode === "client";
   const isAdmin = auth.role === "admin";
+  const guard = (p: Page): Page =>
+    (!isAdmin && ADMIN_NAV.some((n) => n.key === p)) || (p === "client" && !clientMode) ? "overview" : p;
+  const [page, setPageState] = useState<Page>(() => guard(pageFromHash()));
+  const setPage = (p: Page) => { window.location.hash = "/" + p; };
+  useEffect(() => {
+    const onHash = () => setPageState(guard(pageFromHash()));
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const [collapsed, setCollapsed] = useState(false);
+  const [jobs, setJobs] = useState<Record<string, JobEvent>>({});
   const { resolveJob } = useTransfers();
 
   const resolvedJobs = useRef(new Set<string>());

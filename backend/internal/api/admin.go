@@ -515,7 +515,12 @@ func (s *Server) handleListLogs(c *gin.Context) {
 // ---- system settings ---------------------------------------------------------
 
 func renderSystemConfig(sc models.SystemConfig) gin.H {
-	return gin.H{"encrypt_storage": sc.EncryptStorage, "log_max_entries": sc.LogMaxEntries}
+	return gin.H{
+		"encrypt_storage": sc.EncryptStorage, "log_max_entries": sc.LogMaxEntries,
+		"oidc_enabled": sc.OIDCEnabled, "oidc_issuer": sc.OIDCIssuer,
+		"oidc_client_id": sc.OIDCClientID, "oidc_redirect_url": sc.OIDCRedirectURL,
+		"oidc_has_secret": sc.OIDCClientSecret != "",
+	}
 }
 
 func (s *Server) handleGetSystemConfig(c *gin.Context) {
@@ -524,8 +529,13 @@ func (s *Server) handleGetSystemConfig(c *gin.Context) {
 
 func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 	var in struct {
-		EncryptStorage *bool `json:"encrypt_storage"`
-		LogMaxEntries  *int  `json:"log_max_entries"`
+		EncryptStorage   *bool   `json:"encrypt_storage"`
+		LogMaxEntries    *int    `json:"log_max_entries"`
+		OIDCEnabled      *bool   `json:"oidc_enabled"`
+		OIDCIssuer       *string `json:"oidc_issuer"`
+		OIDCClientID     *string `json:"oidc_client_id"`
+		OIDCClientSecret *string `json:"oidc_client_secret"`
+		OIDCRedirectURL  *string `json:"oidc_redirect_url"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -542,6 +552,26 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		}
 		sc.LogMaxEntries = *in.LogMaxEntries
 	}
+	if in.OIDCIssuer != nil {
+		sc.OIDCIssuer = strings.TrimRight(strings.TrimSpace(*in.OIDCIssuer), "/")
+	}
+	if in.OIDCClientID != nil {
+		sc.OIDCClientID = strings.TrimSpace(*in.OIDCClientID)
+	}
+	// empty secret in the payload means "keep the stored one" (it is never echoed back)
+	if in.OIDCClientSecret != nil && strings.TrimSpace(*in.OIDCClientSecret) != "" {
+		sc.OIDCClientSecret = strings.TrimSpace(*in.OIDCClientSecret)
+	}
+	if in.OIDCRedirectURL != nil {
+		sc.OIDCRedirectURL = strings.TrimSpace(*in.OIDCRedirectURL)
+	}
+	if in.OIDCEnabled != nil {
+		sc.OIDCEnabled = *in.OIDCEnabled
+	}
+	if sc.OIDCEnabled && (sc.OIDCIssuer == "" || sc.OIDCClientID == "" || sc.OIDCClientSecret == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "启用统一认证前需填写 Issuer 地址、Client ID 和 Client Secret"})
+		return
+	}
 	sc.ID = 1
 	sc.UpdatedAt = time.Now()
 	if err := s.db.Save(&sc).Error; err != nil {
@@ -549,6 +579,7 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		return
 	}
 	s.audit(c, uidOf(c), usernameOf(c), "system.config",
-		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" log_max_entries="+strconv.Itoa(sc.LogMaxEntries))
+		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" log_max_entries="+strconv.Itoa(sc.LogMaxEntries)+
+			" oidc_enabled="+strconv.FormatBool(sc.OIDCEnabled))
 	c.JSON(http.StatusOK, renderSystemConfig(sc))
 }

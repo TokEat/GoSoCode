@@ -63,6 +63,13 @@ type Server struct {
 	// callback with an arbitrary code.
 	oauthStatesMu sync.Mutex
 	oauthStates   map[string]time.Time
+
+	// cached OIDC discovery document (re-fetched when the issuer changes or
+	// the cache ages out) — see oidc.go
+	oidcMu          sync.Mutex
+	oidcCache       *oidcEndpoints
+	oidcCacheIssuer string
+	oidcCacheAt     time.Time
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baidu.Client,
@@ -103,6 +110,12 @@ func (s *Server) Router() *gin.Engine {
 	r.GET("/api/client/download/:os/:arch", s.handleClientDownload)
 
 	r.POST("/api/login", s.handleLogin)
+	// Unified OIDC (Keycloak) SSO: status is public so the login page knows
+	// whether to offer it; login/callback are public because the browser is
+	// redirected there without a JWT. Callback is protected by a one-time state.
+	r.GET("/api/auth/oidc/status", s.handleOIDCStatus)
+	r.GET("/api/auth/oidc/login", s.handleOIDCLogin)
+	r.GET("/api/auth/oidc/callback", s.handleOIDCCallback)
 	// Public Baidu callback (the browser is redirected here by Baidu, so the
 	// admin can't carry a JWT header). Protected by a one-time `state` we
 	// generate when starting the OAuth flow — see handleOAuthURL.
