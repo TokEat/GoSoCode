@@ -74,7 +74,7 @@ export default function App() {
                 onRuntimeChange={setRuntime}
                 onLogout={() => { auth.clear(); setLoggedIn(false); }}
               />
-            : <Login onDone={() => setLoggedIn(true)} />}
+            : <Login onDone={() => setLoggedIn(true)} runtime={runtime} />}
         </TransferProvider>
       </DialogProvider>
     </ToastProvider>

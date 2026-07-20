@@ -104,9 +104,12 @@ export default function Settings() {
             value={oidc.redirect}
             disabled={saving}
             onChange={(e) => setOidc({ ...oidc, redirect: e.target.value })}
-            placeholder="https://pan.example.com/api/auth/oidc/callback（留空则按访问地址自动生成）"
+            placeholder="https://pan.example.com/api/auth/oidc/callback（留空则在启用时按当前访问地址自动生成）"
           />
-          <small className="field-help">需与 Keycloak 客户端里配置的 Valid Redirect URI 完全一致。</small>
+          <small className="field-help">
+            所有登录流程（含本机客户端模式）统一使用该回调地址，Keycloak 白名单只需配置这一条；
+            需与 Keycloak 客户端里的 Valid Redirect URI 完全一致。留空保存启用时会按你当前访问服务端的地址自动生成并固化，请确认与白名单一致。
+          </small>
         </div>
         <button
           className="btn"

@@ -366,21 +366,22 @@ func (d *Daemon) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// SSO started from the local client UI: tell the server where to bounce
-	// the browser back after the identity provider finishes, and rewrite Host
-	// to the server's own address so the derived redirect_uri is the server
-	// callback (already whitelisted at the provider) — the local client origin
-	// must never be sent to Keycloak, loopback redirects are usually rejected.
+	// the browser back after the identity provider finishes.
 	if r.URL.Path == "/api/auth/oidc/login" {
 		q := r.URL.Query()
 		if q.Get("return_to") == "" {
 			q.Set("return_to", "http://"+r.Host+"/")
 			r.URL.RawQuery = q.Encode()
 		}
-		if su, err := url.Parse(d.config().Server); err == nil && su.Host != "" {
-			r.Host = su.Host
-			if su.Scheme == "https" {
-				r.Header.Set("X-Forwarded-Proto", "https")
-			}
+	}
+	// Always present the server's own Host upstream. The server derives URLs
+	// from the request Host in places (OIDC redirect_uri at login AND the
+	// callback auto-pinned when an admin saves SSO settings); leaking the
+	// local client origin there produces loopback callbacks Keycloak rejects.
+	if su, err := url.Parse(d.config().Server); err == nil && su.Host != "" {
+		r.Host = su.Host
+		if su.Scheme == "https" {
+			r.Header.Set("X-Forwarded-Proto", "https")
 		}
 	}
 	proxy.ServeHTTP(w, r)

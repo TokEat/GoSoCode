@@ -570,6 +570,13 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "启用统一认证前需填写 Issuer 地址、Client ID 和 Client Secret"})
 		return
 	}
+	// Pin the callback when enabling: capture the origin the admin is using
+	// right now (a working server address) so every later flow — including
+	// CLI-client-proxied SSO, whose proxied Host rarely matches the provider
+	// whitelist — sends this exact, single whitelisted redirect_uri.
+	if sc.OIDCEnabled && sc.OIDCRedirectURL == "" {
+		sc.OIDCRedirectURL = s.oidcRedirectURI(c, sc)
+	}
 	sc.ID = 1
 	sc.UpdatedAt = time.Now()
 	if err := s.db.Save(&sc).Error; err != nil {
