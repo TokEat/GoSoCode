@@ -642,8 +642,15 @@ func (c *Client) OpenDownload(ctx context.Context, token, dlink, rangeHeader str
 // ---- helpers -------------------------------------------------------------
 
 func (c *Client) postForm(ctx context.Context, u string, form url.Values, out any) error {
+	return c.postFormH(ctx, u, form, nil, out)
+}
+
+func (c *Client) postFormH(ctx context.Context, u string, form url.Values, headers map[string]string, out any) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err

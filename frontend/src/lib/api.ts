@@ -141,7 +141,9 @@ export const api = {
   shareImport: (p: {
     surl: string; sekey: string; share_id: string; uk: string;
     fs_ids: string[]; total_size: number; target_dir: string; encrypt: boolean;
-  }): Promise<{ job_id: string }> => json("/share/import", "POST", p),
+    rand_name: boolean;
+  }, pwd?: string): Promise<{ job_id: string }> =>
+    json(`/share/import${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ""}`, "POST", p),
 
   // transfers
   listJobs: (): Promise<JobItem[]> => json("/jobs", "GET").then((r) => r.jobs),

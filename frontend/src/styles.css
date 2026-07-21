@@ -234,15 +234,16 @@ tbody tr:hover { background: rgba(99, 102, 241, 0.05); }
 /* ---- forms ---- */
 .field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px; }
 .field label { font-size: 13px; color: var(--muted); font-weight: 500; }
-input, select {
+input, select, textarea {
   padding: 10.5px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-size: 14px; background: rgba(255, 255, 255, 0.65); color: var(--text);
   outline: none; width: 100%;
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
 }
-input:hover, select:hover { background: rgba(255, 255, 255, 0.85); }
-input:focus, select:focus {
+textarea { font-family: inherit; line-height: 1.55; resize: vertical; }
+input:hover, select:hover, textarea:hover { background: rgba(255, 255, 255, 0.85); }
+input:focus, select:focus, textarea:focus {
   border-color: rgba(99, 102, 241, 0.55); background: #fff;
   box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.13);
 }
@@ -398,6 +399,52 @@ tr.row-folder:hover { background: rgba(99, 102, 241, 0.06); }
 }
 .client-orbit::after { content: ""; position: absolute; inset: -5px; border: 1px solid rgba(99, 102, 241, .22); border-radius: 21px; transform: rotate(8deg); }
 .field-help { color: #94a3b8; font-size: 11.5px; line-height: 1.45; }
+
+/* ---- share import page ---- */
+.share-grid { display: grid; grid-template-columns: minmax(0, 1fr) 370px; gap: 18px; align-items: start; }
+@media (max-width: 1080px) { .share-grid { grid-template-columns: 1fr; } }
+.share-link-box textarea {
+  min-height: 108px; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px;
+}
+.share-file-list { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: rgba(255, 255, 255, 0.5); }
+.share-file-scroll { max-height: 380px; overflow-y: auto; }
+.share-file-row {
+  display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: pointer;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.6); font-size: 13.5px;
+}
+.share-file-row:last-child { border-bottom: 0; }
+.share-file-row:hover { background: rgba(99, 102, 241, 0.05); }
+.share-file-row input[type="checkbox"] { width: auto; }
+.share-list-head {
+  display: flex; align-items: center; justify-content: space-between; padding: 8px 14px;
+  background: rgba(248, 250, 252, 0.72); border-bottom: 1px solid var(--border);
+  font-size: 12.5px; color: var(--muted);
+}
+.share-pathbar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 11px;
+  border: 1px solid var(--border); border-radius: 10px; background: rgba(248, 250, 252, 0.62);
+  font-size: 12.5px;
+}
+.share-pathbar code {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: "Cascadia Mono", Consolas, monospace; color: var(--text);
+}
+.share-dir-list { border: 1px solid var(--border); border-radius: 10px; overflow-y: auto; max-height: 200px; background: rgba(255, 255, 255, 0.5); }
+.share-dir-row {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.55);
+}
+.share-dir-row:hover { background: rgba(99, 102, 241, 0.06); }
+.share-dir-row:last-child { border-bottom: 0; }
+.share-opt {
+  display: flex; gap: 10px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 12px;
+  cursor: pointer; align-items: flex-start; background: rgba(255, 255, 255, 0.45);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.share-opt:hover { border-color: rgba(99, 102, 241, 0.35); background: rgba(255, 255, 255, 0.8); }
+.share-opt input[type="checkbox"] { width: auto; margin-top: 2px; }
+.share-opt b { font-size: 13px; font-weight: 600; display: block; margin-bottom: 2px; }
+.share-opt small { color: #94a3b8; font-size: 11.5px; line-height: 1.45; display: block; }
 .client-config-error { padding: 11px 13px; margin: -2px 0 16px; border-radius: 11px; background: rgba(220, 38, 38, .07); color: #b91c1c; font-size: 12.5px; }
 .client-setting-actions { display: flex; justify-content: flex-end; align-items: center; gap: 16px; margin-top: 23px; }
 .client-download-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }

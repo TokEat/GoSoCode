@@ -83,17 +83,29 @@ func relLogical(logical string) string {
 
 // Build renders the manifest JSON for one node from the local File table.
 // Only "ready" entries are included: an in-flight upload must never be
-// importable as a complete file on another deployment.
+// importable as a complete file on another deployment. Entries that carry no
+// mapping information are left out entirely: system rows (/__system), and
+// plain passthrough files (no UUID, not encrypted, remote path identical to
+// the logical path) — reconcile re-derives those from the netdisk itself, so
+// recording them would only bloat the manifest.
 func Build(db *gorm.DB, acc *models.BaiduAccount) ([]byte, error) {
 	var rows []models.File
 	if err := db.Where("baidu_account_id = ? AND status = ?", acc.ID, "ready").
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
+	mroot := mountRoot(acc)
 	doc := Doc{Version: 1, GeneratedAt: time.Now()}
 	for _, f := range rows {
+		if strings.HasPrefix(f.LogicalPath, "/__system/") {
+			continue
+		}
 		rel := relLogical(f.LogicalPath)
 		if rel == "" {
+			continue
+		}
+		remoteRel := strings.TrimPrefix(strings.TrimPrefix(f.RemotePath, mroot), "/")
+		if f.RemoteUUID == "" && !f.Encrypted && remoteRel == rel {
 			continue
 		}
 		doc.Entries = append(doc.Entries, Entry{

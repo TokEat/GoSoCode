@@ -132,10 +132,17 @@ func (s *Syncer) DailyReconcile(ctx context.Context, accID uint) (DailyReconcile
 		}
 	}
 
-	// 3. Import / update every remote item. Netdisk wins.
+	// 3. Import / update every remote item. Netdisk wins. The share-import
+	// staging tree and the manifest file itself are system plumbing: they are
+	// marked seen (so their rows are not orphaned) but never imported.
+	stagingRoot := path.Join(mountRoot(acc), models.ImportsDirName)
+	manifestPath := RemotePath(acc)
 	seenRemote := map[string]bool{}
 	for _, it := range items {
 		seenRemote[it.Path] = true
+		if it.Path == stagingRoot || strings.HasPrefix(it.Path, stagingRoot+"/") || it.Path == manifestPath {
+			continue
+		}
 		imp := s.reconcileItem(acc, it, entryByRemote)
 		st.Imported += imp.Imported
 		st.Updated += imp.Updated
@@ -147,7 +154,8 @@ func (s *Syncer) DailyReconcile(ctx context.Context, accID uint) (DailyReconcile
 	// we were listing the cloud tree is not in the snapshot but is not an
 	// orphan either.
 	var orphans []models.File
-	s.db.Where("baidu_account_id = ? AND status = ? AND updated_at < ?", accID, "ready", start).Find(&orphans)
+	s.db.Where("baidu_account_id = ? AND status = ? AND updated_at < ? AND logical_path NOT LIKE ?",
+		accID, "ready", start, "/__system/%").Find(&orphans)
 	now := time.Now()
 	for _, f := range orphans {
 		if !seenRemote[f.RemotePath] {

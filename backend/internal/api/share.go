@@ -116,6 +116,7 @@ func (s *Server) handleShareImport(c *gin.Context) {
 		TotalSize int64    `json:"total_size"`
 		TargetDir string   `json:"target_dir"`
 		Encrypt   bool     `json:"encrypt"`
+		RandName  bool     `json:"rand_name"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -133,7 +134,7 @@ func (s *Server) handleShareImport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请先解析分享链接并选择要转存的文件"})
 		return
 	}
-	acc, _, clean, err := s.resolveMount(in.TargetDir)
+	acc, remote, clean, err := s.resolveMount(in.TargetDir)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -141,6 +142,7 @@ func (s *Server) handleShareImport(c *gin.Context) {
 	if s.accessDenied(c, clean) {
 		return
 	}
+	destRemote := s.resolveRemote(acc, clean, remote)
 	if in.TotalSize < 0 {
 		in.TotalSize = 0
 	}
@@ -156,8 +158,8 @@ func (s *Server) handleShareImport(c *gin.Context) {
 	jobID, err := s.jobs.SubmitShareImport(job.ShareImportSpec{
 		UserID: uidOf(c), AccountID: reserved.ID,
 		SURL: in.SURL, SeKey: in.SeKey, ShareID: shareID, UK: uk,
-		FsIDs: fsids, Target: clean, MountRoot: nodeMountPath(*reserved),
-		Encrypt: in.Encrypt,
+		FsIDs: fsids, Target: clean, TargetRemote: destRemote, MountRoot: nodeMountPath(*reserved),
+		Encrypt: in.Encrypt, RandName: in.RandName,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

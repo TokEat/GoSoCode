@@ -11,17 +11,17 @@ const LABEL: Record<TransferStatus, string> = {
   canceled: "已取消",
 };
 
-// Docked at the bottom of the main area so transfer progress stays visible
-// while browsing other pages (e.g. checking Files for a finished upload).
-// Renders nothing until the current user has transfer tasks; collapsible to a
-// one-line summary strip.
+// Docked at the bottom of the Files page only. Shows unfinished tasks
+// (running/paused/finalizing) plus failures so they get noticed; done and
+// canceled rows are dropped — full history lives in the Transfers page.
 export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?: boolean; onViewAll: () => void }) {
   const { transfers } = useTransfers();
   const [open, setOpen] = useState(true);
 
-  if (hidden || transfers.length === 0) return null;
+  const shown = transfers.filter((t) => t.status !== "done" && t.status !== "canceled");
+  if (hidden || shown.length === 0) return null;
 
-  const active = transfers.filter((t) => t.status === "running" || t.status === "paused" || t.status === "finalizing");
+  const active = shown.filter((t) => t.status === "running" || t.status === "paused" || t.status === "finalizing");
   const speed = active.reduce((s, t) => s + (t.status === "running" ? t.speed : 0), 0);
   const summary = active.length > 0 ? `${active.length} 个进行中` : "已全部结束";
 
@@ -29,7 +29,7 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
     <div className="transfer-drawer">
       <div className="transfer-drawer-head" onClick={() => setOpen(!open)}>
         <span className="transfer-drawer-title">
-          ⇅ 传输任务 ({transfers.length}) · {summary}{speed > 0 ? ` · ${humanRate(speed)}` : ""}
+          ⇅ 传输任务 ({shown.length}) · {summary}{speed > 0 ? ` · ${humanRate(speed)}` : ""}
         </span>
         <span className="row" style={{ gap: 8 }}>
           <button className="btn ghost sm" onClick={(e) => { e.stopPropagation(); onViewAll(); }}>查看全部</button>
@@ -38,7 +38,7 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
       </div>
       {open && (
         <div className="transfer-drawer-body">
-          {transfers.map((t) => {
+          {shown.map((t) => {
             const pct = t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
             const color = t.status === "error" ? "#dc2626" : t.status === "done" ? "#16a34a" : t.status === "paused" ? "#d97706" : "#6366f1";
             // streaming uploads carry a second progress: bytes confirmed at the cloud

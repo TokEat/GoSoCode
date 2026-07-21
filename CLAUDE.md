@@ -29,7 +29,7 @@ Backend packages (`backend/internal/`):
 - **models** — GORM models; auto-migrated in `store.Open`. `File` is the *authoritative* metadata for the shared filesystem (listing never queries Baidu). `File.LogicalPath` is the user-facing path; `RemotePath` is the real path in the Baidu app sandbox (`/apps/<AppName>/shared/...`, traversal-safe via `Server.toRemote`).
 - **account** (`Pool`) — storage-node selection + token lifecycle. `PickForSize` does capacity-aware placement **and takes a load slot** that must be paired with `Release` (worker defer, stream finish/cancel, janitor). `Token` refreshes OAuth tokens via singleflight. `RefreshQuota` also refreshes `VipType`.
 - **coord** — `Locker` (distributed mutex, e.g. `"path:"+remotePath` around Baidu `create`) and `Limiter` (per-account QPS, key `"acct:"+id`). Memory or Redis backed. **Every Baidu API call must `Limiter.Wait` first.**
-- **baidu** — Baidu OpenAPI client. Upload is always precreate → superfile2 (per-slice, idempotent by partseq) → create. Slice size is per-account-tier: `SliceSizeForVip` (normal 4MB / VIP 16MB / SVIP 32MB). Download: filemetas → dlink (temporary, needs `User-Agent: pan.baidu.com`).
+- **baidu** — Baidu OpenAPI client. Upload is always precreate → superfile2 (per-slice, idempotent by partseq) → create. Slice size is per-account-tier: `SliceSizeForVip` (normal 4MB / VIP 16MB / SVIP 32MB). Download: filemetas → dlink (temporary, needs `User-Agent: pan.baidu.com`). Share (转存) API quirks (`share.go`): `verify`/`transfer` require `Referer: https://pan.baidu.com/` or Baidu answers errno=2; `verify`'s randsk arrives percent-encoded (decode before reuse); `list` returns numeric fields (`fs_id`/`size`/`isdir`/`shareid`) as quoted strings — `ShareItem` has a tolerant `UnmarshalJSON`.
 - **job** (`Manager`) — worker pool for the *store-and-forward* upload path; also runs the janitor that reaps stale `UploadSession`s and `StreamSession`s (releasing their load slots).
 - **api** — gin handlers; `server.go` wires all routes. JWT auth middleware puts `uid`/`role` in context. Admin-only routes under `/api/admin`.
 - **realtime** (WS hub, per-user job events) and **metrics** (live traffic meter).
@@ -47,12 +47,19 @@ Design doc: `docs/streaming-upload-sync.md`.
 
 Downloads (`api/files.go handleDownload`) proxy bytes cloud→server→client with a small buffer + Flush per write (no server buffering, backpressure end to end), forward `Range`, and re-resolve an expired dlink once.
 
+### Share-link import (转存)
+
+`api/share.go` + `job/share.go`: `/api/share/resolve` parses a pasted share link/text (`baidu.ParseShareURL`), verifies the extraction code and lists the share root (fs_id/share_id/uk shipped as strings — they can exceed JS `Number.MAX_SAFE_INTEGER`). `/api/share/import` submits an async job: Baidu-side copy into a per-job staging dir (`<mount>/.gsc-imports/<jobID>`), then everything is **moved out** to the target directory's real remote dir (collision → job-suffixed name) and the staging dir is deleted — `.gsc-imports` is transient plumbing, never long-term storage. Each successful job also sweeps stale staging dirs no live `File` row references. Files are registered as `File` rows at their final remote paths. Options: `encrypt` (download → AES-256 → re-upload in place) and `rand_name` (the *remote* file is renamed in place to a bare UUID like UUID storage; `LogicalPath` keeps the original name, `RemoteUUID` is set so the mapping lands in the cloud manifest). Importing into a 私密 directory goes through `accessDenied` — the frontend passes the access password as the `pwd` query param and prompts on 403. Progress is pushed over the jobs WS feed. Gated by admin toggle `ShareImportEnabled`.
+
 ### Frontend
 
 `frontend/src/transfer.tsx` is the transfer engine (React context): `driveStreamUpload` (plan → md5 pre-scan → windowed XHR slices with dual progress: browser-upload speed from `xhr.upload.onprogress`, cloud-sync speed from confirmed slices) with automatic fallback to the legacy chunked path; ranged, resumable downloads. `pages/Transfers.tsx` renders dual progress bars. API types in `lib/api.ts`.
+
+Routing is hash-based (`App.tsx`, `#/files`, `#/share?dir=…`). `pages/ShareImport.tsx` is the standalone 转存 page (two-column: link resolve + file picker on the left; node select, directory browser, rand-name/encrypt options on the right); the Files page's 分享转存 button navigates there with the current directory pre-filled. `TransferDrawer.tsx` (bottom dock) renders only on the Files page and only unfinished/failed tasks — done/canceled rows are dropped (full history is the Transfers page). The frontend build must be synced into `backend/internal/webui/static/` (the embedded UI served by server/client binaries).
 
 ### Invariants worth knowing
 
 - Accounting on success: `pool.AddUsed`, `meter.AddUp/AddDown`, `bytes_up/bytes_down` on User and BaiduAccount, `TransferLog` row. Both upload paths do all of these — keep them in sync.
 - Deletes are soft (`File.Status = "deleted"`); remote Baidu deletes are best-effort, metadata is authoritative.
 - Folder/move/rename operations are metadata-only rewrites of `LogicalPath`.
+- The cloud manifest (`manifest.Build`) only records entries that carry mapping information: UUID-named, encrypted, or remote-path ≠ logical-path rows. Plain passthrough files and `/__system` rows are excluded — reconcile re-derives them from the netdisk. Reconcile itself never imports `.gsc-imports` content or the manifest file.

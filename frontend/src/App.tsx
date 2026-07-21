@@ -5,6 +5,7 @@ import { TransferProvider, useTransfers } from "./transfer";
 import Login from "./pages/Login";
 import Overview from "./pages/Overview";
 import Files from "./pages/Files";
+import ShareImport from "./pages/ShareImport";
 import Transfers from "./pages/Transfers";
 import Profile from "./pages/Profile";
 import Users from "./pages/Users";
@@ -20,21 +21,22 @@ export interface JobEvent {
 }
 
 type Page =
-  | "overview" | "files" | "transfers" | "profile"
+  | "overview" | "files" | "share" | "transfers" | "profile"
   | "users" | "nodes" | "traffic" | "logs" | "settings" | "client";
 
-const PAGES: Page[] = ["overview", "files", "transfers", "profile", "users", "nodes", "traffic", "logs", "settings", "client"];
+const PAGES: Page[] = ["overview", "files", "share", "transfers", "profile", "users", "nodes", "traffic", "logs", "settings", "client"];
 
 // Hash-based routing (#/files, #/transfers, …) so a refresh or a shared link
 // lands on the same page instead of resetting to the overview.
 function pageFromHash(): Page {
-  const h = window.location.hash.replace(/^#\/?/, "");
+  const h = window.location.hash.replace(/^#\/?/, "").split("?")[0];
   return PAGES.includes(h as Page) ? (h as Page) : "overview";
 }
 
 const USER_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "overview", label: "概览", ico: "▦" },
   { key: "files", label: "文件管理", ico: "🗂" },
+  { key: "share", label: "分享转存", ico: "🔗" },
   { key: "transfers", label: "传输管理", ico: "⇅" },
   { key: "profile", label: "个人资料", ico: "👤" },
 ];
@@ -202,6 +204,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
           <div style={{ display: page === "files" ? undefined : "none" }}>
             <Files jobs={jobs} />
           </div>
+          {page === "share" && <ShareImport />}
           {page === "transfers" && <Transfers />}
           {page === "profile" && <Profile />}
           {page === "users" && isAdmin && <Users />}
@@ -219,7 +222,7 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
             />
           )}
         </section>
-        <TransferDrawer hidden={page === "transfers"} onViewAll={() => setPage("transfers")} />
+        <TransferDrawer hidden={page !== "files"} onViewAll={() => setPage("transfers")} />
       </main>
     </div>
   );

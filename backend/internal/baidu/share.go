@@ -16,6 +16,10 @@ import (
 // list shared files, transfer (转存) into the caller's own netdisk.
 const apiShare = "https://pan.baidu.com/rest/2.0/xpan/share"
 
+// shareHeaders are required by the share write endpoints (verify/transfer):
+// without a pan.baidu.com Referer Baidu answers errno=2 (参数错误).
+var shareHeaders = map[string]string{"Referer": "https://pan.baidu.com/"}
+
 // transferBatch caps fsidlist entries per transfer call.
 const transferBatch = 100
 
@@ -85,22 +89,54 @@ func (c *Client) ShareVerify(ctx context.Context, token, surl, pwd string) (stri
 		baseErr
 		Randsk string `json:"randsk"`
 	}
-	if err := c.postForm(ctx, u, form, &out); err != nil {
+	if err := c.postFormH(ctx, u, form, shareHeaders, &out); err != nil {
 		return "", err
 	}
 	if err := out.err(); err != nil {
 		return "", err
 	}
+	// randsk arrives percent-encoded inside the JSON; decode it so callers can
+	// pass it through normal form/query encoding without double-escaping.
+	if v, err := url.QueryUnescape(out.Randsk); err == nil {
+		return v, nil
+	}
 	return out.Randsk, nil
 }
 
 type ShareItem struct {
-	FsID           uint64 `json:"fs_id"`
-	Path           string `json:"path"`
-	ServerFilename string `json:"server_filename"`
-	Size           int64  `json:"size"`
-	IsDir          int    `json:"isdir"`
-	MD5            string `json:"md5"`
+	FsID           uint64
+	Path           string
+	ServerFilename string
+	Size           int64
+	IsDir          int
+	MD5            string
+}
+
+// UnmarshalJSON tolerates the share API returning numeric fields either as
+// numbers or as quoted strings ("fs_id":"129660991388659").
+func (it *ShareItem) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		FsID           json.Number `json:"fs_id"`
+		Path           string      `json:"path"`
+		ServerFilename string      `json:"server_filename"`
+		Size           json.Number `json:"size"`
+		IsDir          json.Number `json:"isdir"`
+		MD5            string      `json:"md5"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	it.Path, it.ServerFilename, it.MD5 = raw.Path, raw.ServerFilename, raw.MD5
+	if v, err := raw.FsID.Int64(); err == nil {
+		it.FsID = uint64(v)
+	}
+	if v, err := raw.Size.Int64(); err == nil {
+		it.Size = v
+	}
+	if v, err := raw.IsDir.Int64(); err == nil {
+		it.IsDir = int(v)
+	}
+	return nil
 }
 
 type ShareListResult struct {
@@ -111,9 +147,10 @@ type ShareListResult struct {
 
 type shareListResp struct {
 	baseErr
-	// field name differs across doc versions; accept both spellings
-	ShareID  uint64      `json:"share_id"`
-	ShareID2 uint64      `json:"shareid"`
+	// field name differs across doc versions; accept both spellings, and both
+	// numeric and quoted values.
+	ShareID  json.Number `json:"share_id"`
+	ShareID2 json.Number `json:"shareid"`
 	UK       json.Number `json:"uk"`
 	List     []ShareItem `json:"list"`
 }
@@ -147,10 +184,10 @@ func (c *Client) ShareList(ctx context.Context, token, surl, sekey, dir string) 
 		if err := out.err(); err != nil {
 			return nil, err
 		}
-		if out.ShareID != 0 {
-			res.ShareID = out.ShareID
-		} else if out.ShareID2 != 0 {
-			res.ShareID = out.ShareID2
+		if v, err := out.ShareID.Int64(); err == nil && v != 0 {
+			res.ShareID = uint64(v)
+		} else if v, err := out.ShareID2.Int64(); err == nil && v != 0 {
+			res.ShareID = uint64(v)
 		}
 		if uk, err := out.UK.Int64(); err == nil && uk != 0 {
 			res.UK = uint64(uk)
@@ -205,7 +242,7 @@ func (c *Client) shareTransferBatch(ctx context.Context, token string, shareID, 
 			} `json:"list"`
 		} `json:"extra"`
 	}
-	if err := c.postForm(ctx, u, form, &out); err != nil {
+	if err := c.postFormH(ctx, u, form, shareHeaders, &out); err != nil {
 		return err
 	}
 	if err := out.err(); err != nil {
@@ -221,6 +258,9 @@ func (c *Client) shareTransferBatch(ctx context.Context, token string, shareID, 
 
 func (c *Client) getJSON(ctx context.Context, u string, out any) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	for k, v := range shareHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
