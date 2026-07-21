@@ -73,7 +73,7 @@ export default function Transfers() {
             const syncPct = isStream && t.total > 0 ? Math.min(100, Math.round(((t.synced || 0) / t.total) * 100)) : 0;
             return (
               <tr key={t.id}>
-                <td><Badge kind={t.kind === "upload" ? "blue" : "green"}>{t.kind === "upload" ? "上传" : "下载"}</Badge></td>
+                <td><Badge kind={t.kind === "upload" ? "blue" : t.kind === "import" ? "amber" : "green"}>{t.kind === "upload" ? "上传" : t.kind === "import" ? "转存" : "下载"}</Badge></td>
                 <td title={t.path} style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</td>
                 <td>
                   <div className="bar"><span style={{ width: `${pct}%`, background: barColor }} /></div>
@@ -111,9 +111,9 @@ export default function Transfers() {
                 </td>
                 <td>
                   <div className="row">
-                    {!clientMode && t.status === "running" && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
+                    {!clientMode && t.kind !== "import" && t.status === "running" && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
                     {!clientMode && t.status === "paused" && <button className="btn ghost sm" onClick={() => resume(t.id)}>恢复</button>}
-                    {(t.status === "running" || t.status === "paused" || t.status === "finalizing") &&
+                    {t.kind !== "import" && (t.status === "running" || t.status === "paused" || t.status === "finalizing") &&
                       <button className="btn danger sm" onClick={() => cancel(t.id)}>取消</button>}
                     {(t.status === "done" || t.status === "error" || t.status === "canceled") &&
                       <button className="btn ghost sm" onClick={() => remove(t.id)}>清除</button>}
@@ -143,7 +143,7 @@ export default function Transfers() {
         <tbody>
           {history.map((h) => (
             <tr key={h.ID}>
-              <td><Badge kind={h.Kind === "upload" ? "blue" : "green"}>{h.Kind === "upload" ? "上传" : "下载"}</Badge></td>
+              <td><Badge kind={h.Kind === "upload" ? "blue" : h.Kind === "import" ? "amber" : "green"}>{h.Kind === "upload" ? "上传" : h.Kind === "import" ? "转存" : "下载"}</Badge></td>
               <td>{h.Name}</td>
               <td className="muted" title={h.Path}>{h.Path}</td>
               <td className="muted">{humanSize(h.Size)}</td>

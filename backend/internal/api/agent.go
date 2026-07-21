@@ -26,6 +26,7 @@ import (
 	"gorm.io/gorm"
 
 	"gosocode/internal/baidu"
+	"gosocode/internal/manifest"
 	"gosocode/internal/models"
 )
 
@@ -179,9 +180,14 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 			return
 		}
+		if path.Base(clean) == manifest.FileName {
+			c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可访问"})
+			return
+		}
 		if s.accessDenied(c, clean) {
 			return
 		}
+		remotePath = s.resolveRemote(acc, clean, remotePath)
 		var token string
 		token, err = s.pool.Token(ctx, acc)
 		if err != nil {
@@ -255,6 +261,9 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		return
 	}
 	name := metas[0].Filename
+	if encFile != nil && encFile.RemoteUUID != "" { // cloud-side name is an opaque uuid
+		name = path.Base(encFile.LogicalPath)
+	}
 	if name == "" {
 		name = fallbackName
 	}

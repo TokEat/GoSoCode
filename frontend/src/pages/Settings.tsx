@@ -57,6 +57,46 @@ export default function Settings() {
         </div>
       </Card>
 
+      <Card title="UUID 混淆存储">
+        <div className="field">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={cfg.uuid_storage}
+              disabled={saving}
+              onChange={(e) => save({ uuid_storage: e.target.checked })}
+              style={{ width: "auto" }}
+            />
+            启用 UUID 混淆存储
+          </label>
+          <small className="field-help">
+            开启后，新上传的文件与新建的目录在百度网盘侧以随机 UUID 命名，系统内仍显示真实名称；
+            每个节点的挂载根目录会维护一份元数据清单（.gsc-manifest.json，系统中不可见），
+            其他服务器部署可在「存储节点」页通过「同步元数据」从网盘恢复目录结构与加密信息。
+            已上传的历史文件不受开关影响。
+          </small>
+        </div>
+      </Card>
+
+      <Card title="分享转存">
+        <div className="field">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={cfg.share_import_enabled}
+              disabled={saving}
+              onChange={(e) => save({ share_import_enabled: e.target.checked })}
+              style={{ width: "auto" }}
+            />
+            允许导入外部分享链接
+          </label>
+          <small className="field-help">
+            开启后，用户可在「文件」页把别人分享的百度网盘链接转存进系统。默认在百度侧直接复制（不消耗服务器带宽）；
+            勾选「加密存储」的导入会经由服务器下载并加密后重新上传，消耗服务器上下行带宽。
+          </small>
+        </div>
+      </Card>
+
       <Card title="统一认证 (Keycloak / OIDC)">
         <div className="field">
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>

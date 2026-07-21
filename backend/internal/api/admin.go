@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"path"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
+	"gosocode/internal/manifest"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 )
@@ -209,7 +211,13 @@ func (s *Server) handleDeleteUser(c *gin.Context) {
 		return
 	}
 	s.db.Delete(&models.User{}, id)
+	var accIDs []uint
+	s.db.Model(&models.File{}).Where("owner_user_id = ? AND status <> ?", id, "deleted").
+		Distinct().Pluck("baidu_account_id", &accIDs)
 	s.db.Model(&models.File{}).Where("owner_user_id = ?", id).Update("status", "deleted")
+	for _, a := range accIDs {
+		s.msync.Mark(a)
+	}
 	s.audit(c, uidOf(c), usernameOf(c), "user.delete", "id="+c.Param("id"))
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -291,6 +299,7 @@ func (s *Server) handleUpdateNode(c *gin.Context) {
 			return
 		}
 	}
+	mountPathChanged := mountPath != nodeMountPath(acc)
 	acc.MountName = in.MountName
 	acc.Remark = in.Remark
 	acc.MountPath = mountPath
@@ -298,6 +307,10 @@ func (s *Server) handleUpdateNode(c *gin.Context) {
 	if err := s.db.Save(&acc).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	if mountPathChanged {
+		// the manifest lives at the mount root: write one at the new root
+		s.msync.Mark(acc.ID)
 	}
 	s.audit(c, uidOf(c), usernameOf(c), "node.update", "id="+c.Param("id")+" mount="+mountName(acc)+" path="+mountPath)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -389,6 +402,30 @@ func (s *Server) handleRefreshNode(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// handleSyncNodeManifest imports the node's on-netdisk metadata manifest into
+// the local File table (cross-deployment migration/sync).
+func (s *Server) handleSyncNodeManifest(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	acc, err := s.pool.Get(c.Request.Context(), uint(id))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "挂载节点不存在"})
+		return
+	}
+	doc, err := s.msync.Fetch(c.Request.Context(), acc)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	stats, err := manifest.Import(s.db, acc, mountName(*acc), doc)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	s.audit(c, uidOf(c), usernameOf(c), "node.manifest_sync",
+		fmt.Sprintf("id=%d imported=%d updated=%d skipped=%d", id, stats.Imported, stats.Updated, stats.Skipped))
+	c.JSON(http.StatusOK, gin.H{"ok": true, "imported": stats.Imported, "updated": stats.Updated, "skipped": stats.Skipped})
 }
 
 func (s *Server) handleDeleteNode(c *gin.Context) {
@@ -514,7 +551,8 @@ func (s *Server) handleListLogs(c *gin.Context) {
 
 func renderSystemConfig(sc models.SystemConfig) gin.H {
 	return gin.H{
-		"encrypt_storage": sc.EncryptStorage, "log_max_entries": sc.LogMaxEntries,
+		"encrypt_storage": sc.EncryptStorage, "uuid_storage": sc.UUIDStorage, "log_max_entries": sc.LogMaxEntries,
+		"share_import_enabled": sc.ShareImportEnabled,
 		"oidc_enabled": sc.OIDCEnabled, "oidc_issuer": sc.OIDCIssuer,
 		"oidc_client_id": sc.OIDCClientID, "oidc_redirect_url": sc.OIDCRedirectURL,
 		"oidc_has_secret": sc.OIDCClientSecret != "",
@@ -527,8 +565,10 @@ func (s *Server) handleGetSystemConfig(c *gin.Context) {
 
 func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 	var in struct {
-		EncryptStorage   *bool   `json:"encrypt_storage"`
-		LogMaxEntries    *int    `json:"log_max_entries"`
+		EncryptStorage     *bool   `json:"encrypt_storage"`
+		UUIDStorage        *bool   `json:"uuid_storage"`
+		LogMaxEntries      *int    `json:"log_max_entries"`
+		ShareImportEnabled *bool   `json:"share_import_enabled"`
 		OIDCEnabled      *bool   `json:"oidc_enabled"`
 		OIDCIssuer       *string `json:"oidc_issuer"`
 		OIDCClientID     *string `json:"oidc_client_id"`
@@ -542,6 +582,12 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 	sc := s.systemConfig()
 	if in.EncryptStorage != nil {
 		sc.EncryptStorage = *in.EncryptStorage
+	}
+	if in.UUIDStorage != nil {
+		sc.UUIDStorage = *in.UUIDStorage
+	}
+	if in.ShareImportEnabled != nil {
+		sc.ShareImportEnabled = *in.ShareImportEnabled
 	}
 	if in.LogMaxEntries != nil {
 		if *in.LogMaxEntries < 50 || *in.LogMaxEntries > 100000 {
@@ -584,7 +630,9 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		return
 	}
 	s.audit(c, uidOf(c), usernameOf(c), "system.config",
-		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" log_max_entries="+strconv.Itoa(sc.LogMaxEntries)+
+		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" uuid_storage="+strconv.FormatBool(sc.UUIDStorage)+
+			" log_max_entries="+strconv.Itoa(sc.LogMaxEntries)+
+			" share_import_enabled="+strconv.FormatBool(sc.ShareImportEnabled)+
 			" oidc_enabled="+strconv.FormatBool(sc.OIDCEnabled))
 	c.JSON(http.StatusOK, renderSystemConfig(sc))
 }

@@ -120,6 +120,9 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
       if (e.status === "done" || e.status === "failed") {
         resolvedJobs.current.add(e.job_id);
         resolveJob(e.job_id, e.status, e.error);
+      } else {
+        // running: feeds progress of server-side jobs (e.g. 分享转存)
+        resolveJob(e.job_id, e.status, e.error, e.progress);
       }
     });
 

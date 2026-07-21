@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"gosocode/internal/crypto"
+	"gosocode/internal/manifest"
 	"gosocode/internal/models"
 )
 
@@ -132,16 +134,118 @@ func (s *Server) resolveMount(logical string) (*models.BaiduAccount, string, str
 	return nil, "", p, fmt.Errorf("挂载节点不存在")
 }
 
-func (s *Server) resolveUploadTarget(ctx *gin.Context, logical string, size int64) (*models.BaiduAccount, string, string, func(), error) {
+// resolveRemote maps a logical path to its real remote path, honoring UUID
+// mappings recorded in the File table: exact row first, then the deepest
+// mapped directory ancestor with the remainder appended plainly. plainRemote
+// (the resolveMount concatenation) is the fallback for fully unmapped paths,
+// so legacy plain trees and mixed trees keep working.
+func (s *Server) resolveRemote(acc *models.BaiduAccount, logical, plainRemote string) string {
+	logical = cleanLogical(logical)
+	var f models.File
+	if err := s.db.Where("baidu_account_id = ? AND logical_path = ? AND status <> ?", acc.ID, logical, "deleted").
+		Order("id desc").First(&f).Error; err == nil && f.RemotePath != "" {
+		return f.RemotePath
+	}
+	ancestors := []string{}
+	for p := path.Dir(logical); strings.Count(p, "/") >= 2; p = path.Dir(p) {
+		ancestors = append(ancestors, p)
+	}
+	if len(ancestors) == 0 {
+		return plainRemote
+	}
+	var dirs []models.File
+	s.db.Where("baidu_account_id = ? AND is_dir = ? AND status <> ? AND logical_path IN ?",
+		acc.ID, true, "deleted", ancestors).Find(&dirs)
+	var best *models.File
+	for i := range dirs {
+		if dirs[i].RemotePath != "" && (best == nil || len(dirs[i].LogicalPath) > len(best.LogicalPath)) {
+			best = &dirs[i]
+		}
+	}
+	if best == nil {
+		return plainRemote
+	}
+	return path.Join(best.RemotePath, strings.TrimPrefix(logical, best.LogicalPath))
+}
+
+// ensureUUIDDirs walks the logical directory chain below the mount root and
+// get-or-creates a UUID directory mapping per missing level, returning the
+// remote path of the deepest directory. Directories that already hold plain
+// (non-UUID) platform children stay plain so their legacy content remains
+// visible next to new uploads.
+func (s *Server) ensureUUIDDirs(c *gin.Context, acc *models.BaiduAccount, logicalDir string) (string, error) {
+	logicalDir = cleanLogical(logicalDir)
+	if strings.Count(logicalDir, "/") < 2 { // the mount root itself
+		return nodeMountPath(*acc), nil
+	}
+	parent, err := s.ensureUUIDDirs(c, acc, path.Dir(logicalDir))
+	if err != nil {
+		return "", err
+	}
+	ctx := c.Request.Context()
+	unlock, err := s.coord.Locker.Lock(ctx, "dirmap:"+itoa(acc.ID)+":"+logicalDir, 30*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	var d models.File
+	if err := s.db.Where("baidu_account_id = ? AND logical_path = ? AND is_dir = ? AND status <> ?",
+		acc.ID, logicalDir, true, "deleted").Order("id desc").First(&d).Error; err == nil && d.RemotePath != "" {
+		return d.RemotePath, nil
+	}
+	var plainKids int64
+	s.db.Model(&models.File{}).
+		Where("baidu_account_id = ? AND status <> ? AND remote_uuid = ? AND logical_path LIKE ?",
+			acc.ID, "deleted", "", logicalDir+"/%").Count(&plainKids)
+	if plainKids > 0 {
+		return path.Join(parent, path.Base(logicalDir)), nil
+	}
+	id := uuid.NewString()
+	now := time.Now()
+	d = models.File{
+		OwnerUserID: uidOf(c), BaiduAccountID: acc.ID,
+		LogicalPath: logicalDir, RemotePath: path.Join(parent, id), RemoteUUID: id,
+		IsDir: true, Status: "ready", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.db.Create(&d).Error; err != nil {
+		return "", err
+	}
+	// New directory mapping exists now (even before any file finishes): put it
+	// in the cloud manifest right away.
+	s.msync.Mark(acc.ID)
+	return d.RemotePath, nil
+}
+
+func (s *Server) resolveUploadTarget(ctx *gin.Context, logical string, size int64) (*models.BaiduAccount, string, string, string, func(), error) {
 	acc, remote, clean, err := s.resolveMount(logical)
 	if err != nil {
-		return nil, "", clean, nil, err
+		return nil, "", "", clean, nil, err
+	}
+	remoteUUID := ""
+	if s.systemConfig().UUIDStorage {
+		// Overwrite of an existing UUID file keeps its remote name (rtype=3
+		// replaces in place, no orphan blob).
+		var prev models.File
+		if err := s.db.Where("baidu_account_id = ? AND logical_path = ? AND is_dir = ? AND status <> ? AND remote_uuid <> ?",
+			acc.ID, clean, false, "deleted", "").Order("id desc").First(&prev).Error; err == nil {
+			remote, remoteUUID = prev.RemotePath, prev.RemoteUUID
+		} else {
+			parentRemote, derr := s.ensureUUIDDirs(ctx, acc, path.Dir(clean))
+			if derr != nil {
+				return nil, "", "", clean, nil, derr
+			}
+			remoteUUID = uuid.NewString()
+			remote = path.Join(parentRemote, remoteUUID)
+		}
+	} else {
+		// Toggle off: still respect UUID-mapped parents from earlier.
+		remote = s.resolveRemote(acc, clean, remote)
 	}
 	reserved, err := s.pool.PickByIDForSize(ctx.Request.Context(), acc.ID, size)
 	if err != nil {
-		return nil, "", clean, nil, err
+		return nil, "", "", clean, nil, err
 	}
-	return reserved, remote, clean, func() { s.pool.Release(reserved.ID) }, nil
+	return reserved, remote, remoteUUID, clean, func() { s.pool.Release(reserved.ID) }, nil
 }
 
 // handleListFiles lists the current logical directory. The logical root exposes
@@ -186,21 +290,92 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
+	remoteDir = s.resolveRemote(acc, logical, remoteDir)
 	items, err := s.client.ListDir(ctx, token, remoteDir)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
 	mount := strings.TrimSuffix(logical, "/")
-	// One query marks the direct children that carry their own password rule,
-	// so the UI can show lock badges without N lookups.
-	childPaths := make([]string, 0, len(items))
+
+	// Reverse-map UUID-named remote items to their logical names in one query.
+	remotePaths := make([]string, 0, len(items))
+	for _, it := range items {
+		remotePaths = append(remotePaths, it.Path)
+	}
+	rowByRemote := map[string]models.File{}
+	if len(remotePaths) > 0 {
+		var rows []models.File
+		s.db.Where("baidu_account_id = ? AND status <> ? AND remote_path IN ?", acc.ID, "deleted", remotePaths).
+			Order("id asc").Find(&rows)
+		for _, r := range rows {
+			rowByRemote[r.RemotePath] = r // newest row wins on duplicates
+		}
+	}
+
+	type listEntry struct {
+		id        uint64
+		childPath string
+		size      int64
+		isDir     bool
+		remote    string
+		created   time.Time
+		modified  time.Time
+		encrypted bool
+	}
+	entries := make([]listEntry, 0, len(items))
+	seenRemote := map[string]bool{}
+	seenChild := map[string]bool{}
 	for _, it := range items {
 		name := it.ServerFilename
 		if name == "" {
 			name = path.Base(it.Path)
 		}
-		childPaths = append(childPaths, mount+"/"+name)
+		if name == manifest.FileName { // system metadata file: never listed
+			continue
+		}
+		if name == models.ImportsDirName { // share-import staging dir: hidden
+			continue
+		}
+		childPath := mount + "/" + name
+		enc := false
+		if r, ok := rowByRemote[it.Path]; ok {
+			childPath = r.LogicalPath
+			enc = r.Encrypted
+		}
+		entries = append(entries, listEntry{
+			id: it.FsID, childPath: childPath, size: it.Size,
+			isDir: it.IsDir == 1, remote: it.Path,
+			created: unixTime(it.ServerCTime), modified: unixTime(it.ServerMTime),
+			encrypted: enc,
+		})
+		seenRemote[it.Path] = true
+		seenChild[childPath] = true
+	}
+
+	// Overlay platform entries whose bytes live outside this directory's
+	// resolved remote dir (mixed legacy/UUID trees), e.g. UUID children of a
+	// plain directory.
+	var extra []models.File
+	s.db.Where("baidu_account_id = ? AND status <> ? AND logical_path LIKE ? AND logical_path NOT LIKE ?",
+		acc.ID, "deleted", mount+"/%", mount+"/%/%").Order("id asc").Find(&extra)
+	for _, f := range extra {
+		if seenRemote[f.RemotePath] || seenChild[f.LogicalPath] {
+			continue
+		}
+		seenChild[f.LogicalPath] = true
+		entries = append(entries, listEntry{
+			id: uint64(f.ID), childPath: f.LogicalPath, size: f.Size,
+			isDir: f.IsDir, remote: f.RemotePath,
+			created: f.CreatedAt, modified: f.UpdatedAt, encrypted: f.Encrypted,
+		})
+	}
+
+	// One query marks the direct children that carry their own password rule,
+	// so the UI can show lock badges without N lookups.
+	childPaths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		childPaths = append(childPaths, e.childPath)
 	}
 	ruleByPath := map[string]models.AccessRule{}
 	if len(childPaths) > 0 {
@@ -224,29 +399,22 @@ func (s *Server) handleListFiles(c *gin.Context) {
 	}
 	uid := uidOf(c)
 
-	out := make([]gin.H, 0, len(items))
-	for _, it := range items {
-		name := it.ServerFilename
-		if name == "" {
-			name = path.Base(it.Path)
-		}
-		childPath := mount + "/" + name
-		mt := unixTime(it.ServerMTime)
-		ct := unixTime(it.ServerCTime)
+	out := make([]gin.H, 0, len(entries))
+	for _, e := range entries {
 		row := gin.H{
-			"id": it.FsID, "path": childPath, "size": it.Size,
-			"status": "ready", "created_at": ct, "modified": mt,
-			"is_dir": it.IsDir == 1, "owner": acc.Nickname,
-			"node_id": acc.ID, "remote_path": it.Path,
-			"download_url": fmt.Sprintf("/api/files/remote-download?path=%s", pathEscape(childPath)),
+			"id": e.id, "path": e.childPath, "size": e.size,
+			"status": "ready", "created_at": e.created, "modified": e.modified,
+			"is_dir": e.isDir, "owner": acc.Nickname,
+			"node_id": acc.ID, "remote_path": e.remote,
+			"download_url": fmt.Sprintf("/api/files/remote-download?path=%s", pathEscape(e.childPath)),
 		}
-		if r, ok := ruleByPath[childPath]; ok {
+		if r, ok := ruleByPath[e.childPath]; ok {
 			row["protected"] = true
 			// free (passwordless) access is owner-only; admins manage via role
 			row["protected_own"] = r.OwnerUserID == uid
 			row["protected_by"] = r.OwnerName
 		}
-		if encByPath[childPath] {
+		if e.encrypted || encByPath[e.childPath] {
 			row["encrypted"] = true
 		}
 		out = append(out, row)
@@ -356,7 +524,9 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 			c.JSON(http.StatusBadGateway, gin.H{"error": "无法从云端获取下载地址: " + errString(merr)})
 			return
 		}
-		if metas[0].Filename != "" {
+		// UUID-named storage: the cloud-side name is an opaque uuid, the real
+		// name lives on the metadata row.
+		if metas[0].Filename != "" && (encFile == nil || encFile.RemoteUUID == "") {
 			filename = metas[0].Filename
 		}
 		if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); err != nil {
@@ -444,9 +614,14 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	if path.Base(clean) == manifest.FileName {
+		c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可访问"})
+		return
+	}
 	if s.accessDenied(c, clean) {
 		return
 	}
+	remotePath = s.resolveRemote(acc, clean, remotePath)
 	token, err := s.pool.Token(c.Request.Context(), acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -461,7 +636,7 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能下载文件夹"})
 		return
 	}
-	s.proxyDownload(c, acc, token, ref.FsID, ref.Name, "path="+clean, s.fileByRemote(acc.ID, remotePath))
+	s.proxyDownload(c, acc, token, ref.FsID, path.Base(clean), "path="+clean, s.fileByRemote(acc.ID, remotePath))
 }
 
 // handleCheckAccess verifies that the caller may access a protected file or path.
@@ -550,7 +725,11 @@ func (s *Server) handleDownload(c *gin.Context) {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "无法从云端获取下载地址: " + errString(merr)})
 			return
 		}
-		filename = metas[0].Filename
+		if f.RemoteUUID != "" { // cloud-side name is an opaque uuid
+			filename = path.Base(f.LogicalPath)
+		} else {
+			filename = metas[0].Filename
+		}
 
 		if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
@@ -662,6 +841,7 @@ func (s *Server) handleDeleteFile(c *gin.Context) {
 	}
 	s.db.Model(&f).Update("status", "deleted")
 	s.dropAccessRules(cleanLogical(f.LogicalPath))
+	s.msync.Mark(f.BaiduAccountID)
 	s.audit(c, uid, usernameOf(c), "file.delete", f.LogicalPath)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -685,8 +865,13 @@ func (s *Server) handleRenameFile(c *gin.Context) {
 	if s.accessDenied(c, f.LogicalPath) {
 		return
 	}
+	if path.Base(f.LogicalPath) == manifest.FileName || path.Base(cleanLogical(in.Path)) == manifest.FileName {
+		c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可操作"})
+		return
+	}
 	s.db.Model(&f).Update("logical_path", in.Path)
 	s.moveAccessRules(cleanLogical(f.LogicalPath), cleanLogical(in.Path))
+	s.msync.Mark(f.BaiduAccountID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -704,6 +889,10 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除根目录"})
 		return
 	}
+	if path.Base(p) == manifest.FileName {
+		c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可删除"})
+		return
+	}
 	if s.accessDenied(c, p) {
 		return
 	}
@@ -712,6 +901,7 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	remotePath = s.resolveRemote(acc, p, remotePath)
 	token, err := s.pool.Token(c.Request.Context(), acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -728,6 +918,7 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 	s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 		Update("status", "deleted")
 	s.dropAccessRules(p)
+	s.msync.Mark(acc.ID)
 	s.audit(c, uid, usernameOf(c), "file.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -793,6 +984,18 @@ func (s *Server) handleCreateFolder(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	if s.systemConfig().UUIDStorage {
+		// ensureUUIDDirs creates the whole chain (mapping rows); the deepest
+		// level is this folder itself. MakeDir materializes it remotely so an
+		// empty folder is browsable immediately.
+		remotePath, err = s.ensureUUIDDirs(c, acc, p)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	} else {
+		remotePath = s.resolveRemote(acc, p, remotePath)
+	}
 	token, err := s.pool.Token(c.Request.Context(), acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -806,6 +1009,7 @@ func (s *Server) handleCreateFolder(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
+	s.msync.Mark(acc.ID)
 	s.audit(c, uid, usernameOf(c), "folder.create", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -825,6 +1029,10 @@ func (s *Server) handleMove(c *gin.Context) {
 	src, dst := cleanLogical(in.Src), cleanLogical(in.Dst)
 	if src == "/" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source"})
+		return
+	}
+	if path.Base(src) == manifest.FileName || path.Base(dst) == manifest.FileName {
+		c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可操作"})
 		return
 	}
 	if s.accessDenied(c, src) {
@@ -863,30 +1071,62 @@ func (s *Server) handleMove(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "暂不支持跨挂载节点移动"})
 		return
 	}
-	token, err := s.pool.Token(c.Request.Context(), srcAcc)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	srcRemote = s.resolveRemote(srcAcc, src, srcRemote)
+	var srcRow models.File
+	hasRow := s.db.Where("baidu_account_id = ? AND logical_path = ? AND status <> ?", srcAcc.ID, src, "deleted").
+		Order("id desc").First(&srcRow).Error == nil
+	if hasRow && srcRow.RemoteUUID != "" {
+		if path.Dir(src) == path.Dir(dst) {
+			// pure rename: the uuid remote name doesn't change -> metadata-only
+			dstRemote = srcRemote
+		} else {
+			var dstParent string
+			if s.systemConfig().UUIDStorage {
+				dstParent, err = s.ensureUUIDDirs(c, dstAcc, path.Dir(dst))
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+			} else {
+				dstParent = s.resolveRemote(dstAcc, path.Dir(dst), path.Dir(dstRemote))
+			}
+			dstRemote = path.Join(dstParent, srcRow.RemoteUUID)
+		}
+	} else {
+		dstRemote = s.resolveRemote(dstAcc, dst, dstRemote)
 	}
-	if err := s.coord.Limiter.Wait(c.Request.Context(), "acct:"+itoa(srcAcc.ID)); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-	if err := s.client.Move(c.Request.Context(), token, srcRemote, dstRemote); err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
+	if srcRemote != dstRemote {
+		token, err := s.pool.Token(c.Request.Context(), srcAcc)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if err := s.coord.Limiter.Wait(c.Request.Context(), "acct:"+itoa(srcAcc.ID)); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		if err := s.client.Move(c.Request.Context(), token, srcRemote, dstRemote); err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	// Move the item itself (file or folder record).
 	s.db.Model(&models.File{}).Where("logical_path = ? AND status != ?", src, "deleted").
-		Update("logical_path", dst)
-	// Move descendants by prefix rewrite.
+		Updates(map[string]any{"logical_path": dst, "remote_path": dstRemote})
+	// Move descendants by prefix rewrite (logical always, remote when the
+	// subtree physically moved).
 	var kids []models.File
 	s.db.Where("logical_path LIKE ? AND status != ?", src+"/%", "deleted").Find(&kids)
 	for _, k := range kids {
 		np := dst + strings.TrimPrefix(k.LogicalPath, src)
-		s.db.Model(&models.File{}).Where("id = ?", k.ID).Update("logical_path", np)
+		updates := map[string]any{"logical_path": np}
+		if srcRemote != dstRemote && strings.HasPrefix(k.RemotePath, srcRemote+"/") {
+			updates["remote_path"] = dstRemote + strings.TrimPrefix(k.RemotePath, srcRemote)
+		}
+		s.db.Model(&models.File{}).Where("id = ?", k.ID).Updates(updates)
 	}
 	s.moveAccessRules(src, dst)
+	s.msync.Mark(srcAcc.ID)
 	s.audit(c, uid, usernameOf(c), "move", src+" -> "+dst)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "moved": len(kids) + 1})
 }
@@ -911,6 +1151,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		return
 	}
 	if acc, remotePath, _, err := s.resolveMount(p); err == nil {
+		remotePath = s.resolveRemote(acc, p, remotePath)
 		token, err := s.pool.Token(c.Request.Context(), acc)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -927,6 +1168,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 			Update("status", "deleted")
 		s.dropAccessRules(p)
+		s.msync.Mark(acc.ID)
 		s.audit(c, uid, usernameOf(c), "folder.delete", p)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 		return
@@ -934,6 +1176,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 	var items []models.File
 	s.db.Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").Find(&items)
 	ctx := c.Request.Context()
+	touched := map[uint]bool{}
 	for _, f := range items {
 		if !f.IsDir && f.RemotePath != "" {
 			if acc, err := s.pool.Get(ctx, f.BaiduAccountID); err == nil {
@@ -944,9 +1187,13 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 				}
 			}
 		}
+		touched[f.BaiduAccountID] = true
 		s.db.Model(&models.File{}).Where("id = ?", f.ID).Update("status", "deleted")
 	}
 	s.dropAccessRules(p)
+	for id := range touched {
+		s.msync.Mark(id)
+	}
 	s.audit(c, uid, usernameOf(c), "folder.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "count": len(items)})
 }

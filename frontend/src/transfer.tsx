@@ -18,7 +18,7 @@ export type TransferStatus = "running" | "paused" | "finalizing" | "done" | "err
 
 export interface Transfer {
   id: string;
-  kind: "upload" | "download";
+  kind: "upload" | "download" | "import";
   name: string;
   path: string;
   total: number;
@@ -45,7 +45,7 @@ interface StreamCtl {
 }
 
 interface Ctl {
-  kind: "upload" | "download";
+  kind: "upload" | "download" | "import";
   name: string;
   path: string;
   total: number;
@@ -83,7 +83,9 @@ interface TransferApi {
   cancel: (id: string) => void;
   remove: (id: string) => void;
   clearFinished: () => void;
-  resolveJob: (jobId: string, status: string, error?: string) => void;
+  resolveJob: (jobId: string, status: string, error?: string, progress?: number) => void;
+  // server-side 转存 job: shows a progress row driven purely by WS job events
+  startShareImport: (jobId: string, name: string, path: string, total: number) => void;
 }
 
 const Ctx = createContext<TransferApi>(null as unknown as TransferApi);
@@ -209,10 +211,10 @@ async function chunksInfo(id: string): Promise<{ count: number; bytes: number }>
 const dropStored = (id: string) => { fileDrop(id); chunksDrop(id); };
 
 interface PersistEntry {
-  id: string; kind: "upload" | "download"; name: string; path: string;
+  id: string; kind: "upload" | "download" | "import"; name: string; path: string;
   total: number; transferred: number; synced?: number;
   status: TransferStatus; error?: string;
-  uploadId?: string; fileId?: number; downloadUrl?: string;
+  uploadId?: string; fileId?: number; downloadUrl?: string; jobId?: string;
   stream?: { sessionId: string; sliceSize: number; total: number; window: number };
 }
 
@@ -226,10 +228,12 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
     for (const e of raw) {
       if (!e || !e.id) continue;
       const wasActive = e.status === "running" || e.status === "paused" || e.status === "finalizing";
-      const status: TransferStatus = wasActive ? "paused" : e.status;
+      // import jobs run server-side: they stay "running" across a refresh and
+      // are resolved by the /api/jobs poll instead of a local resume
+      const status: TransferStatus = wasActive && e.kind !== "import" ? "paused" : e.status;
       // transfers that were mid-flight get auto-resumed once their local data
       // (upload File / download buffer) is reattached from IndexedDB
-      if (e.status === "running" || e.status === "finalizing") resumeIds.push(e.id);
+      if ((e.status === "running" || e.status === "finalizing") && e.kind !== "import") resumeIds.push(e.id);
       const transferred = e.transferred || 0;
       const synced = e.stream ? Math.min(e.synced || 0, e.total) : undefined;
       list.push({
@@ -240,7 +244,7 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
         kind: e.kind, name: e.name, path: e.path, total: e.total,
         sent: transferred, shown: transferred, synced: synced || 0,
         paused: true, canceled: e.status === "canceled",
-        uploadId: e.uploadId, fileId: e.fileId, downloadUrl: e.downloadUrl,
+        uploadId: e.uploadId, fileId: e.fileId, downloadUrl: e.downloadUrl, jobId: e.jobId,
         chunks: [], dlSeq: 0, retrying: false,
         lastTime: Date.now(), lastBytes: transferred, lastSynced: synced || 0,
         stream: e.stream ? {
@@ -358,7 +362,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       return {
         id: t.id, kind: t.kind, name: t.name, path: t.path, total: t.total,
         transferred: t.transferred, synced: t.synced, status: t.status, error: t.error,
-        uploadId: ctl?.uploadId, fileId: ctl?.fileId, downloadUrl: ctl?.downloadUrl,
+        uploadId: ctl?.uploadId, fileId: ctl?.fileId, downloadUrl: ctl?.downloadUrl, jobId: ctl?.jobId,
         stream: ctl?.stream ? {
           sessionId: ctl.stream.sessionId, sliceSize: ctl.stream.sliceSize,
           total: ctl.stream.total, window: ctl.stream.window,
@@ -950,13 +954,29 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     }));
   }, []);
 
-  const resolveJob = useCallback((jobId: string, status: string, error?: string) => {
+  const resolveJob = useCallback((jobId: string, status: string, error?: string, progress?: number) => {
     for (const [id, ctl] of ctls.current) {
       if (ctl.jobId !== jobId) continue;
       if (status === "done") { dropStored(id); patch(id, { status: "done", transferred: ctl.total, speed: 0 }); }
       else if (status === "failed") patch(id, { status: "error", error: error || "云端处理失败", speed: 0 });
+      else if (ctl.kind === "import" && progress !== undefined && ctl.total > 0) {
+        // server-side 转存 progress: percentage-driven, no byte counter of its own
+        const done = Math.min(ctl.total, Math.round((ctl.total * progress) / 100));
+        ctl.sent = ctl.shown = done;
+        patch(id, { status: "running", transferred: done });
+      }
     }
   }, [patch]);
+
+  const startShareImport = useCallback((jobId: string, name: string, path: string, total: number) => {
+    const id = "imp-" + jobId;
+    ctls.current.set(id, {
+      kind: "import", name, path, total, sent: 0, shown: 0, synced: 0,
+      paused: false, canceled: false, chunks: [], jobId, dlSeq: 0, retrying: false,
+      lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
+    });
+    setTransfers((l) => [{ id, kind: "import", name, path, total, transferred: 0, speed: 0, status: "running" }, ...l]);
+  }, []);
 
   // After a refresh: reattach local data from IndexedDB (upload File handles,
   // download buffers), then automatically continue transfers that were running.
@@ -991,7 +1011,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
   }, [patch, resume]);
 
   return (
-    <Ctx.Provider value={{ clientMode: false, transfers, startUpload, startClientUpload, startDownload, pause, resume, cancel, remove, clearFinished, resolveJob }}>
+    <Ctx.Provider value={{ clientMode: false, transfers, startUpload, startClientUpload, startDownload, pause, resume, cancel, remove, clearFinished, resolveJob, startShareImport }}>
       {children}
     </Ctx.Provider>
   );
@@ -1113,6 +1133,7 @@ function ClientTransferProvider({ children }: { children: ReactNode }) {
       remove,
       clearFinished,
       resolveJob: noop,
+      startShareImport: noop,
     }}>
       {children}
     </Ctx.Provider>

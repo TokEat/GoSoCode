@@ -49,6 +49,11 @@ export default function Nodes() {
   const act = (fn: Promise<any>, ok: string) =>
     fn.then(() => { toast("ok", ok); refresh(); }).catch((e) => toast("err", e.message));
 
+  const syncManifest = (id: number) =>
+    api.syncNodeManifest(id)
+      .then((r) => { toast("ok", `元数据同步完成：新增 ${r.imported}，更新 ${r.updated}，跳过 ${r.skipped}`); refresh(); })
+      .catch((e) => toast("err", e.message));
+
   async function persistCfg(next: typeof form, okMsg: string) {
     if (!next.app_key.trim()) { toast("info", "请填写 AppKey"); return; }
     if (!cfg?.has_secret && !next.secret_key.trim()) { toast("info", "请填写 SecretKey"); return; }
@@ -293,6 +298,7 @@ export default function Nodes() {
                   <div className="row" style={{ flexWrap: "wrap" }}>
                     <button className="btn ghost sm" onClick={() => editNode(n)}>设置</button>
                     <button className="btn ghost sm" onClick={() => act(api.refreshNode(n.id), "容量信息已更新")}>刷新容量</button>
+                    <button className="btn ghost sm" onClick={() => syncManifest(n.id)}>同步元数据</button>
                     {n.status === "active"
                       ? <button className="btn ghost sm" onClick={() => act(api.setNodeStatus(n.id, "disabled"), "已停用")}>停用</button>
                       : <button className="btn ghost sm" onClick={() => act(api.setNodeStatus(n.id, "active"), "已启用")}>启用</button>}

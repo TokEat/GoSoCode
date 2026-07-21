@@ -122,7 +122,7 @@ func (s *Server) handleUploadFinish(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "upload incomplete"})
 		return
 	}
-	acc, remote, logical, release, err := s.resolveUploadTarget(c, sess.LogicalPath, sess.Offset)
+	acc, remote, remoteUUID, logical, release, err := s.resolveUploadTarget(c, sess.LogicalPath, sess.Offset)
 	if err != nil {
 		if release != nil {
 			release()
@@ -133,7 +133,7 @@ func (s *Server) handleUploadFinish(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	jobID, err := s.jobs.SubmitUploadTo(uid, sess.TmpPath, logical, remote, sess.Offset, acc)
+	jobID, err := s.jobs.SubmitUploadTo(uid, sess.TmpPath, logical, remote, remoteUUID, sess.Offset, acc)
 	if err != nil {
 		log.Printf("[upload] finish->submit failed session=%s path=%s: %v", in.UploadID, sess.LogicalPath, err)
 		os.Remove(sess.TmpPath)

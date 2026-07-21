@@ -46,7 +46,7 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
             const syncPct = isStream && t.total > 0 ? Math.min(100, Math.round(((t.synced || 0) / t.total) * 100)) : 0;
             return (
               <div key={t.id} className="transfer-drawer-row">
-                <span className={`drawer-kind ${t.kind}`}>{t.kind === "upload" ? "↑" : "↓"}</span>
+                <span className={`drawer-kind ${t.kind}`}>{t.kind === "upload" ? "↑" : t.kind === "import" ? "⇄" : "↓"}</span>
                 <span className="drawer-name" title={t.path}>{t.name}</span>
                 <div className="drawer-bars">
                   <div className="bar drawer-bar"><span style={{ width: `${pct}%`, background: color }} /></div>

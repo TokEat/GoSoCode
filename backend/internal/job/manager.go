@@ -22,6 +22,7 @@ import (
 	"gosocode/internal/coord"
 	"gosocode/internal/crypto"
 	"gosocode/internal/keystore"
+	"gosocode/internal/manifest"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 	"gosocode/internal/realtime"
@@ -43,13 +44,14 @@ type Manager struct {
 	coord   *coord.Coordinator
 	hub     *realtime.Hub
 	meter   *metrics.Meter
+	msync   *manifest.Syncer
 	queue   chan uploadTask
 	keysDir string // local backup store for per-node encryption keys
 }
 
-func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord.Coordinator, hub *realtime.Hub, meter *metrics.Meter, workers int, keysDir string) *Manager {
+func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord.Coordinator, hub *realtime.Hub, meter *metrics.Meter, msync *manifest.Syncer, workers int, keysDir string) *Manager {
 	m := &Manager{
-		db: db, pool: pool, client: client, coord: co, hub: hub, meter: meter,
+		db: db, pool: pool, client: client, coord: co, hub: hub, meter: meter, msync: msync,
 		queue: make(chan uploadTask, 256), keysDir: keysDir,
 	}
 	if workers <= 0 {
@@ -131,21 +133,10 @@ func (m *Manager) cleanupStaleUploads() {
 	}
 }
 
-// SubmitUpload picks a storage node with room for the file (capacity-aware
-// placement), registers a job + file record, and enqueues the transfer.
-func (m *Manager) SubmitUpload(userID uint, tmpPath, logical, remotePath string, size int64) (string, error) {
-	acc, err := m.pool.PickForSize(context.Background(), size)
-	if err != nil {
-		return "", err
-	}
-	return m.submitUploadWithAccount(userID, tmpPath, logical, remotePath, size, acc)
-}
-
-func (m *Manager) SubmitUploadTo(userID uint, tmpPath, logical, remotePath string, size int64, acc *models.BaiduAccount) (string, error) {
-	return m.submitUploadWithAccount(userID, tmpPath, logical, remotePath, size, acc)
-}
-
-func (m *Manager) submitUploadWithAccount(userID uint, tmpPath, logical, remotePath string, size int64, acc *models.BaiduAccount) (string, error) {
+// SubmitUploadTo registers a job + file record on the chosen node and
+// enqueues the transfer. remoteUUID is non-empty when the remote name is an
+// obfuscation uuid (UUID storage mode).
+func (m *Manager) SubmitUploadTo(userID uint, tmpPath, logical, remotePath, remoteUUID string, size int64, acc *models.BaiduAccount) (string, error) {
 	jobID := uuid.NewString()
 	job := models.Job{
 		ID: jobID, UserID: userID, Type: "upload",
@@ -158,7 +149,7 @@ func (m *Manager) submitUploadWithAccount(userID uint, tmpPath, logical, remoteP
 	}
 	f := models.File{
 		OwnerUserID: userID, BaiduAccountID: acc.ID,
-		LogicalPath: logical, RemotePath: remotePath,
+		LogicalPath: logical, RemotePath: remotePath, RemoteUUID: remoteUUID,
 		Size: size, Status: "uploading",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -290,6 +281,7 @@ func (m *Manager) runUpload(t uploadTask) {
 		Path: t.logical, Size: size, At: time.Now(),
 	})
 
+	m.msync.Mark(acc.ID)
 	m.setStatus(t, "done", 100, "")
 }
 
@@ -298,59 +290,69 @@ func (m *Manager) runUpload(t uploadTask) {
 // row so downloads can decrypt. The key is the target node's account key
 // (one per node, double-stored in DB + KeysDir); the IV is fresh per file.
 func (m *Manager) encryptTemp(t *uploadTask, masterKey string, accID, fileID uint) error {
-	key, err := keystore.NodeKey(m.db, masterKey, m.keysDir, accID)
+	encPath, err := m.encryptFileToTemp(t.tmpPath, masterKey, accID, fileID)
 	if err != nil {
 		return err
+	}
+	os.Remove(t.tmpPath)
+	t.tmpPath = encPath
+	log.Printf("[job] upload encrypted at rest job=%s path=%s", t.jobID, t.logical)
+	return nil
+}
+
+// encryptFileToTemp streams srcPath through AES-256-CTR into a fresh temp file
+// and records the wrapped key material on the File row so downloads can
+// decrypt. The key is the node's account key; the IV is fresh per file. The
+// caller owns both the source file and the returned ciphertext file.
+func (m *Manager) encryptFileToTemp(srcPath, masterKey string, accID, fileID uint) (string, error) {
+	key, err := keystore.NodeKey(m.db, masterKey, m.keysDir, accID)
+	if err != nil {
+		return "", err
 	}
 	iv, err := crypto.NewIV()
 	if err != nil {
-		return err
+		return "", err
 	}
-	src, err := os.Open(t.tmpPath)
+	src, err := os.Open(srcPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer src.Close()
 	enc, err := crypto.NewCTRReader(src, key, iv, 0)
 	if err != nil {
-		return err
+		return "", err
 	}
 	dst, err := os.CreateTemp("", "gsc-enc-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := io.Copy(dst, enc); err != nil {
 		dst.Close()
 		os.Remove(dst.Name())
-		return err
+		return "", err
 	}
 	if err := dst.Close(); err != nil {
 		os.Remove(dst.Name())
-		return err
+		return "", err
 	}
 
 	wk, err := crypto.Wrap(masterKey, hex.EncodeToString(key))
 	if err != nil {
 		os.Remove(dst.Name())
-		return err
+		return "", err
 	}
 	wiv, err := crypto.Wrap(masterKey, hex.EncodeToString(iv))
 	if err != nil {
 		os.Remove(dst.Name())
-		return err
+		return "", err
 	}
 	if err := m.db.Model(&models.File{}).Where("id = ?", fileID).Updates(map[string]any{
 		"encrypted": true, "enc_key": wk, "enc_iv": wiv, "updated_at": time.Now(),
 	}).Error; err != nil {
 		os.Remove(dst.Name())
-		return err
+		return "", err
 	}
-
-	src.Close()
-	os.Remove(t.tmpPath)
-	t.tmpPath = dst.Name()
-	log.Printf("[job] upload encrypted at rest job=%s path=%s", t.jobID, t.logical)
-	return nil
+	return dst.Name(), nil
 }
 
 // streamChunks reads the temp file one sliceSize block at a time and uploads
@@ -394,12 +396,16 @@ func (m *Manager) streamChunks(ctx context.Context, t uploadTask, token, uploadI
 }
 
 func (m *Manager) setStatus(t uploadTask, status string, progress int, errMsg string) {
-	m.db.Model(&models.Job{}).Where("id = ?", t.jobID).Updates(map[string]any{
+	m.jobStatus(t.jobID, t.userID, t.logical, status, progress, errMsg)
+}
+
+func (m *Manager) jobStatus(jobID string, userID uint, logical, status string, progress int, errMsg string) {
+	m.db.Model(&models.Job{}).Where("id = ?", jobID).Updates(map[string]any{
 		"status": status, "progress": progress, "error": errMsg, "updated_at": time.Now(),
 	})
-	m.hub.Publish(t.userID, map[string]any{
-		"type": "job", "job_id": t.jobID, "status": status,
-		"progress": progress, "logical_path": t.logical, "error": errMsg,
+	m.hub.Publish(userID, map[string]any{
+		"type": "job", "job_id": jobID, "status": status,
+		"progress": progress, "logical_path": logical, "error": errMsg,
 	})
 }
 

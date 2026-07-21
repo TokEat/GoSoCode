@@ -37,10 +37,16 @@ export interface BaiduConfig {
   has_secret: boolean; configured: boolean;
 }
 export interface SystemConfig {
-  encrypt_storage: boolean; log_max_entries: number;
+  encrypt_storage: boolean; uuid_storage: boolean; log_max_entries: number;
+  share_import_enabled: boolean;
   oidc_enabled: boolean; oidc_issuer: string; oidc_client_id: string;
   oidc_redirect_url: string; oidc_has_secret: boolean;
   oidc_client_secret?: string; // write-only: sent on save, never echoed back
+}
+// fs_id/share_id/uk arrive as strings: they can exceed Number.MAX_SAFE_INTEGER
+export interface ShareFile { fs_id: string; name: string; size: number; is_dir: boolean; }
+export interface ShareResolveResult {
+  surl: string; sekey: string; share_id: string; uk: string; files: ShareFile[];
 }
 export type UserInput = { username: string; password?: string; role: string; status: string };
 export interface TrafficRow { id: number; label: string; bytes_up: number; bytes_down: number; }
@@ -129,6 +135,14 @@ export const api = {
     return json(`/files/access-check?${params.toString()}`, "GET");
   },
 
+  // share-link import (转存)
+  shareResolve: (link: string, pwd?: string): Promise<ShareResolveResult> =>
+    json("/share/resolve", "POST", { link, pwd }),
+  shareImport: (p: {
+    surl: string; sekey: string; share_id: string; uk: string;
+    fs_ids: string[]; total_size: number; target_dir: string; encrypt: boolean;
+  }): Promise<{ job_id: string }> => json("/share/import", "POST", p),
+
   // transfers
   listJobs: (): Promise<JobItem[]> => json("/jobs", "GET").then((r) => r.jobs),
   cancelJob: (id: string) => json(`/jobs/${id}/cancel`, "POST"),
@@ -157,6 +171,8 @@ export const api = {
 	    json(`/admin/nodes/${id}/directories?path=${encodeURIComponent(path)}`, "GET"),
 	  setNodeStatus: (id: number, status: string) => json(`/admin/nodes/${id}/status`, "POST", { status }),
   refreshNode: (id: number) => json(`/admin/nodes/${id}/refresh`, "POST"),
+  syncNodeManifest: (id: number): Promise<{ imported: number; updated: number; skipped: number }> =>
+    json(`/admin/nodes/${id}/sync-manifest`, "POST"),
   deleteNode: (id: number) => json(`/admin/nodes/${id}`, "DELETE"),
 
   // admin: traffic + logs

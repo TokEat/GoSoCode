@@ -13,6 +13,7 @@ import (
 	"gosocode/internal/coord"
 	"gosocode/internal/crypto"
 	"gosocode/internal/job"
+	"gosocode/internal/manifest"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 	"gosocode/internal/realtime"
@@ -71,7 +72,11 @@ func main() {
 	}
 	hub := realtime.NewHub()
 	meter := metrics.New()
-	jobs := job.NewManager(db, pool, client, co, hub, meter, cfg.Workers, cfg.KeysDir)
+	msync := manifest.NewSyncer(db, pool, client, co, hub)
+	jobs := job.NewManager(db, pool, client, co, hub, meter, msync, cfg.Workers, cfg.KeysDir)
+	if cfg.DailyReconcile {
+		msync.StartDailyReconcile(cfg.Timezone)
+	}
 
 	// Live traffic feed: push the meter snapshot to admin WebSocket connections
 	// every 2s so the monitoring page doesn't need to poll for realtime stats.
@@ -83,7 +88,7 @@ func main() {
 		}
 	}()
 
-	srv := api.NewServer(cfg, db, pool, client, co, jobs, hub, meter, agentControl)
+	srv := api.NewServer(cfg, db, pool, client, co, jobs, hub, meter, agentControl, msync)
 	log.Printf("gosocode backend listening on %s", cfg.Addr)
 	if err := srv.Router().Run(cfg.Addr); err != nil {
 		log.Fatalf("server: %v", err)

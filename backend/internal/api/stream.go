@@ -253,7 +253,7 @@ func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *mode
 	if logical == "/" {
 		logical = "/" + in.Name
 	}
-	acc, remote, logical, release, err := s.resolveUploadTarget(c, logical, in.Size)
+	acc, remote, remoteUUID, logical, release, err := s.resolveUploadTarget(c, logical, in.Size)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
@@ -314,7 +314,7 @@ func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *mode
 
 	f := models.File{
 		OwnerUserID: uid, BaiduAccountID: acc.ID,
-		LogicalPath: logical, RemotePath: remote,
+		LogicalPath: logical, RemotePath: remote, RemoteUUID: remoteUUID,
 		Size: in.Size, Status: "uploading",
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -661,6 +661,7 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 		return
 	}
 	s.streamStateDrop(sess.ID)
+	s.msync.Mark(acc.ID)
 
 	log.Printf("[stream] finish ok session=%s path=%s bytes=%d fsid=%d", sess.ID, sess.LogicalPath, sess.Size, fsID)
 	c.JSON(http.StatusOK, gin.H{"file_id": sess.FileID})

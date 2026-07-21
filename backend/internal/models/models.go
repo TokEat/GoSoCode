@@ -2,6 +2,11 @@ package models
 
 import "time"
 
+// ImportsDirName is the hidden per-node staging directory (directly under the
+// mount root) that share-link imports (转存) land in. It is filtered from
+// listings; imported files stay here and are exposed via LogicalPath only.
+const ImportsDirName = ".gsc-imports"
+
 // BaiduAccount is one shared Baidu Netdisk account in the pool. Multiple
 // platform users operate through it; the access token is centrally managed.
 type BaiduAccount struct {
@@ -59,8 +64,13 @@ type BaiduAppConfig struct {
 type SystemConfig struct {
 	ID             uint   `gorm:"primaryKey"`
 	EncryptStorage bool   `gorm:"default:false"` // new uploads are AES-encrypted at rest
-	MasterKey      string `gorm:"size:128"`      // hex, 32 bytes
-	LogMaxEntries  int    `gorm:"default:500"`   // audit log retention cap
+	// explicit column name: gorm's initialism handling would otherwise map
+	// UUIDStorage to u_u_i_d_storage
+	UUIDStorage   bool   `gorm:"column:uuid_storage;default:false"` // new uploads/dirs get UUID names on the netdisk
+	MasterKey     string `gorm:"size:128"`                          // hex, 32 bytes
+	LogMaxEntries int    `gorm:"default:500"`                       // audit log retention cap
+
+	ShareImportEnabled bool `gorm:"default:true"` // allow importing external Baidu share links (转存)
 
 	// Unified OIDC (e.g. Keycloak) single sign-on. When enabled, the login
 	// page offers SSO alongside local password login; both methods coexist.
@@ -118,7 +128,10 @@ type File struct {
 	BaiduAccountID uint   `gorm:"index"`           // which pooled account holds it
 	LogicalPath    string `gorm:"size:1024;index"` // user-facing path, e.g. /docs/a.pdf
 	RemotePath     string `gorm:"size:1024"`       // real path in Baidu sandbox
-	FsID           uint64 `gorm:"index"`
+	// non-empty = the remote name is this UUID (obfuscated storage); display
+	// name always comes from LogicalPath
+	RemoteUUID string `gorm:"column:remote_uuid;size:64;index"`
+	FsID       uint64 `gorm:"index"`
 	Size           int64
 	MD5            string `gorm:"size:64"`
 	Encrypted      bool   `gorm:"default:false"`             // stored bytes are AES-256-CTR ciphertext
@@ -126,6 +139,8 @@ type File struct {
 	EncIV          string `gorm:"size:512"`                  // per-file CTR IV, wrapped with the master key
 	IsDir          bool   `gorm:"default:false"`             // metadata-only folder marker
 	Status         string `gorm:"size:32;default:uploading"` // uploading/ready/deleted
+	DeletedBy      string `gorm:"size:64"`                   // e.g. daily_reconcile, user_delete
+	DeletedAt      *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }

@@ -25,6 +25,7 @@ import (
 	"gosocode/internal/coord"
 	"gosocode/internal/crypto"
 	"gosocode/internal/job"
+	"gosocode/internal/manifest"
 	"gosocode/internal/metrics"
 	"gosocode/internal/models"
 	"gosocode/internal/realtime"
@@ -41,6 +42,7 @@ type Server struct {
 	hub     *realtime.Hub
 	meter   *metrics.Meter
 	control *crypto.Codec
+	msync   *manifest.Syncer
 
 	// negotiated control-plane encryption: server ECDH key pair generated at
 	// startup and the per-client sessions derived from /api/agent/handshake
@@ -73,9 +75,10 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB, pool *account.Pool, client *baidu.Client,
-	co *coord.Coordinator, jobs *job.Manager, hub *realtime.Hub, meter *metrics.Meter, control *crypto.Codec) *Server {
+	co *coord.Coordinator, jobs *job.Manager, hub *realtime.Hub, meter *metrics.Meter, control *crypto.Codec,
+	msync *manifest.Syncer) *Server {
 	srv := &Server{
-		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter, control: control,
+		cfg: cfg, db: db, pool: pool, client: client, coord: co, jobs: jobs, hub: hub, meter: meter, control: control, msync: msync,
 		streamStates: map[string]*streamState{},
 		ctrlSessions: map[string]*controlSession{},
 		oauthStates:  map[string]oauthStateEntry{},
@@ -154,6 +157,9 @@ func (s *Server) Router() *gin.Engine {
 		auth.GET("/files/:id/download", s.handleDownload)
 		auth.DELETE("/files/:id", s.handleDeleteFile)
 		auth.POST("/files/:id/rename", s.handleRenameFile)
+		// share-link import (转存 from external Baidu share links)
+		auth.POST("/share/resolve", s.handleShareResolve)
+		auth.POST("/share/import", s.handleShareImport)
 		// transfers
 		auth.GET("/jobs", s.handleListJobs)
 		auth.POST("/jobs/:id/cancel", s.handleCancelJob)
@@ -194,6 +200,7 @@ func (s *Server) Router() *gin.Engine {
 		admin.GET("/nodes/:id/directories", s.handleListNodeDirectories)
 		admin.POST("/nodes/:id/status", s.handleSetNodeStatus)
 		admin.POST("/nodes/:id/refresh", s.handleRefreshNode)
+		admin.POST("/nodes/:id/sync-manifest", s.handleSyncNodeManifest)
 		admin.DELETE("/nodes/:id", s.handleDeleteNode)
 
 		admin.GET("/traffic", s.handleTraffic)

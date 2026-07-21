@@ -1,9 +1,11 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Config holds all runtime configuration. Values come from environment
@@ -30,6 +32,9 @@ type Config struct {
 	WebUIDir        string // if the dir exists, serve the built web UI from it
 	ClientDir       string // if set, serves CLI client binaries at /api/client/download/<os>/<arch>
 	KeysDir         string // local backup copies of per-node encryption keys (second store besides the DB)
+
+	DailyReconcile bool   // run a full netdisk-to-DB reconciliation every day at 00:00
+	Timezone       string // IANA timezone for daily schedule; empty = server local time
 }
 
 func env(key, def string) string {
@@ -40,7 +45,7 @@ func env(key, def string) string {
 }
 
 func Load() *Config {
-	return &Config{
+	cfg := &Config{
 		Addr:        env("GSC_ADDR", ":8080"),
 		DBPath:      env("GSC_DB", "gosocode.db"),
 		JWTSecret:   env("GSC_JWT_SECRET", "dev-insecure-change-me"),
@@ -62,7 +67,17 @@ func Load() *Config {
 		WebUIDir:        env("GSC_WEBUI", "webui"),
 		ClientDir:       env("GSC_CLIENT_DIR", ""),
 		KeysDir:         env("GSC_KEYS_DIR", filepath.Join(filepath.Dir(env("GSC_DB", "gosocode.db")), "gsc-keys")),
+
+		DailyReconcile: env("GSC_DAILY_RECONCILE", "1") != "0",
+		Timezone:       env("GSC_TIMEZONE", ""),
 	}
+	if cfg.Timezone != "" {
+		if _, err := time.LoadLocation(cfg.Timezone); err != nil {
+			log.Printf("[config] invalid GSC_TIMEZONE %q: %v; using local time", cfg.Timezone, err)
+			cfg.Timezone = ""
+		}
+	}
+	return cfg
 }
 
 func envInt(key string, def int) int {

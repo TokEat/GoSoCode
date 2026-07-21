@@ -5,6 +5,7 @@ import { humanSize, fmtTime } from "../lib/format";
 import { useTransfers } from "../transfer";
 import { JobEvent } from "../App";
 import LocalFilePicker from "../LocalFilePicker";
+import ShareImportDialog from "../ShareImportDialog";
 import { LocalEntry } from "../lib/api";
 
 // ---- path helpers ----------------------------------------------------------
@@ -100,6 +101,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [clip, setClip] = useState<Clip | null>(null);
   const [localPicker, setLocalPicker] = useState(false);
+  const [shareDialog, setShareDialog] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
   const dialog = useDialog();
@@ -232,6 +234,16 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     transfers.startUpload(f, normDir(cwd) + f.name);
     toast("ok", "已加入上传队列,可在「传输管理」查看进度");
     if (fileRef.current) fileRef.current.value = "";
+  }
+
+  function onShareImportSubmitted(jobId: string, name: string, total: number) {
+    setShareDialog(false);
+    if (!transfers.clientMode) {
+      transfers.startShareImport(jobId, name, cwd, total);
+      toast("ok", "转存任务已提交，可在「传输管理」查看进度");
+    } else {
+      toast("ok", "转存任务已提交，转存在服务器上进行，稍后刷新目录即可看到文件");
+    }
   }
 
   async function newFolder() {
@@ -370,6 +382,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     return [
       { label: "新建文件夹", onClick: wrap(newFolder), disabled: cwd === "/" },
       { label: "上传文件", onClick: wrap(pickFile), disabled: cwd === "/" },
+      { label: "分享转存…", onClick: wrap(() => setShareDialog(true)), disabled: cwd === "/" },
       { label: clip ? `粘贴 “${baseName(clip.path)}”` : "粘贴", onClick: wrap(() => paste(cwd)), disabled: !clip || cwd === "/" },
       "div",
       { label: "刷新", onClick: wrap(() => { refresh(); refreshStorage(); }) },
@@ -386,12 +399,14 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
       action={
         <div className="row">
           <button className="btn ghost sm" onClick={newFolder} disabled={cwd === "/"}>新建文件夹</button>
+          <button className="btn ghost sm" onClick={() => setShareDialog(true)} disabled={cwd === "/"} title="转存别人分享的百度网盘链接">分享转存</button>
           <button className="btn" onClick={pickFile} disabled={cwd === "/"}>{transfers.clientMode ? "选择本机文件" : "上传文件"}</button>
         </div>
       }
     >
       <input ref={fileRef} type="file" style={{ display: "none" }} onChange={onFilePicked} />
       <LocalFilePicker open={localPicker} onClose={() => setLocalPicker(false)} onSelect={onLocalFilePicked} />
+      <ShareImportDialog open={shareDialog} targetDir={cwd} onClose={() => setShareDialog(false)} onSubmitted={onShareImportSubmitted} />
 
       {/* capacity */}
       <div className="cap-wrap">

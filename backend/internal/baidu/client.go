@@ -485,30 +485,101 @@ type listResp struct {
 	List []ListItem `json:"list"`
 }
 
-func (c *Client) ListDir(ctx context.Context, token, remoteDir string) ([]ListItem, error) {
-	q := url.Values{}
-	q.Set("method", "list")
-	q.Set("access_token", token)
-	q.Set("dir", remoteDir)
-	q.Set("order", "name")
-	q.Set("desc", "0")
-	q.Set("folder", "0")
-	q.Set("web", "1")
+// Limiter is the small subset of the coordinator we need for recursive
+// directory walking, avoiding an import cycle with the coord package.
+type Limiter interface {
+	Wait(ctx context.Context, key string) error
+}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiFile+"?"+q.Encode(), nil)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
+// manifestFileName is duplicated here to avoid importing internal/manifest
+// (the manifest package imports baidu, not the other way around).
+const manifestFileName = ".gsc-manifest.json"
+
+// ListDirRecursive walks the remote directory tree depth-first, returning a
+// flat slice of all files and directories under remoteDir. Each ListDir call
+// observes the coordinator rate limiter. maxDepth caps recursion to avoid
+// infinite loops caused by odd remote structures; zero means default 20.
+func (c *Client) ListDirRecursive(ctx context.Context, limiter Limiter, acctKey, token, remoteDir string, maxDepth int) ([]ListItem, error) {
+	if maxDepth <= 0 {
+		maxDepth = 20
 	}
-	defer resp.Body.Close()
-	var out listResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+	type frame struct {
+		dir   string
+		depth int
 	}
-	if err := out.err(); err != nil {
-		return nil, err
+	var out []ListItem
+	seen := map[string]bool{}
+	stack := []frame{{dir: remoteDir, depth: 0}}
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if f.depth > maxDepth {
+			continue
+		}
+		if seen[f.dir] {
+			continue
+		}
+		seen[f.dir] = true
+		if limiter != nil {
+			if err := limiter.Wait(ctx, acctKey); err != nil {
+				return nil, err
+			}
+		}
+		items, err := c.ListDir(ctx, token, f.dir)
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", f.dir, err)
+		}
+		for _, it := range items {
+			if it.ServerFilename == manifestFileName {
+				continue
+			}
+			out = append(out, it)
+			if it.IsDir == 1 {
+				stack = append(stack, frame{dir: it.Path, depth: f.depth + 1})
+			}
+		}
 	}
-	return out.List, nil
+	return out, nil
+}
+
+// ListDir returns all entries of remoteDir, paging through Baidu's list API
+// (1000 per page) so large directories are never silently truncated — the
+// daily reconcile deletes local rows missing from this listing, so a
+// truncated page would destroy metadata.
+func (c *Client) ListDir(ctx context.Context, token, remoteDir string) ([]ListItem, error) {
+	const pageSize = 1000
+	var all []ListItem
+	for start := 0; ; start += pageSize {
+		q := url.Values{}
+		q.Set("method", "list")
+		q.Set("access_token", token)
+		q.Set("dir", remoteDir)
+		q.Set("order", "name")
+		q.Set("desc", "0")
+		q.Set("folder", "0")
+		q.Set("web", "1")
+		q.Set("start", strconv.Itoa(start))
+		q.Set("limit", strconv.Itoa(pageSize))
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiFile+"?"+q.Encode(), nil)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var out listResp
+		derr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if derr != nil {
+			return nil, derr
+		}
+		if err := out.err(); err != nil {
+			return nil, err
+		}
+		all = append(all, out.List...)
+		if len(out.List) < pageSize {
+			return all, nil
+		}
+	}
 }
 
 // ---- Download: filemetas -> dlink ---------------------------------------
