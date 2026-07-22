@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { api, auth, FileItem, Storage } from "../lib/api";
 import { Card, statusBadge, useToast, useDialog } from "../ui";
 import { humanSize, fmtTime } from "../lib/format";
@@ -169,6 +170,18 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     e.preventDefault();
     setMenu({ x: e.clientX, y: e.clientY, target });
   }
+
+  // Keep the context menu inside the viewport (it opens at the cursor, which
+  // may be near the right/bottom edge).
+  const menuRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (!menu || !menuRef.current) return;
+    const r = menuRef.current.getBoundingClientRect();
+    let nx = menu.x, ny = menu.y;
+    if (r.right > window.innerWidth - 8) nx = Math.max(8, window.innerWidth - 8 - r.width);
+    if (r.bottom > window.innerHeight - 8) ny = Math.max(8, window.innerHeight - 8 - r.height);
+    if (nx !== menu.x || ny !== menu.y) setMenu({ ...menu, x: nx, y: ny });
+  }, [menu]);
 
   async function runProtected(p: string, action: (pwd?: string) => Promise<any>, ok: string) {
     const cached = pwdFor(p);
@@ -440,9 +453,11 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                   onDoubleClick={() => enter(d.name)}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
                   <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}</div></td>
-                  <td className="muted">{humanSize(d.size)}</td>
+                  {/* the listing only covers direct children, so a folder's
+                      own size is unknown — show a dash instead of "0 B" */}
+                  <td className="muted">{d.count > 0 ? humanSize(d.size) : "—"}</td>
                   <td className="muted">{d.modified ? fmtTime(d.modified) : "—"}</td>
-                  <td className="muted">文件夹 ({d.count})</td>
+                  <td className="muted">{d.count > 0 ? `文件夹 (${d.count})` : "文件夹"}</td>
                   <td></td>
                 </tr>
               );
@@ -471,10 +486,13 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         </table>
       </div>
 
-      {menu && (
+      {/* Portal to <body>: the card's backdrop-filter (and hover transform)
+          makes it the containing block for position:fixed, which would shift
+          the menu away from the cursor and shrink the overlay to the card. */}
+      {menu && createPortal(
         <>
           <div className="ctx-overlay" onClick={closeMenu} onContextMenu={(e) => { e.preventDefault(); closeMenu(); }} />
-          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+          <div className="ctx-menu" ref={menuRef} style={{ left: menu.x, top: menu.y }}>
             {menuItems(menu.target).map((it, i) =>
               it === "div"
                 ? <div key={i} className="ctx-div" />
@@ -482,7 +500,8 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                     onClick={() => !it.disabled && it.onClick?.()}>{it.label}</div>
             )}
           </div>
-        </>
+        </>,
+        document.body,
       )}
     </Card>
   );
