@@ -28,9 +28,11 @@ func Open(path string) (*gorm.DB, error) {
 		&models.UploadSession{},
 		&models.StreamSession{},
 		&models.TransferLog{},
+		&models.TransferEvent{},
 		&models.AuditLog{},
 		&models.SystemConfig{},
 		&models.AccessRule{},
+		&models.AccessGrant{},
 	); err != nil {
 		return nil, err
 	}

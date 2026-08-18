@@ -39,7 +39,7 @@ type User struct {
 	// explicit column name: gorm's initialism handling would otherwise map
 	// OIDCSubject to o_id_c_subject and break raw `oidc_subject = ?` lookups
 	OIDCSubject  string `gorm:"column:oidc_subject;size:128;index"` // OIDC `sub` claim; non-empty = account provisioned via SSO
-	Role         string `gorm:"size:16;default:user"`   // admin | user
+	Role         string `gorm:"size:16;default:user"`   // admin | user | temporary
 	Status       string `gorm:"size:16;default:active"` // active | disabled
 	BytesUp      int64  // lifetime uploaded bytes (traffic accounting)
 	BytesDown    int64  // lifetime downloaded bytes
@@ -107,6 +107,36 @@ type TransferLog struct {
 	Path   string `gorm:"size:1024"`
 	Size   int64
 	At     time.Time `gorm:"index"`
+}
+
+// TransferEvent records fine-grained per-stage transfer events for uploads,
+// downloads and imports. It is best-effort and must not affect the main flow.
+type TransferEvent struct {
+	ID          uint      `gorm:"primaryKey"`
+	UserID      uint      `gorm:"index"`
+	Kind        string    `gorm:"size:16"`   // upload | download | import
+	Stage       string    `gorm:"size:32"`   // init | start | chunk | slice | progress | finish | cancel | failure
+	RefType     string    `gorm:"size:32"`   // upload_session | stream | job | file | agent | share | client
+	RefID       string    `gorm:"size:128"`
+	Name        string    `gorm:"size:512"`
+	Path        string    `gorm:"size:1024"`
+	AccountID   uint      `gorm:"index"`
+	OffsetStart int64
+	OffsetEnd   int64
+	Bytes       int64
+	Error       string    `gorm:"size:512"`
+	At          time.Time `gorm:"index"`
+}
+
+// AccessGrant authorizes a temporary user to access a specific logical path
+// or any descendant of it. Non-temporary users are never restricted by grants.
+type AccessGrant struct {
+	ID        uint       `gorm:"primaryKey"`
+	UserID    uint       `gorm:"index;uniqueIndex:idx_grant_user_path"`
+	Path      string     `gorm:"size:1024;index;uniqueIndex:idx_grant_user_path"`
+	GrantedBy uint
+	CreatedAt time.Time
+	ExpiresAt *time.Time
 }
 
 // AuditLog records notable actions for the ops log view.

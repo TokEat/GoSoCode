@@ -45,11 +45,45 @@ func (s *Server) ruleFor(logical string) *models.AccessRule {
 	return best
 }
 
+// temporaryAccessDenied checks whether a temporary user is authorized for the
+// given logical path. Access is allowed when the path itself or any recursive
+// parent directory has an active AccessGrant for this user.
+func (s *Server) temporaryAccessDenied(c *gin.Context, logical string) bool {
+	role, _ := c.Get("role")
+	if role != "temporary" {
+		return false
+	}
+	logical = cleanLogical(logical)
+
+	paths := []string{logical}
+	for p := path.Dir(logical); p != "/" && p != "."; p = path.Dir(p) {
+		paths = append(paths, p)
+	}
+
+	var count int64
+	now := time.Now()
+	s.db.Model(&models.AccessGrant{}).
+		Where("user_id = ? AND path IN ? AND (expires_at IS NULL OR expires_at > ?)", uidOf(c), paths, now).
+		Count(&count)
+	if count > 0 {
+		return false
+	}
+
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":            "未授权访问：请联系管理员授权该路径",
+		"temporary_denied": true,
+	})
+	return true
+}
+
 // accessDenied enforces an AccessRule on the path. When access is denied it
 // writes the 403 response (with protected:true so the UI prompts for the
 // password) and returns true. The password is taken from the `pwd` query
 // parameter or the X-Access-Password header.
 func (s *Server) accessDenied(c *gin.Context, logical string) bool {
+	if s.temporaryAccessDenied(c, logical) {
+		return true
+	}
 	rule := s.ruleFor(logical)
 	if rule == nil {
 		return false

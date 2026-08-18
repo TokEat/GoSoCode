@@ -65,6 +65,14 @@ func NewManager(db *gorm.DB, pool *account.Pool, client *baidu.Client, co *coord
 	return m
 }
 
+// logTransferEvent writes a fine-grained transfer stage event. Best-effort.
+func (m *Manager) logTransferEvent(ev *models.TransferEvent) {
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	m.db.Create(ev)
+}
+
 // auditJanitor trims the audit log to the configured retention cap
 // (SystemConfig.LogMaxEntries, default 500), oldest entries first.
 func (m *Manager) auditJanitor() {
@@ -156,6 +164,12 @@ func (m *Manager) SubmitUploadTo(userID uint, tmpPath, logical, remotePath, remo
 	m.db.Create(&f)
 	m.db.Model(&models.Job{}).Where("id = ?", jobID).Update("file_id", f.ID)
 
+	m.logTransferEvent(&models.TransferEvent{
+		UserID: userID, Kind: "upload", Stage: "init", RefType: "job",
+		RefID: jobID, Name: path.Base(logical), Path: logical,
+		AccountID: acc.ID, Bytes: size,
+	})
+
 	m.queue <- uploadTask{
 		jobID: jobID, userID: userID, tmpPath: tmpPath,
 		remotePath: remotePath, logical: logical, size: size,
@@ -175,6 +189,13 @@ func (m *Manager) runUpload(t uploadTask) {
 	m.db.First(&job, "id = ?", t.jobID)
 	defer m.pool.Release(job.BaiduAccountID)
 	defer os.Remove(t.tmpPath)
+
+	m.logTransferEvent(
+		&models.TransferEvent{
+			UserID: t.userID, Kind: "upload", Stage: "start", RefType: "job",
+			RefID: t.jobID, Name: path.Base(t.logical), Path: t.logical,
+			AccountID: job.BaiduAccountID, Bytes: t.size,
+		})
 
 	m.setStatus(t, "running", 0, "")
 
@@ -244,7 +265,7 @@ func (m *Manager) runUpload(t uploadTask) {
 
 	// Step 2: stream missing chunks (skipped entirely on rapid-upload hit).
 	if returnType != 2 {
-		if err := m.streamChunks(ctx, t, token, uploadID, acctKey, len(blocks), sliceSize); err != nil {
+		if err := m.streamChunks(ctx, t, token, uploadID, acctKey, len(blocks), sliceSize, acc.ID); err != nil {
 			m.fail(t, err)
 			return
 		}
@@ -280,6 +301,12 @@ func (m *Manager) runUpload(t uploadTask) {
 		UserID: t.userID, Kind: "upload", Name: path.Base(t.logical),
 		Path: t.logical, Size: size, At: time.Now(),
 	})
+	m.logTransferEvent(
+		&models.TransferEvent{
+			UserID: t.userID, Kind: "upload", Stage: "finish", RefType: "job",
+			RefID: t.jobID, Name: path.Base(t.logical), Path: t.logical,
+			AccountID: acc.ID, Bytes: size,
+		})
 
 	m.msync.Mark(acc.ID)
 	m.setStatus(t, "done", 100, "")
@@ -357,7 +384,7 @@ func (m *Manager) encryptFileToTemp(srcPath, masterKey string, accID, fileID uin
 
 // streamChunks reads the temp file one sliceSize block at a time and uploads
 // each via superfile2, so peak memory is a single block regardless of file size.
-func (m *Manager) streamChunks(ctx context.Context, t uploadTask, token, uploadID, acctKey string, total int, sliceSize int64) error {
+func (m *Manager) streamChunks(ctx context.Context, t uploadTask, token, uploadID, acctKey string, total int, sliceSize int64, accountID uint) error {
 	f, err := os.Open(t.tmpPath)
 	if err != nil {
 		return err
@@ -382,6 +409,15 @@ func (m *Manager) streamChunks(ctx context.Context, t uploadTask, token, uploadI
 				return err
 			}
 			m.meter.AddUp(int64(n)) // live meter: count bytes as they reach Baidu
+			m.logTransferEvent(
+				&models.TransferEvent{
+					UserID: t.userID, Kind: "upload", Stage: "chunk", RefType: "job",
+					RefID: t.jobID, Name: path.Base(t.logical), Path: t.logical,
+					AccountID: accountID,
+					OffsetStart: int64(partseq) * sliceSize,
+					OffsetEnd:   int64(partseq)*sliceSize + int64(n),
+					Bytes:       int64(n),
+				})
 			seq++
 			m.setStatus(t, "running", seq*100/total, "")
 		}
@@ -414,6 +450,17 @@ func (m *Manager) fail(t uploadTask, err error) {
 	m.db.Model(&models.File{}).
 		Where("logical_path = ? AND owner_user_id = ?", t.logical, t.userID).
 		Update("status", "failed")
+	var job models.Job
+	var accountID uint
+	if m.db.First(&job, "id = ?", t.jobID).Error == nil {
+		accountID = job.BaiduAccountID
+	}
+	m.logTransferEvent(
+		&models.TransferEvent{
+			UserID: t.userID, Kind: "upload", Stage: "failure", RefType: "job",
+			RefID: t.jobID, Name: path.Base(t.logical), Path: t.logical,
+			AccountID: accountID, Bytes: t.size, Error: err.Error(),
+		})
 	m.setStatus(t, "failed", 0, err.Error())
 }
 

@@ -59,6 +59,13 @@ func (s *Server) handleAgentUploadInit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "系统已启用加密存储，当前客户端版本不支持，请更新客户端"})
 		return
 	}
+	logical := cleanLogical(in.Path)
+	if logical == "/" {
+		logical = "/" + in.Name
+	}
+	if s.temporaryAccessDenied(c, logical) {
+		return
+	}
 	// No streamActive cap: agent sessions consume no server memory, so they are
 	// not registered in streamStates either.
 	sess, token, need, rapid, ok := s.openStreamSession(c, in)
@@ -150,6 +157,11 @@ func (s *Server) handleAgentUploadProgress(c *gin.Context) {
 	// response. Count bytes only when the authoritative bitmap actually changes.
 	if changed && in.Bytes > 0 {
 		s.meter.AddUp(in.Bytes)
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "upload", Stage: "progress", RefType: "agent",
+			RefID: sess.ID, Name: sess.Name, Path: sess.LogicalPath,
+			AccountID: sess.BaiduAccountID, Bytes: in.Bytes,
+		})
 	}
 	s.agentJSON(c, http.StatusOK, gin.H{"done_count": sess.DoneCount, "total": sess.TotalSlices})
 }
@@ -169,6 +181,7 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		fallbackName string
 		fallbackSize int64
 		fileID       uint
+		resolvedPath string
 		encFile      *models.File
 		err          error
 	)
@@ -180,6 +193,7 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 			return
 		}
+		resolvedPath = clean
 		if path.Base(clean) == manifest.FileName {
 			c.JSON(http.StatusForbidden, gin.H{"error": "系统文件不可访问"})
 			return
@@ -238,6 +252,7 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 			return
 		}
 		fsID, fallbackName, fallbackSize, fileID = f.FsID, path.Base(f.LogicalPath), f.Size, f.ID
+		resolvedPath = f.LogicalPath
 		ff := f
 		encFile = &ff
 	}
@@ -291,6 +306,11 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		out["enc_key"] = hex.EncodeToString(key)
 		out["enc_iv"] = hex.EncodeToString(iv)
 	}
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uidOf(c), Kind: "download", Stage: "start", RefType: "agent",
+		RefID: strconv.FormatUint(uint64(fileID), 10), Name: name,
+		Path: resolvedPath, AccountID: acc.ID, Bytes: size,
+	})
 	s.agentJSON(c, http.StatusOK, out)
 }
 
@@ -305,14 +325,15 @@ func (s *Server) handleAgentDownloadReport(c *gin.Context) {
 		FileID uint  `json:"file_id"`
 		NodeID uint  `json:"node_id"`
 		Bytes  int64 `json:"bytes" binding:"required,gt=0"`
+		Done   bool  `json:"done"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	nodeID := in.NodeID
+	var f models.File
 	if nodeID == 0 && in.FileID != 0 {
-		var f models.File
 		if err := s.db.First(&f, in.FileID).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
@@ -333,5 +354,27 @@ func (s *Server) handleAgentDownloadReport(c *gin.Context) {
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
 	s.db.Model(&models.BaiduAccount{}).Where("id = ?", nodeID).
 		UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", in.Bytes))
+
+	name := path.Base(f.LogicalPath)
+	if name == "" || name == "." {
+		name = "unknown"
+	}
+	if in.Done {
+		s.db.Create(&models.TransferLog{
+			UserID: uid, Kind: "download", Name: name,
+			Path: f.LogicalPath, Size: in.Bytes, At: time.Now(),
+		})
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "download", Stage: "finish", RefType: "agent",
+			RefID: strconv.FormatUint(uint64(in.FileID), 10), Name: name,
+			Path: f.LogicalPath, AccountID: nodeID, Bytes: in.Bytes,
+		})
+	} else {
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "download", Stage: "progress", RefType: "agent",
+			RefID: strconv.FormatUint(uint64(in.FileID), 10), Name: name,
+			Path: f.LogicalPath, AccountID: nodeID, Bytes: in.Bytes,
+		})
+	}
 	s.agentJSON(c, http.StatusOK, gin.H{"ok": true})
 }

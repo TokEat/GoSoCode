@@ -74,6 +74,7 @@ export default function Users() {
               <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
                 <option value="user">普通用户</option>
                 <option value="admin">管理员</option>
+                <option value="temporary">临时用户</option>
               </select>
             </div>
             <div className="field" style={{ width: 150, margin: 0 }}>
@@ -104,7 +105,9 @@ export default function Users() {
                 <td>{u.id}</td>
                 <td>{u.username}</td>
                 <td><Badge kind={u.sso ? "amber" : "gray"}>{u.sso ? "SSO 用户" : "系统用户"}</Badge></td>
-                <td><Badge kind={u.role === "admin" ? "blue" : "gray"}>{u.role === "admin" ? "管理员" : "普通用户"}</Badge></td>
+                <td><Badge kind={u.role === "admin" ? "blue" : u.role === "temporary" ? "amber" : "gray"}>
+                  {u.role === "admin" ? "管理员" : u.role === "temporary" ? "临时用户" : "普通用户"}
+                </Badge></td>
                 <td>{statusBadge(u.status)}</td>
                 <td>{humanSize(u.bytes_up)} / {humanSize(u.bytes_down)}</td>
                 <td>{fmtTime(u.created_at)}</td>

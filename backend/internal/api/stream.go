@@ -231,6 +231,14 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 	}
 	in.EncKey, in.EncIV = "", "" // browser sessions never carry key material
 
+	logical := cleanLogical(in.Path)
+	if logical == "/" {
+		logical = "/" + in.Name
+	}
+	if s.temporaryAccessDenied(c, logical) {
+		return
+	}
+
 	sess, _, need, rapid, ok := s.openStreamSession(c, in)
 	if !ok {
 		return
@@ -362,6 +370,11 @@ func (s *Server) openStreamSession(c *gin.Context, in streamInitReq) (sess *mode
 	if !rapid && len(missing) > 0 && len(missing) < total {
 		need = missing // Baidu told us a subset is already there
 	}
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: "upload", Stage: "init", RefType: "stream",
+		RefID: sess.ID, Name: in.Name, Path: logical, AccountID: sess.BaiduAccountID,
+		Bytes: in.Size, At: time.Now(),
+	})
 	log.Printf("[stream] init session=%s user=%d path=%s size=%d slices=%d slice_size=%d rapid=%v",
 		sess.ID, uid, logical, in.Size, total, sliceSize, rapid)
 	return sess, token, need, rapid, true
@@ -383,6 +396,9 @@ func (s *Server) handleStreamSlice(c *gin.Context) {
 	var sess models.StreamSession
 	if err := s.db.Where("id = ? AND user_id = ?", id, uid).First(&sess).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
+		return
+	}
+	if s.temporaryAccessDenied(c, sess.LogicalPath) {
 		return
 	}
 	if seq >= sess.TotalSlices {
@@ -517,6 +533,16 @@ func (s *Server) handleStreamSlice(c *gin.Context) {
 	s.db.Model(&models.StreamSession{}).Where("id = ?", sess.ID).Updates(map[string]any{
 		"done_bitmap": sess.DoneBitmap, "done_count": sess.DoneCount, "updated_at": time.Now(),
 	})
+	offsetStart := int64(seq) * sess.SliceSize
+	offsetEnd := offsetStart + int64(len(data))
+	if offsetEnd > sess.Size {
+		offsetEnd = sess.Size
+	}
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: "upload", Stage: "slice", RefType: "stream",
+		RefID: sess.ID, Name: sess.Name, Path: sess.LogicalPath, AccountID: sess.BaiduAccountID,
+		OffsetStart: offsetStart, OffsetEnd: offsetEnd, Bytes: int64(len(data)),
+	})
 	c.JSON(http.StatusOK, gin.H{"seq": seq, "done_count": sess.DoneCount, "total": sess.TotalSlices})
 }
 
@@ -550,6 +576,9 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 	var sess models.StreamSession
 	if err := s.db.Where("id = ? AND user_id = ?", in.SessionID, uid).First(&sess).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
+		return
+	}
+	if s.temporaryAccessDenied(c, sess.LogicalPath) {
 		return
 	}
 	if sess.Completed {
@@ -626,6 +655,11 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 	}
 	if err != nil {
 		log.Printf("[stream] finish create failed session=%s path=%s: %v", sess.ID, sess.LogicalPath, err)
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "upload", Stage: "failure", RefType: "stream",
+			RefID: sess.ID, Name: path.Base(sess.LogicalPath), Path: sess.LogicalPath,
+			AccountID: sess.BaiduAccountID, Bytes: sess.Size, Error: err.Error(),
+		})
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
@@ -663,6 +697,11 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 	s.streamStateDrop(sess.ID)
 	s.msync.Mark(acc.ID)
 
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: "upload", Stage: "finish", RefType: "stream",
+		RefID: sess.ID, Name: path.Base(sess.LogicalPath), Path: sess.LogicalPath,
+		AccountID: sess.BaiduAccountID, Bytes: sess.Size,
+	})
 	log.Printf("[stream] finish ok session=%s path=%s bytes=%d fsid=%d", sess.ID, sess.LogicalPath, sess.Size, fsID)
 	c.JSON(http.StatusOK, gin.H{"file_id": sess.FileID})
 }
@@ -688,6 +727,11 @@ func (s *Server) handleStreamCancel(c *gin.Context) {
 		}
 		s.db.Delete(&models.StreamSession{}, "id = ?", sess.ID)
 		s.streamStateDrop(sess.ID)
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "upload", Stage: "cancel", RefType: "stream",
+			RefID: sess.ID, Name: sess.Name, Path: sess.LogicalPath,
+			AccountID: sess.BaiduAccountID,
+		})
 		log.Printf("[stream] cancel session=%s path=%s", sess.ID, sess.LogicalPath)
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})

@@ -191,6 +191,10 @@ func (s *Server) Router() *gin.Engine {
 		admin.POST("/users/:id/role", s.handleSetUserRole)
 		admin.DELETE("/users/:id", s.handleDeleteUser)
 
+		admin.GET("/access-grants", s.handleListAccessGrants)
+		admin.POST("/access-grants", s.handleCreateAccessGrant)
+		admin.DELETE("/access-grants/:id", s.handleDeleteAccessGrant)
+
 		admin.GET("/baidu-config", s.handleGetBaiduConfig)
 		admin.PUT("/baidu-config", s.handleSaveBaiduConfig)
 		admin.GET("/oauth/url", s.handleOAuthURL)            // begin Baidu authorization
@@ -295,6 +299,11 @@ func (s *Server) failureAudit() gin.HandlerFunc {
 		c.Next()
 		status := c.Writer.Status()
 		if status < 400 {
+			return
+		}
+		// Authentication failures are not recorded in the audit log, but
+		// authorization failures (403) are still kept.
+		if status == http.StatusUnauthorized {
 			return
 		}
 		var uid uint

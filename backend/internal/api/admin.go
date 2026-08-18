@@ -44,7 +44,7 @@ func cleanUserPayload(in adminUserPayload) adminUserPayload {
 }
 
 func validUserRole(role string) bool {
-	return role == "admin" || role == "user"
+	return role == "admin" || role == "user" || role == "temporary"
 }
 
 func validUserStatus(status string) bool {
@@ -193,7 +193,7 @@ func (s *Server) handleSetUserRole(c *gin.Context) {
 		return
 	}
 	var in struct {
-		Role string `json:"role" binding:"required,oneof=admin user"`
+		Role string `json:"role" binding:"required,oneof=admin user temporary"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

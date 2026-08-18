@@ -55,6 +55,10 @@ func (m *Manager) SubmitShareImport(spec ShareImportSpec) (string, error) {
 		m.pool.Release(spec.AccountID)
 		return "", err
 	}
+	m.logTransferEvent(&models.TransferEvent{
+		UserID: spec.UserID, Kind: "import", Stage: "init", RefType: "share",
+		RefID: jobID, Path: spec.Target, AccountID: spec.AccountID,
+	})
 	go m.runShareImport(jobID, spec)
 	return jobID, nil
 }
@@ -65,6 +69,12 @@ func (m *Manager) runShareImport(jobID string, spec ShareImportSpec) {
 
 	fail := func(err error) {
 		log.Printf("[job] share import FAILED job=%s user=%d target=%s: %v", jobID, spec.UserID, spec.Target, err)
+		m.logTransferEvent(
+			&models.TransferEvent{
+				UserID: spec.UserID, Kind: "import", Stage: "failure", RefType: "share",
+				RefID: jobID, Path: spec.Target, AccountID: spec.AccountID,
+				Error: baidu.ShareErrMsg(err),
+			})
 		m.jobStatus(jobID, spec.UserID, spec.Target, "failed", 0, baidu.ShareErrMsg(err))
 	}
 	progress := func(p int) {
@@ -217,6 +227,12 @@ func (m *Manager) runShareImport(jobID string, spec ShareImportSpec) {
 		Path: spec.Target, Size: total, At: time.Now(),
 	})
 	m.msync.Mark(acc.ID)
+	m.logTransferEvent(
+		&models.TransferEvent{
+			UserID: spec.UserID, Kind: "import", Stage: "finish", RefType: "share",
+			RefID: jobID, Path: spec.Target, AccountID: spec.AccountID,
+			Bytes: total,
+		})
 	m.jobStatus(jobID, spec.UserID, spec.Target, "done", 100, "")
 	log.Printf("[job] share import done job=%s user=%d target=%s files=%d bytes=%d encrypt=%v",
 		jobID, spec.UserID, spec.Target, len(files), total, spec.Encrypt)

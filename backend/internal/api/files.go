@@ -508,7 +508,7 @@ func (s *Server) decryptedBody(resp *http.Response, f *models.File) (io.Reader, 
 	return crypto.NewCTRReader(resp.Body, key, iv, off)
 }
 
-func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) {
+func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) int64 {
 	ctx := c.Request.Context()
 	var resp *http.Response
 	filename := fallbackName
@@ -516,13 +516,13 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-			return
+			return 0
 		}
 		metas, merr := s.client.FileMetas(ctx, token, []uint64{fsID})
 		if merr != nil || len(metas) == 0 || metas[0].Dlink == "" {
 			log.Printf("[download] resolve dlink failed %s node=%d: %v", logLabel, acc.ID, merr)
 			c.JSON(http.StatusBadGateway, gin.H{"error": "无法从云端获取下载地址: " + errString(merr)})
-			return
+			return 0
 		}
 		// UUID-named storage: the cloud-side name is an opaque uuid, the real
 		// name lives on the metadata row.
@@ -531,13 +531,13 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 		}
 		if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(acc.ID)); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-			return
+			return 0
 		}
 		resp, err = s.client.OpenDownload(ctx, token, metas[0].Dlink, c.GetHeader("Range"))
 		if err != nil {
 			log.Printf("[download] open upstream failed %s node=%d: %v", logLabel, acc.ID, err)
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-			return
+			return 0
 		}
 		if resp.StatusCode < 400 {
 			break
@@ -548,7 +548,7 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 	}
 	if resp == nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "云端拒绝下载（直链失效），请重试"})
-		return
+		return 0
 	}
 	defer resp.Body.Close()
 
@@ -559,7 +559,7 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 	if err != nil {
 		log.Printf("[download] decrypt init failed %s node=%d: %v", logLabel, acc.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法解密文件"})
-		return
+		return 0
 	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Accept-Ranges", "bytes")
@@ -605,6 +605,7 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 		s.db.Model(&models.BaiduAccount{}).Where("id = ?", acc.ID).
 			UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", n))
 	}
+	return n
 }
 
 func (s *Server) handleRemoteDownload(c *gin.Context) {
@@ -636,7 +637,15 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能下载文件夹"})
 		return
 	}
-	s.proxyDownload(c, acc, token, ref.FsID, path.Base(clean), "path="+clean, s.fileByRemote(acc.ID, remotePath))
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uidOf(c), Kind: "download", Stage: "start", RefType: "file",
+		Name: path.Base(clean), Path: clean, AccountID: acc.ID, Bytes: ref.Size,
+	})
+	n := s.proxyDownload(c, acc, token, ref.FsID, path.Base(clean), "path="+clean, s.fileByRemote(acc.ID, remotePath))
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uidOf(c), Kind: "download", Stage: "finish", RefType: "file",
+		Name: path.Base(clean), Path: clean, AccountID: acc.ID, Bytes: n,
+	})
 }
 
 // handleCheckAccess verifies that the caller may access a protected file or path.
@@ -696,6 +705,15 @@ func (s *Server) handleDownload(c *gin.Context) {
 	if s.accessDenied(c, f.LogicalPath) {
 		return
 	}
+
+	var offsetStart, offsetEnd int64
+	parseRangeHeader(c.GetHeader("Range"), f.Size, &offsetStart, &offsetEnd)
+	s.logTransferEvent(
+		&models.TransferEvent{
+			UserID: uid, Kind: "download", Stage: "start", RefType: "file",
+			RefID: strconv.Itoa(id), Name: path.Base(f.LogicalPath), Path: f.LogicalPath,
+			AccountID: f.BaiduAccountID, OffsetStart: offsetStart, OffsetEnd: offsetEnd, Bytes: offsetEnd - offsetStart,
+		})
 
 	ctx := c.Request.Context()
 	acc, err := s.pool.Get(ctx, f.BaiduAccountID)
@@ -815,6 +833,12 @@ func (s *Server) handleDownload(c *gin.Context) {
 		s.db.Model(&models.BaiduAccount{}).Where("id = ?", acc.ID).
 			UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", n))
 	}
+	s.logTransferEvent(
+		&models.TransferEvent{
+			UserID: uid, Kind: "download", Stage: "finish", RefType: "file",
+			RefID: strconv.Itoa(id), Name: path.Base(f.LogicalPath), Path: f.LogicalPath,
+			AccountID: f.BaiduAccountID, OffsetStart: offsetStart, OffsetEnd: offsetStart + n, Bytes: n,
+		})
 }
 
 // handleDeleteFile removes a file from its storage node and marks it deleted.
@@ -1196,4 +1220,33 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 	}
 	s.audit(c, uid, usernameOf(c), "folder.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "count": len(items)})
+}
+
+// parseRangeHeader parses a simple "bytes=start-end" Range header. If the
+// header is missing or malformed, the full file range [0, size) is returned.
+func parseRangeHeader(h string, size int64, start, end *int64) {
+	*start, *end = 0, size
+	if !strings.HasPrefix(h, "bytes=") {
+		return
+	}
+	h = strings.TrimPrefix(h, "bytes=")
+	parts := strings.SplitN(h, "-", 2)
+	if len(parts) != 2 {
+		return
+	}
+	if s, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err == nil {
+		*start = s
+	}
+	if e, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+		*end = e + 1 // Range end is inclusive
+	}
+	if *end > size {
+		*end = size
+	}
+	if *start < 0 {
+		*start = 0
+	}
+	if *start > *end {
+		*start, *end = 0, size
+	}
 }

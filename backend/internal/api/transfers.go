@@ -27,7 +27,20 @@ func (s *Server) handleLogTransfer(c *gin.Context) {
 	s.db.Create(&models.TransferLog{
 		UserID: uid, Kind: in.Kind, Name: in.Name, Path: in.Path, Size: in.Size, At: time.Now(),
 	})
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: in.Kind, Stage: "finish", RefType: "client",
+		Name: in.Name, Path: in.Path, Bytes: in.Size,
+	})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// logTransferEvent writes a fine-grained transfer stage event. It is best-effort
+// and never fails the request.
+func (s *Server) logTransferEvent(ev *models.TransferEvent) {
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	s.db.Create(ev)
 }
 
 // handleListTransferLog returns one page of the caller's completed-transfer

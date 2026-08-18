@@ -26,16 +26,19 @@ func (s *Server) handleUploadInit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	logical := in.Path
+	if logical == "" {
+		logical = "/" + in.Name
+	}
+	if s.temporaryAccessDenied(c, logical) {
+		return
+	}
 	tmp, err := os.CreateTemp("", "gsc-rsu-*")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	tmp.Close()
-	logical := in.Path
-	if logical == "" {
-		logical = "/" + in.Name
-	}
 	sess := models.UploadSession{
 		ID: uuid.NewString(), UserID: uid, Name: in.Name,
 		LogicalPath: logical, Size: in.Size, Offset: 0, TmpPath: tmp.Name(),
@@ -45,6 +48,10 @@ func (s *Server) handleUploadInit(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: "upload", Stage: "init", RefType: "upload_session",
+		RefID: sess.ID, Name: in.Name, Path: logical, Bytes: in.Size,
+	})
 	c.JSON(http.StatusOK, gin.H{"upload_id": sess.ID, "offset": 0})
 }
 
@@ -87,6 +94,11 @@ func (s *Server) handleUploadChunk(c *gin.Context) {
 		sess.Offset = end
 		s.db.Model(&sess).Update("offset", end)
 	}
+	s.logTransferEvent(&models.TransferEvent{
+		UserID: uid, Kind: "upload", Stage: "chunk", RefType: "upload_session",
+		RefID: sess.ID, Name: sess.Name, Path: sess.LogicalPath,
+		OffsetStart: offset, OffsetEnd: sess.Offset, Bytes: int64(len(data)),
+	})
 	c.JSON(http.StatusOK, gin.H{"offset": sess.Offset})
 }
 
@@ -120,6 +132,9 @@ func (s *Server) handleUploadFinish(c *gin.Context) {
 	}
 	if sess.Size > 0 && sess.Offset != sess.Size {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "upload incomplete"})
+		return
+	}
+	if s.temporaryAccessDenied(c, sess.LogicalPath) {
 		return
 	}
 	acc, remote, remoteUUID, logical, release, err := s.resolveUploadTarget(c, sess.LogicalPath, sess.Offset)
@@ -161,6 +176,10 @@ func (s *Server) handleUploadCancel(c *gin.Context) {
 	if err := s.db.Where("id = ? AND user_id = ?", in.UploadID, uid).First(&sess).Error; err == nil {
 		os.Remove(sess.TmpPath)
 		s.db.Delete(&sess)
+		s.logTransferEvent(&models.TransferEvent{
+			UserID: uid, Kind: "upload", Stage: "cancel", RefType: "upload_session",
+			RefID: sess.ID, Name: sess.Name, Path: sess.LogicalPath,
+		})
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
