@@ -33,6 +33,7 @@ func Open(path string) (*gorm.DB, error) {
 		&models.SystemConfig{},
 		&models.AccessRule{},
 		&models.AccessGrant{},
+		&models.ShareLink{},
 	); err != nil {
 		return nil, err
 	}

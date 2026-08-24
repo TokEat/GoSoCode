@@ -15,6 +15,7 @@ import Logs from "./pages/Logs";
 import Settings from "./pages/Settings";
 import ClientSettings from "./pages/ClientSettings";
 import TransferDrawer from "./TransferDrawer";
+import SharePage from "./pages/SharePage";
 
 export interface JobEvent {
   job_id: string; status: string; progress: number; logical_path: string; error?: string;
@@ -64,6 +65,11 @@ export default function App() {
 
   if (runtime.mode === "client" && !runtime.configured) {
     return providers(<ClientSettings info={runtime} firstRun onSaved={(next) => setRuntime(next)} />);
+  }
+
+  // Public share landing page uses pathname routing, not the hash router.
+  if (window.location.pathname.startsWith("/s/")) {
+    return providers(<SharePage />);
   }
 
   return (

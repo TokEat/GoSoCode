@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, auth, FileItem, Storage } from "../lib/api";
+import { api, auth, FileItem, Storage, downloadZipUrl } from "../lib/api";
 import { Card, statusBadge, useToast, useDialog } from "../ui";
 import { humanSize, fmtTime } from "../lib/format";
 import { useTransfers } from "../transfer";
@@ -258,6 +258,62 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     runProtected(cwd, (pwd) => api.createFolder(normDir(cwd) + name.trim(), pwd), "文件夹已创建");
   }
 
+  async function doCreateShare(item: { id?: number; path: string; is_dir: boolean }) {
+    const choices: { label: string; value: string }[] = [
+      { label: "1 小时", value: "1h" },
+      { label: "1 天", value: "1d" },
+      { label: "7 天", value: "7d" },
+      { label: "永久有效", value: "never" },
+    ];
+    const expiresIn = await dialog.prompt({
+      title: "创建分享链接",
+      message: "请选择链接有效期",
+      defaultValue: "1d",
+      placeholder: "1h / 1d / 7d / never",
+    });
+    if (!expiresIn) return;
+    const valid = choices.some((c) => c.value === expiresIn.trim());
+    if (!valid) {
+      toast("err", "有效期必须是 1h、1d、7d 或 never");
+      return;
+    }
+    try {
+      const res = await api.createShare({ id: item.id, path: item.path, expires_in: expiresIn.trim() });
+      await navigator.clipboard.writeText(res.url);
+      toast("ok", `分享链接已复制到剪贴板（有效期：${choices.find((c) => c.value === expiresIn.trim())?.label}）`);
+    } catch (e: any) {
+      toast("err", e?.message || "创建分享链接失败");
+    }
+  }
+
+  async function doDownloadZip(dirPath: string) {
+    let pwd = pwdFor(dirPath);
+    if (!pwd) {
+      // Try to see if this directory or an ancestor is protected.
+      try {
+        await api.checkAccess(undefined, dirPath, "");
+      } catch (e: any) {
+        if (e?.status === 403 && e?.protected) {
+          const entered = await dialog.prompt({
+            title: "私密目录",
+            message: e?.owner ? `该目录由「${e.owner}」设置了访问密码` : undefined,
+            placeholder: "请输入访问密码",
+          });
+          if (!entered || !entered.trim()) return;
+          pwd = entered.trim();
+          try {
+            await api.checkAccess(undefined, dirPath, pwd);
+            pwds.current.set(fullPath(dirPath), pwd);
+          } catch (err: any) {
+            toast("err", "访问密码错误");
+            return;
+          }
+        }
+      }
+    }
+    window.open(downloadZipUrl(dirPath, pwd), "_blank");
+  }
+
   async function doDownload(item: FileItem) {
     let pwd = pwdFor(item.path);
     if (item.protected && !item.protected_own && !pwd) {
@@ -356,6 +412,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         : [{ label: "设为私密…", onClick: wrap(() => setPassword(fp, false)) }];
       return [
         { label: "下载", onClick: wrap(() => doDownload(it)), disabled: it.status !== "ready" },
+        { label: "创建分享…", onClick: wrap(() => doCreateShare({ id: it.id, path: fp, is_dir: false })) },
         { label: "剪切", onClick: wrap(() => setClip({ path: fp, isDir: false })) },
         { label: "重命名", onClick: wrap(() => doRename(fp)) },
         ...protect,
@@ -376,6 +433,8 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
           : [{ label: "设为私密…", onClick: wrap(() => setPassword(t.path, true)) }];
       return [
         { label: "打开", onClick: wrap(() => enter(t.name)) },
+        { label: "下载目录", onClick: wrap(() => doDownloadZip(t.path)), disabled: atRoot },
+        { label: "创建分享…", onClick: wrap(() => doCreateShare({ path: t.path, is_dir: true })), disabled: atRoot },
         { label: "剪切", onClick: wrap(() => setClip({ path: t.path, isDir: true })), disabled: atRoot },
         { label: "粘贴到此", onClick: wrap(() => paste(t.path)), disabled: !clip || atRoot },
         { label: "重命名", onClick: wrap(() => doRename(t.path)), disabled: atRoot },

@@ -552,7 +552,7 @@ func (s *Server) handleListLogs(c *gin.Context) {
 func renderSystemConfig(sc models.SystemConfig) gin.H {
 	return gin.H{
 		"encrypt_storage": sc.EncryptStorage, "uuid_storage": sc.UUIDStorage, "log_max_entries": sc.LogMaxEntries,
-		"share_import_enabled": sc.ShareImportEnabled,
+		"share_import_enabled": sc.ShareImportEnabled, "share_links_enabled": sc.ShareLinksEnabled,
 		"oidc_enabled": sc.OIDCEnabled, "oidc_issuer": sc.OIDCIssuer,
 		"oidc_client_id": sc.OIDCClientID, "oidc_redirect_url": sc.OIDCRedirectURL,
 		"oidc_has_secret": sc.OIDCClientSecret != "",
@@ -569,11 +569,12 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		UUIDStorage        *bool   `json:"uuid_storage"`
 		LogMaxEntries      *int    `json:"log_max_entries"`
 		ShareImportEnabled *bool   `json:"share_import_enabled"`
-		OIDCEnabled      *bool   `json:"oidc_enabled"`
-		OIDCIssuer       *string `json:"oidc_issuer"`
-		OIDCClientID     *string `json:"oidc_client_id"`
-		OIDCClientSecret *string `json:"oidc_client_secret"`
-		OIDCRedirectURL  *string `json:"oidc_redirect_url"`
+		ShareLinksEnabled  *bool   `json:"share_links_enabled"`
+		OIDCEnabled        *bool   `json:"oidc_enabled"`
+		OIDCIssuer         *string `json:"oidc_issuer"`
+		OIDCClientID       *string `json:"oidc_client_id"`
+		OIDCClientSecret   *string `json:"oidc_client_secret"`
+		OIDCRedirectURL    *string `json:"oidc_redirect_url"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -588,6 +589,9 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 	}
 	if in.ShareImportEnabled != nil {
 		sc.ShareImportEnabled = *in.ShareImportEnabled
+	}
+	if in.ShareLinksEnabled != nil {
+		sc.ShareLinksEnabled = *in.ShareLinksEnabled
 	}
 	if in.LogMaxEntries != nil {
 		if *in.LogMaxEntries < 50 || *in.LogMaxEntries > 100000 {
@@ -633,6 +637,7 @@ func (s *Server) handleSaveSystemConfig(c *gin.Context) {
 		"encrypt_storage="+strconv.FormatBool(sc.EncryptStorage)+" uuid_storage="+strconv.FormatBool(sc.UUIDStorage)+
 			" log_max_entries="+strconv.Itoa(sc.LogMaxEntries)+
 			" share_import_enabled="+strconv.FormatBool(sc.ShareImportEnabled)+
+			" share_links_enabled="+strconv.FormatBool(sc.ShareLinksEnabled)+
 			" oidc_enabled="+strconv.FormatBool(sc.OIDCEnabled))
 	c.JSON(http.StatusOK, renderSystemConfig(sc))
 }

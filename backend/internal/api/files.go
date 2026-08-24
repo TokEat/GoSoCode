@@ -508,7 +508,7 @@ func (s *Server) decryptedBody(resp *http.Response, f *models.File) (io.Reader, 
 	return crypto.NewCTRReader(resp.Body, key, iv, off)
 }
 
-func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) int64 {
+func (s *Server) proxyDownload(c *gin.Context, uid uint, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) int64 {
 	ctx := c.Request.Context()
 	var resp *http.Response
 	filename := fallbackName
@@ -600,7 +600,7 @@ func (s *Server) proxyDownload(c *gin.Context, acc *models.BaiduAccount, token s
 		log.Printf("[download] stream interrupted %s node=%d after %d bytes: %v", logLabel, acc.ID, n, cerr)
 	}
 	if n > 0 {
-		s.db.Model(&models.User{}).Where("id = ?", uidOf(c)).
+		s.db.Model(&models.User{}).Where("id = ?", uid).
 			UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", n))
 		s.db.Model(&models.BaiduAccount{}).Where("id = ?", acc.ID).
 			UpdateColumn("bytes_down", gorm.Expr("bytes_down + ?", n))
@@ -641,7 +641,7 @@ func (s *Server) handleRemoteDownload(c *gin.Context) {
 		UserID: uidOf(c), Kind: "download", Stage: "start", RefType: "file",
 		Name: path.Base(clean), Path: clean, AccountID: acc.ID, Bytes: ref.Size,
 	})
-	n := s.proxyDownload(c, acc, token, ref.FsID, path.Base(clean), "path="+clean, s.fileByRemote(acc.ID, remotePath))
+	n := s.proxyDownload(c, uidOf(c), acc, token, ref.FsID, path.Base(clean), "path="+clean, s.fileByRemote(acc.ID, remotePath))
 	s.logTransferEvent(&models.TransferEvent{
 		UserID: uidOf(c), Kind: "download", Stage: "finish", RefType: "file",
 		Name: path.Base(clean), Path: clean, AccountID: acc.ID, Bytes: n,

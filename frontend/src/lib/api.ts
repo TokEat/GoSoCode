@@ -38,10 +38,26 @@ export interface BaiduConfig {
 }
 export interface SystemConfig {
   encrypt_storage: boolean; uuid_storage: boolean; log_max_entries: number;
-  share_import_enabled: boolean;
+  share_import_enabled: boolean; share_links_enabled: boolean;
   oidc_enabled: boolean; oidc_issuer: string; oidc_client_id: string;
   oidc_redirect_url: string; oidc_has_secret: boolean;
   oidc_client_secret?: string; // write-only: sent on save, never echoed back
+}
+
+export interface ShareLinkResult {
+  token: string;
+  url: string;
+  expires_at: string | null;
+  is_dir: boolean;
+}
+
+export interface ShareInfo {
+  name: string;
+  size: number;
+  is_dir: boolean;
+  expires_at: string | null;
+  protected: boolean;
+  owner?: string;
 }
 // fs_id/share_id/uk arrive as strings: they can exceed Number.MAX_SAFE_INTEGER
 export interface ShareFile { fs_id: string; name: string; size: number; is_dir: boolean; }
@@ -89,6 +105,11 @@ async function req(path: string, opts: RequestInit = {}) {
   if (auth.token) headers.set("Authorization", `Bearer ${auth.token}`);
   const res = await fetch(`/api${path}`, { ...opts, headers });
   if (!res.ok) {
+    if (res.status === 401) {
+      auth.clear();
+      window.location.reload();
+      return new Promise(() => {}) as Promise<Response>;
+    }
     const body = await res.json().catch(() => ({}));
     const err = new Error(body.error || res.statusText) as Error & { status?: number; protected?: boolean; owner?: string };
     err.status = res.status;
@@ -145,6 +166,11 @@ export const api = {
   }, pwd?: string): Promise<{ job_id: string }> =>
     json(`/share/import${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ""}`, "POST", p),
 
+  // system share links
+  createShare: (p: { id?: number; path?: string; expires_in: string }): Promise<ShareLinkResult> =>
+    json("/shares", "POST", p),
+  getShare: (token: string): Promise<ShareInfo> => json(`/shares/${encodeURIComponent(token)}`, "GET"),
+
   // transfers
   listJobs: (): Promise<JobItem[]> => json("/jobs", "GET").then((r) => r.jobs),
   cancelJob: (id: string) => json(`/jobs/${id}/cancel`, "POST"),
@@ -187,6 +213,14 @@ export const api = {
   getSystemConfig: (): Promise<SystemConfig> => json("/admin/system-config", "GET"),
   saveSystemConfig: (cfg: Partial<SystemConfig>): Promise<SystemConfig> => json("/admin/system-config", "PUT", cfg),
 };
+
+export function downloadShareUrl(token: string, pwd?: string): string {
+  return `/api/shares/${encodeURIComponent(token)}/download${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ""}`;
+}
+
+export function downloadZipUrl(path: string, pwd?: string): string {
+  return `/api/files/zip?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`;
+}
 
 export interface ClientInfo {
   mode: "client" | "server";

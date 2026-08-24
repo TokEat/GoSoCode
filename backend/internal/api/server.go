@@ -112,6 +112,10 @@ func (s *Server) Router() *gin.Engine {
 	r.GET("/api/client/download/info", s.handleClientDownloadInfo)
 	r.GET("/api/client/download/:os/:arch", s.handleClientDownload)
 
+	// Public share-link metadata and direct download endpoints.
+	r.GET("/api/shares/:token", s.handleGetShare)
+	r.GET("/api/shares/:token/download", s.handleDownloadShare)
+
 	r.POST("/api/login", s.handleLogin)
 	// Unified OIDC (Keycloak) SSO: status is public so the login page knows
 	// whether to offer it; login/callback are public because the browser is
@@ -154,9 +158,12 @@ func (s *Server) Router() *gin.Engine {
 		auth.POST("/files/delete-folder", s.handleDeleteFolder)
 		auth.GET("/files/remote-download", s.handleRemoteDownload)
 		auth.GET("/files/access-check", s.handleCheckAccess)
+		auth.GET("/files/zip", s.handleZipDownload)
 		auth.GET("/files/:id/download", s.handleDownload)
 		auth.DELETE("/files/:id", s.handleDeleteFile)
 		auth.POST("/files/:id/rename", s.handleRenameFile)
+		// share-link creation
+		auth.POST("/shares", s.handleCreateShare)
 		// share-link import (转存 from external Baidu share links)
 		auth.POST("/share/resolve", s.handleShareResolve)
 		auth.POST("/share/import", s.handleShareImport)
@@ -226,7 +233,16 @@ func (s *Server) Router() *gin.Engine {
 		}
 	}
 	embedded := webui.Handler()
+	serveIndex := func(c *gin.Context) {
+		if diskUI != "" {
+			c.File(filepath.Join(diskUI, "index.html"))
+			return
+		}
+		embedded.ServeHTTP(c.Writer, c.Request)
+	}
 	if diskUI != "" || embedded != nil {
+		// Public share landing pages use pathname routing, not the hash router.
+		r.GET("/s/:token", serveIndex)
 		r.NoRoute(func(c *gin.Context) {
 			p := c.Request.URL.Path
 			if strings.HasPrefix(p, "/api/") || c.Request.Method != http.MethodGet {

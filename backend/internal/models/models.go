@@ -38,13 +38,13 @@ type User struct {
 	PasswordHash string `gorm:"size:255"`
 	// explicit column name: gorm's initialism handling would otherwise map
 	// OIDCSubject to o_id_c_subject and break raw `oidc_subject = ?` lookups
-	OIDCSubject  string `gorm:"column:oidc_subject;size:128;index"` // OIDC `sub` claim; non-empty = account provisioned via SSO
-	Role         string `gorm:"size:16;default:user"`   // admin | user | temporary
-	Status       string `gorm:"size:16;default:active"` // active | disabled
-	BytesUp      int64  // lifetime uploaded bytes (traffic accounting)
-	BytesDown    int64  // lifetime downloaded bytes
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	OIDCSubject string `gorm:"column:oidc_subject;size:128;index"` // OIDC `sub` claim; non-empty = account provisioned via SSO
+	Role        string `gorm:"size:16;default:user"`               // admin | user | temporary
+	Status      string `gorm:"size:16;default:active"`             // active | disabled
+	BytesUp     int64  // lifetime uploaded bytes (traffic accounting)
+	BytesDown   int64  // lifetime downloaded bytes
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // BaiduAppConfig is the singleton (ID=1) holding the platform's Baidu OpenAPI
@@ -62,8 +62,8 @@ type BaiduAppConfig struct {
 // from the admin UI. MasterKey wraps per-file encryption keys and stored access
 // passwords; it is generated once and never leaves the server.
 type SystemConfig struct {
-	ID             uint   `gorm:"primaryKey"`
-	EncryptStorage bool   `gorm:"default:false"` // new uploads are AES-encrypted at rest
+	ID             uint `gorm:"primaryKey"`
+	EncryptStorage bool `gorm:"default:false"` // new uploads are AES-encrypted at rest
 	// explicit column name: gorm's initialism handling would otherwise map
 	// UUIDStorage to u_u_i_d_storage
 	UUIDStorage   bool   `gorm:"column:uuid_storage;default:false"` // new uploads/dirs get UUID names on the netdisk
@@ -71,6 +71,7 @@ type SystemConfig struct {
 	LogMaxEntries int    `gorm:"default:500"`                       // audit log retention cap
 
 	ShareImportEnabled bool `gorm:"default:true"` // allow importing external Baidu share links (转存)
+	ShareLinksEnabled  bool `gorm:"default:true"` // allow users to create public share links
 
 	// Unified OIDC (e.g. Keycloak) single sign-on. When enabled, the login
 	// page offers SSO alongside local password login; both methods coexist.
@@ -112,15 +113,15 @@ type TransferLog struct {
 // TransferEvent records fine-grained per-stage transfer events for uploads,
 // downloads and imports. It is best-effort and must not affect the main flow.
 type TransferEvent struct {
-	ID          uint      `gorm:"primaryKey"`
-	UserID      uint      `gorm:"index"`
-	Kind        string    `gorm:"size:16"`   // upload | download | import
-	Stage       string    `gorm:"size:32"`   // init | start | chunk | slice | progress | finish | cancel | failure
-	RefType     string    `gorm:"size:32"`   // upload_session | stream | job | file | agent | share | client
-	RefID       string    `gorm:"size:128"`
-	Name        string    `gorm:"size:512"`
-	Path        string    `gorm:"size:1024"`
-	AccountID   uint      `gorm:"index"`
+	ID          uint   `gorm:"primaryKey"`
+	UserID      uint   `gorm:"index"`
+	Kind        string `gorm:"size:16"` // upload | download | import
+	Stage       string `gorm:"size:32"` // init | start | chunk | slice | progress | finish | cancel | failure
+	RefType     string `gorm:"size:32"` // upload_session | stream | job | file | agent | share | client
+	RefID       string `gorm:"size:128"`
+	Name        string `gorm:"size:512"`
+	Path        string `gorm:"size:1024"`
+	AccountID   uint   `gorm:"index"`
 	OffsetStart int64
 	OffsetEnd   int64
 	Bytes       int64
@@ -131,9 +132,9 @@ type TransferEvent struct {
 // AccessGrant authorizes a temporary user to access a specific logical path
 // or any descendant of it. Non-temporary users are never restricted by grants.
 type AccessGrant struct {
-	ID        uint       `gorm:"primaryKey"`
-	UserID    uint       `gorm:"index;uniqueIndex:idx_grant_user_path"`
-	Path      string     `gorm:"size:1024;index;uniqueIndex:idx_grant_user_path"`
+	ID        uint   `gorm:"primaryKey"`
+	UserID    uint   `gorm:"index;uniqueIndex:idx_grant_user_path"`
+	Path      string `gorm:"size:1024;index;uniqueIndex:idx_grant_user_path"`
 	GrantedBy uint
 	CreatedAt time.Time
 	ExpiresAt *time.Time
@@ -162,17 +163,17 @@ type File struct {
 	// name always comes from LogicalPath
 	RemoteUUID string `gorm:"column:remote_uuid;size:64;index"`
 	FsID       uint64 `gorm:"index"`
-	Size           int64
-	MD5            string `gorm:"size:64"`
-	Encrypted      bool   `gorm:"default:false"`             // stored bytes are AES-256-CTR ciphertext
-	EncKey         string `gorm:"size:512"`                  // per-file key, wrapped with the master key
-	EncIV          string `gorm:"size:512"`                  // per-file CTR IV, wrapped with the master key
-	IsDir          bool   `gorm:"default:false"`             // metadata-only folder marker
-	Status         string `gorm:"size:32;default:uploading"` // uploading/ready/deleted
-	DeletedBy      string `gorm:"size:64"`                   // e.g. daily_reconcile, user_delete
-	DeletedAt      *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	Size       int64
+	MD5        string `gorm:"size:64"`
+	Encrypted  bool   `gorm:"default:false"`             // stored bytes are AES-256-CTR ciphertext
+	EncKey     string `gorm:"size:512"`                  // per-file key, wrapped with the master key
+	EncIV      string `gorm:"size:512"`                  // per-file CTR IV, wrapped with the master key
+	IsDir      bool   `gorm:"default:false"`             // metadata-only folder marker
+	Status     string `gorm:"size:32;default:uploading"` // uploading/ready/deleted
+	DeletedBy  string `gorm:"size:64"`                   // e.g. daily_reconcile, user_delete
+	DeletedAt  *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // UploadSession backs a resumable (chunked) browser->server upload. The bytes
@@ -226,4 +227,20 @@ type Job struct {
 	Error          string `gorm:"size:512"`
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+// ShareLink is a public, time-limited link to a file or directory in the
+// shared filesystem. It can be revoked independently of the user's JWT.
+type ShareLink struct {
+	ID        uint   `gorm:"primaryKey"`
+	Token     string `gorm:"size:64;uniqueIndex"` // 32 random bytes -> hex
+	FileID    uint   `gorm:"index"`               // non-zero when shared by File row
+	Path      string `gorm:"size:1024;index"`     // target logical path
+	IsDir     bool
+	CreatedBy uint `gorm:"index"`
+	ExpiresAt *time.Time
+	Revoked   bool  `gorm:"default:false"`
+	Downloads int64 `gorm:"default:0"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
