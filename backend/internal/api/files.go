@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -424,6 +425,261 @@ func (s *Server) handleListFiles(c *gin.Context) {
 
 func pathEscape(p string) string {
 	return url.QueryEscape(p)
+}
+
+func likeContains(q string) string {
+	q = strings.ReplaceAll(q, `\`, `\\`)
+	q = strings.ReplaceAll(q, `%`, `\%`)
+	q = strings.ReplaceAll(q, `_`, `\_`)
+	return "%" + q + "%"
+}
+
+func hiddenLogical(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == models.ImportsDirName || seg == manifest.FileName {
+			return true
+		}
+	}
+	return false
+}
+
+func searchScore(logical, q string) int {
+	name := strings.ToLower(path.Base(logical))
+	ql := strings.ToLower(q)
+	switch {
+	case name == ql:
+		return 0
+	case strings.HasPrefix(name, ql):
+		return 1
+	case strings.Contains(name, ql):
+		return 2
+	case strings.Contains(strings.ToLower(logical), ql):
+		return 3
+	default:
+		return 4
+	}
+}
+
+func pathCoveredByGrant(logical string, grants []string) bool {
+	for _, g := range grants {
+		if logical == g || strings.HasPrefix(logical, g+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func coveringRule(logical string, rules []models.AccessRule) *models.AccessRule {
+	var best *models.AccessRule
+	for i := range rules {
+		r := &rules[i]
+		if logical == r.Path || strings.HasPrefix(logical, r.Path+"/") {
+			if best == nil || len(r.Path) > len(best.Path) {
+				best = r
+			}
+		}
+	}
+	return best
+}
+
+// handleSearchFiles finds files and directories by name or logical path in the
+// local metadata table (no Baidu round-trip). Password-protected descendants
+// are omitted for non-owners so names inside a locked folder are not leaked;
+// a match on the protected item itself is returned and flagged.
+func (s *Server) handleSearchFiles(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		c.JSON(http.StatusOK, gin.H{"files": []gin.H{}})
+		return
+	}
+	if len([]rune(q)) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "搜索关键词过长"})
+		return
+	}
+
+	role, _ := c.Get("role")
+	uid := uidOf(c)
+	var grantPaths []string
+	if role == "temporary" {
+		var grants []models.AccessGrant
+		now := time.Now()
+		s.db.Where("user_id = ? AND (expires_at IS NULL OR expires_at > ?)", uid, now).Find(&grants)
+		for _, g := range grants {
+			grantPaths = append(grantPaths, cleanLogical(g.Path))
+		}
+	}
+
+	var rules []models.AccessRule
+	s.db.Find(&rules)
+	pwd := c.Query("pwd")
+	if pwd == "" {
+		pwd = c.GetHeader("X-Access-Password")
+	}
+
+	query := s.db.Model(&models.File{}).
+		Where("status <> ? AND status <> ? AND logical_path LIKE ? ESCAPE ?", "deleted", "uploading", likeContains(q), `\`)
+	if role == "temporary" {
+		if len(grantPaths) == 0 {
+			query = query.Where("1 = 0")
+		} else {
+			var conds []string
+			var args []any
+			for _, g := range grantPaths {
+				conds = append(conds, "(logical_path = ? OR logical_path LIKE ?)")
+				args = append(args, g, g+"/%")
+			}
+			query = query.Where(strings.Join(conds, " OR "), args...)
+		}
+	}
+
+	var rows []models.File
+	if err := query.Order("logical_path asc").Limit(300).Find(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	acctIDs := map[uint]struct{}{}
+	type cand struct {
+		path      string
+		id        uint
+		size      int64
+		isDir     bool
+		created   time.Time
+		modified  time.Time
+		encrypted bool
+		remote    string
+		acctID    uint
+		status    string
+		mount     bool
+	}
+	cands := make([]cand, 0, len(rows)+4)
+	seen := map[string]bool{}
+	for _, f := range rows {
+		p := cleanLogical(f.LogicalPath)
+		if p == "/" || hiddenLogical(p) || seen[p] {
+			continue
+		}
+		seen[p] = true
+		cands = append(cands, cand{
+			path: p, id: f.ID, size: f.Size, isDir: f.IsDir,
+			created: f.CreatedAt, modified: f.UpdatedAt, encrypted: f.Encrypted,
+			remote: f.RemotePath, acctID: f.BaiduAccountID, status: f.Status,
+		})
+		if f.BaiduAccountID != 0 {
+			acctIDs[f.BaiduAccountID] = struct{}{}
+		}
+	}
+
+	nodes, err := s.activeNodes()
+	if err == nil {
+		ql := strings.ToLower(q)
+		for _, n := range nodes {
+			m := mountName(n)
+			p := "/" + m
+			if seen[p] || !strings.Contains(strings.ToLower(m), ql) {
+				continue
+			}
+			if role == "temporary" && !pathCoveredByGrant(p, grantPaths) {
+				continue
+			}
+			seen[p] = true
+			cands = append(cands, cand{
+				path: p, isDir: true, created: n.CreatedAt, modified: n.UpdatedAt,
+				acctID: n.ID, status: "ready", mount: true,
+			})
+			acctIDs[n.ID] = struct{}{}
+		}
+	}
+
+	ids := make([]uint, 0, len(acctIDs))
+	for id := range acctIDs {
+		ids = append(ids, id)
+	}
+	acctByID := map[uint]models.BaiduAccount{}
+	if len(ids) > 0 {
+		var accts []models.BaiduAccount
+		s.db.Where("id IN ?", ids).Find(&accts)
+		for _, a := range accts {
+			acctByID[a.ID] = a
+		}
+	}
+
+	type scored struct {
+		item  gin.H
+		score int
+		path  string
+	}
+	out := make([]scored, 0, len(cands))
+	for _, e := range cands {
+		rule := coveringRule(e.path, rules)
+		protected, own, by := false, false, ""
+		if rule != nil {
+			own = rule.OwnerUserID == uid
+			protected = true
+			by = rule.OwnerName
+			if !own {
+				ok := false
+				if pwd != "" {
+					plain, err := crypto.Unwrap(s.systemConfig().MasterKey, rule.PasswordEnc)
+					ok = err == nil && plain == pwd
+				}
+				if !ok && e.path != rule.Path {
+					// do not leak names inside a locked folder
+					continue
+				}
+			}
+		}
+		owner := ""
+		if acc, ok := acctByID[e.acctID]; ok {
+			owner = acc.Nickname
+			if e.mount {
+				owner = "百度网盘"
+			}
+		}
+		status := e.status
+		if status == "" {
+			status = "ready"
+		}
+		row := gin.H{
+			"id": e.id, "path": e.path, "size": e.size,
+			"status": status, "created_at": e.created, "modified": e.modified,
+			"is_dir": e.isDir, "owner": owner, "node_id": e.acctID,
+		}
+		if e.remote != "" {
+			row["remote_path"] = e.remote
+		}
+		if !e.isDir {
+			row["download_url"] = fmt.Sprintf("/api/files/remote-download?path=%s", pathEscape(e.path))
+		}
+		if e.mount {
+			row["mount"] = true
+		}
+		if e.encrypted {
+			row["encrypted"] = true
+		}
+		if protected {
+			row["protected"] = true
+			row["protected_own"] = own
+			row["protected_by"] = by
+		}
+		out = append(out, scored{item: row, score: searchScore(e.path, q), path: e.path})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].score != out[j].score {
+			return out[i].score < out[j].score
+		}
+		return out[i].path < out[j].path
+	})
+	const maxResults = 80
+	files := make([]gin.H, 0, len(out))
+	for i, it := range out {
+		if i >= maxResults {
+			break
+		}
+		files = append(files, it.item)
+	}
+	c.JSON(http.StatusOK, gin.H{"files": files})
 }
 
 func (s *Server) remoteItemByPath(ctx *gin.Context, acc *models.BaiduAccount, token, remotePath string) (*baiduListRef, error) {

@@ -136,6 +136,7 @@ func (s *Server) Router() *gin.Engine {
 		// files
 		auth.GET("/storage", s.handleStorage)
 		auth.GET("/files", s.handleListFiles)
+		auth.GET("/files/search", s.handleSearchFiles)
 		auth.POST("/files/upload/init", s.handleUploadInit)
 		auth.PUT("/files/upload/chunk", s.handleUploadChunk)
 		auth.GET("/files/upload/status", s.handleUploadStatus)

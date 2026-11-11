@@ -136,6 +136,8 @@ export const api = {
   storage: (): Promise<Storage> => json("/storage", "GET"),
   listFiles: (path = "/", pwd?: string): Promise<FileItem[]> =>
     json(`/files?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.files),
+  searchFiles: (q: string, pwd?: string): Promise<FileItem[]> =>
+    json(`/files/search?q=${encodeURIComponent(q)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.files || []),
   createFolder: (path: string, pwd?: string) => json(`/files/folder${pq(pwd)}`, "POST", { path }),
   move: (src: string, dst: string, pwd?: string) => json(`/files/move${pq(pwd)}`, "POST", { src, dst }),
   deletePath: (path: string, pwd?: string) => json(`/files/delete-path${pq(pwd)}`, "POST", { path }),
