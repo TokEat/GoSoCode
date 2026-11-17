@@ -7,37 +7,15 @@ import { useTransfers } from "../transfer";
 import { JobEvent } from "../App";
 import LocalFilePicker from "../LocalFilePicker";
 import { LocalEntry } from "../lib/api";
+import FileSearch from "../components/FileSearch";
+import { PathNotePanel, NoteFlag } from "../components/PathNotePanel";
+import { normDir, fullPath, parentDir, baseName, searchLocateTarget } from "../lib/searchLocate";
 
 // ---- path helpers ----------------------------------------------------------
 
-function normDir(d: string): string {
-  let s = d.startsWith("/") ? d : "/" + d;
-  if (!s.endsWith("/")) s += "/";
-  return s.replace(/\/+/g, "/");
-}
-function fullPath(p: string): string {
-  return p.startsWith("/") ? p : "/" + p;
-}
-function parentDir(p: string): string {
-  const fp = fullPath(p).replace(/\/+$/, "");
-  const i = fp.lastIndexOf("/");
-  return i <= 0 ? "/" : fp.slice(0, i) + "/";
-}
-function baseName(p: string): string {
-  const fp = fullPath(p).replace(/\/+$/, "");
-  return fp.slice(fp.lastIndexOf("/") + 1);
-}
 function extOf(name: string): string {
   const i = name.lastIndexOf(".");
   return i > 0 ? name.slice(i + 1).toUpperCase() + " 文件" : "文件";
-}
-
-function highlightName(text: string, q: string) {
-  const ql = q.trim();
-  if (!ql) return text;
-  const i = text.toLowerCase().indexOf(ql.toLowerCase());
-  if (i < 0) return text;
-  return <>{text.slice(0, i)}<mark className="search-mark">{text.slice(i, i + ql.length)}</mark>{text.slice(i + ql.length)}</>;
 }
 
 interface FolderRow { name: string; count: number; size: number; modified: string; protected?: boolean; protectedOwn?: boolean; protectedBy?: string; }
@@ -109,15 +87,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [clip, setClip] = useState<Clip | null>(null);
   const [localPicker, setLocalPicker] = useState(false);
-  const [searchQ, setSearchQ] = useState("");
-  const [searchHits, setSearchHits] = useState<FileItem[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchIdx, setSearchIdx] = useState(0);
   const [locatePath, setLocatePath] = useState("");
+  const [noteTarget, setNoteTarget] = useState<{ path: string; isDir: boolean; name: string } | null>(null);
+  const [noteFlags, setNoteFlags] = useState<Set<string>>(new Set());
   const fileRef = useRef<HTMLInputElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
-  const searchBoxRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
   const dialog = useDialog();
   const transfers = useTransfers();
@@ -144,9 +117,20 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     return undefined;
   }
 
+  const refreshNotes = async (dir = cwd) => {
+    const key = fullPath(dir).replace(/\/+$/, "") || "/";
+    try {
+      const paths = await api.noteIndex(key, pwdFor(dir));
+      setNoteFlags(new Set(paths));
+    } catch {
+      setNoteFlags(new Set());
+    }
+  };
+
   const refresh = async () => {
     try {
       setFiles(await api.listFiles(cwd, pwdFor(cwd)));
+      void refreshNotes(cwd);
     } catch (e: any) {
       if (!e?.protected) return;
       const pwd = await dialog.prompt({
@@ -160,6 +144,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
           const list = await api.listFiles(cwd, pwd.trim());
           pwds.current.set(key, pwd.trim());
           setFiles(list);
+          void refreshNotes(cwd);
           return;
         } catch (e2: any) {
           toast("err", e2.message || "访问密码错误");
@@ -175,30 +160,6 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   useEffect(() => { refresh(); refreshStorage(); }, [doneCount]);
 
   useEffect(() => {
-    const q = searchQ.trim();
-    if (!q) {
-      setSearchHits([]);
-      setSearching(false);
-      return;
-    }
-    setSearching(true);
-    const t = setTimeout(() => {
-      api.searchFiles(q)
-        .then((rows) => {
-          setSearchHits(rows);
-          setSearchIdx(0);
-          setSearchOpen(true);
-        })
-        .catch((e: any) => {
-          toast("err", e.message || "搜索失败");
-          setSearchHits([]);
-        })
-        .finally(() => setSearching(false));
-    }, 250);
-    return () => clearTimeout(t);
-  }, [searchQ]);
-
-  useEffect(() => {
     if (!locatePath) return;
     const el = document.querySelector("tr.locate") as HTMLElement | null;
     el?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -206,48 +167,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
     return () => clearTimeout(t);
   }, [locatePath, files]);
 
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
-        setSearchOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, []);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      const typing = tag === "INPUT" || tag === "TEXTAREA";
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        searchRef.current?.focus();
-        setSearchOpen(!!searchQ.trim());
-        return;
-      }
-      if (!typing && e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        searchRef.current?.focus();
-        setSearchOpen(!!searchQ.trim());
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [searchQ]);
-
   function locate(item: FileItem) {
-    const fp = fullPath(item.path);
-    setSearchOpen(false);
-    setSearchQ("");
-    setSearchHits([]);
-    if (item.is_dir) {
-      setLocatePath("");
-      setCwd(normDir(fp));
-    } else {
-      setLocatePath(fp);
-      setCwd(parentDir(fp));
-    }
+    const t = searchLocateTarget(item);
+    setCwd(t.cwd);
+    setLocatePath(t.highlightPath);
   }
 
   const { folderRows, here } = useMemo(() => buildListing(files, cwd), [files, cwd]);
@@ -507,6 +430,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         { label: "创建分享…", onClick: wrap(() => doCreateShare({ id: it.id, path: fp, is_dir: false })) },
         { label: "剪切", onClick: wrap(() => setClip({ path: fp, isDir: false })) },
         { label: "重命名", onClick: wrap(() => doRename(fp)) },
+        { label: "备注", onClick: wrap(() => setNoteTarget({ path: fp, isDir: false, name: baseName(it.path) })) },
         ...protect,
         "div",
         { label: "删除", danger: true, onClick: wrap(() => askDelete(baseName(it.path), it.path, (pwd) => api.deletePath(it.path, pwd), "已删除")) },
@@ -530,6 +454,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         { label: "剪切", onClick: wrap(() => setClip({ path: t.path, isDir: true })), disabled: atRoot },
         { label: "粘贴到此", onClick: wrap(() => paste(t.path)), disabled: !clip || atRoot },
         { label: "重命名", onClick: wrap(() => doRename(t.path)), disabled: atRoot },
+        { label: "备注", onClick: wrap(() => setNoteTarget({ path: t.path, isDir: true, name: t.name })), disabled: atRoot },
         ...protect,
         "div",
         { label: "删除", danger: true, disabled: atRoot, onClick: wrap(() => askDelete(`文件夹 ${t.name} 及其内容`, t.path, (pwd) => api.deleteFolder(t.path, pwd), "已删除")) },
@@ -540,6 +465,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
       { label: "上传文件", onClick: wrap(pickFile), disabled: cwd === "/" },
       { label: "分享转存…", onClick: wrap(gotoShareImport), disabled: cwd === "/" },
       { label: clip ? `粘贴 “${baseName(clip.path)}”` : "粘贴", onClick: wrap(() => paste(cwd)), disabled: !clip || cwd === "/" },
+      { label: "当前目录备注", onClick: wrap(() => setNoteTarget({ path: fullPath(cwd).replace(/\/+$/, "") || "/", isDir: true, name: baseName(cwd) || cwd })), disabled: cwd === "/" },
       "div",
       { label: "刷新", onClick: wrap(() => { refresh(); refreshStorage(); }) },
     ];
@@ -548,6 +474,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const empty = folderRows.length === 0 && here.length === 0;
   const usedPct = storage && storage.total > 0 ? Math.round((storage.used / storage.total) * 100) : 0;
   const cutPath = clip?.path;
+  const cwdKey = fullPath(cwd).replace(/\/+$/, "") || "/";
 
   return (
     <Card
@@ -585,64 +512,13 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
             </span>
           ))}
         </div>
-        <div className="file-search" ref={searchBoxRef}>
-          <input
-            ref={searchRef}
-            value={searchQ}
-            onChange={(e) => { setSearchQ(e.target.value); setSearchOpen(true); }}
-            onFocus={() => { if (searchQ.trim()) setSearchOpen(true); }}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                setSearchOpen(false);
-                searchRef.current?.blur();
-                return;
-              }
-              if (!searchOpen || searchHits.length === 0) return;
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setSearchIdx((i) => (i + 1) % searchHits.length);
-              } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setSearchIdx((i) => (i - 1 + searchHits.length) % searchHits.length);
-              } else if (e.key === "Enter") {
-                e.preventDefault();
-                const hit = searchHits[searchIdx];
-                if (hit) locate(hit);
-              }
-            }}
-            placeholder="搜索文件和目录"
-            aria-label="全局搜索"
-          />
-          {searchOpen && searchQ.trim() && (
-            <div className="file-search-menu">
-              {searching && searchHits.length === 0 && <div className="file-search-empty">搜索中…</div>}
-              {!searching && searchHits.length === 0 && <div className="file-search-empty">未找到匹配的文件或目录</div>}
-              {searchHits.map((h, i) => {
-                const name = baseName(h.path);
-                const dir = parentDir(h.path);
-                return (
-                  <div
-                    key={(h.is_dir ? "d:" : "f:") + h.path + ":" + h.id}
-                    className={`file-search-item${i === searchIdx ? " active" : ""}`}
-                    onMouseEnter={() => setSearchIdx(i)}
-                    onMouseDown={(e) => { e.preventDefault(); locate(h); }}
-                  >
-                    {h.is_dir ? <FolderIcon /> : <FileIcon />}
-                    <div className="file-search-meta">
-                      <div className="file-search-name">
-                        {highlightName(name, searchQ)}
-                        {h.protected && <span>🔒</span>}
-                        {h.encrypted && <span title="加密存储">🛡️</span>}
-                      </div>
-                      <div className="file-search-path">{dir === "/" ? "根目录" : dir}</div>
-                    </div>
-                    <span className="file-search-kind">{h.is_dir ? (h.mount ? "挂载" : "文件夹") : "文件"}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+        <FileSearch onLocate={locate} />
+        {cwd !== "/" && (
+          <button className="btn ghost sm" title="当前目录备注"
+            onClick={() => setNoteTarget({ path: cwdKey, isDir: true, name: baseName(cwd) || cwd })}>
+            备注{noteFlags.has(cwdKey) && <NoteFlag />}
+          </button>
+        )}
         <div className="crumb-count">
           {clip && <span className="clip-hint">已剪切: {baseName(clip.path)} · <span className="link" onClick={() => paste(cwd)}>粘贴到此</span></span>}
           <span>{folderRows.length} 个文件夹 · {here.length} 个文件</span>
@@ -661,7 +537,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                 <tr key={"d:" + d.name} className="row-folder" style={cutPath === dp ? { opacity: 0.5 } : undefined}
                   onDoubleClick={() => enter(d.name)}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
-                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}</div></td>
+                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}{noteFlags.has(dp) && <NoteFlag />}</div></td>
                   {/* the listing only covers direct children, so a folder's
                       own size is unknown — show a dash instead of "0 B" */}
                   <td className="muted">{d.count > 0 ? humanSize(d.size) : "—"}</td>
@@ -678,7 +554,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
                   className={locatePath === fullPath(f.path) ? "locate" : undefined}
                   style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
-                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>} {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>}{noteFlags.has(fullPath(f.path)) && <NoteFlag />} {f.status !== "ready" && statusBadge(f.status)}</div></td>
                   <td className="muted">{humanSize(f.size)}</td>
                   <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
                   <td className="muted">{extOf(name)}</td>
@@ -712,6 +588,15 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
             )}
           </div>
         </>,
+        document.body,
+      )}
+      {noteTarget && createPortal(
+        <PathNotePanel
+          target={noteTarget}
+          pwd={pwdFor(noteTarget.path)}
+          onClose={() => setNoteTarget(null)}
+          onChanged={() => { void refreshNotes(cwd); }}
+        />,
         document.body,
       )}
     </Card>

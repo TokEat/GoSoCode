@@ -7,6 +7,8 @@ export interface FileItem {
   encrypted?: boolean;
 }
 export interface ProtectInfo { protected: boolean; owner?: string; is_dir?: boolean; password?: string; }
+export interface PathNote { path: string; is_dir: boolean; body: string; exists: boolean; updated?: string; updated_by?: number; }
+export interface NoteImageUpload { id: number; url: string; name: string; mime: string; size: number; }
 export interface Storage { total: number; used: number; free: number; }
 export interface TransferLogItem { ID: number; Kind: string; Name: string; Path: string; Size: number; At: string; }
 export interface JobItem { ID: string; Type: string; Status: string; Progress: number; Error: string; CreatedAt: string; }
@@ -144,6 +146,24 @@ export const api = {
   deleteFolder: (path: string, pwd?: string) => json(`/files/delete-folder${pq(pwd)}`, "POST", { path }),
   deleteFile: (id: number, pwd?: string) => json(`/files/${id}${pq(pwd)}`, "DELETE"),
   renameFile: (id: number, path: string, pwd?: string) => json(`/files/${id}/rename${pq(pwd)}`, "POST", { path }),
+
+  // path notes (备注)
+  getNote: (path: string, pwd?: string): Promise<PathNote> =>
+    json(`/notes?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET"),
+  putNote: (path: string, isDir: boolean, body: string, pwd?: string): Promise<PathNote & { ok: boolean }> =>
+    json(`/notes${pq(pwd)}`, "PUT", { path, is_dir: isDir, body }),
+  deleteNote: (path: string, pwd?: string) =>
+    json(`/notes?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "DELETE"),
+  noteIndex: (dir: string, pwd?: string): Promise<string[]> =>
+    json(`/notes/index?dir=${encodeURIComponent(dir)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.paths || []),
+  uploadNoteImage: (path: string, file: File, pwd?: string): Promise<NoteImageUpload> => {
+    const fd = new FormData();
+    fd.append("path", path);
+    fd.append("file", file);
+    return req(`/notes/images${pq(pwd)}`, { method: "POST", body: fd }).then((r) => r.json());
+  },
+  noteImageBlob: (id: number, pwd?: string): Promise<Blob> =>
+    req(`/notes/images/${id}${pq(pwd)}`).then((r) => r.blob()),
 
   // password protection (私密)
   getProtect: (path: string): Promise<ProtectInfo> => json(`/files/protect?path=${encodeURIComponent(path)}`, "GET"),

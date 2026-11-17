@@ -60,6 +60,15 @@ func New(appKey, secret string) *Client {
 	}
 }
 
+// SetHTTPClient replaces the underlying HTTP client. Tests use this to stub
+// OpenAPI responses without touching the production endpoints.
+func (c *Client) SetHTTPClient(h *http.Client) {
+	if h == nil {
+		return
+	}
+	c.http = h
+}
+
 // SetCreds updates the OAuth app credentials at runtime (called on startup and
 // whenever the admin saves the Baidu config).
 func (c *Client) SetCreds(appKey, secret string) {
@@ -580,6 +589,55 @@ func (c *Client) ListDir(ctx context.Context, token, remoteDir string) ([]ListIt
 			return all, nil
 		}
 	}
+}
+
+// Search finds files and directories whose names contain key, recursively
+// under remoteDir. Results are paged (200 per page, capped at 10 pages).
+func (c *Client) Search(ctx context.Context, token, remoteDir, key string) ([]ListItem, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, nil
+	}
+	if remoteDir == "" {
+		remoteDir = "/"
+	}
+	const pageSize = 200
+	const maxPages = 10
+	var all []ListItem
+	for page := 1; page <= maxPages; page++ {
+		q := url.Values{}
+		q.Set("method", "search")
+		q.Set("access_token", token)
+		q.Set("key", key)
+		q.Set("dir", remoteDir)
+		q.Set("recursion", "1")
+		q.Set("web", "1")
+		q.Set("page", strconv.Itoa(page))
+		q.Set("num", strconv.Itoa(pageSize))
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiFile+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var out listResp
+		derr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if derr != nil {
+			return nil, derr
+		}
+		if err := out.err(); err != nil {
+			return nil, err
+		}
+		all = append(all, out.List...)
+		if len(out.List) < pageSize {
+			return all, nil
+		}
+	}
+	return all, nil
 }
 
 // ---- Download: filemetas -> dlink ---------------------------------------

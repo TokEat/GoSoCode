@@ -32,6 +32,7 @@ type Config struct {
 	WebUIDir        string // if the dir exists, serve the built web UI from it
 	ClientDir       string // if set, serves CLI client binaries at /api/client/download/<os>/<arch>
 	KeysDir         string // local backup copies of per-node encryption keys (second store besides the DB)
+	NotesDir        string // local image files for path notes (next to the DB by default)
 
 	DailyReconcile bool   // run a full netdisk-to-DB reconciliation every day at 00:00
 	Timezone       string // IANA timezone for daily schedule; empty = server local time
@@ -67,6 +68,7 @@ func Load() *Config {
 		WebUIDir:        env("GSC_WEBUI", "webui"),
 		ClientDir:       env("GSC_CLIENT_DIR", ""),
 		KeysDir:         env("GSC_KEYS_DIR", filepath.Join(filepath.Dir(env("GSC_DB", "gosocode.db")), "gsc-keys")),
+		NotesDir:        env("GSC_NOTES_DIR", filepath.Join(filepath.Dir(env("GSC_DB", "gosocode.db")), "gsc-notes")),
 
 		DailyReconcile: env("GSC_DAILY_RECONCILE", "1") != "0",
 		Timezone:       env("GSC_TIMEZONE", ""),

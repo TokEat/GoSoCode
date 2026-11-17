@@ -545,3 +545,144 @@ tr.row-folder:hover { background: rgba(99, 102, 241, 0.06); }
   .local-picker-workspace { grid-template-columns: 132px minmax(0, 1fr); }
   .drive-shortcut-name { font-size: 11px; }
 }
+
+/* ---- path notes (file / folder remarks) ---- */
+.note-flag {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--primary); opacity: 0.85; flex-shrink: 0;
+}
+.note-overlay {
+  position: fixed; inset: 0; z-index: 860;
+  background: rgba(15, 23, 42, 0.18);
+}
+.note-drawer {
+  position: fixed; top: 14px; right: 14px; bottom: 14px;
+  width: min(440px, calc(100vw - 28px));
+  z-index: 870;
+  display: flex; flex-direction: column;
+  background: var(--panel-strong);
+  backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+  overflow: hidden;
+}
+.note-drawer.dragging { outline: 2px dashed rgba(99, 102, 241, 0.55); outline-offset: -3px; }
+.note-head {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.note-head-icon {
+  width: 36px; height: 36px; border-radius: 12px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff;
+  background: linear-gradient(135deg, var(--primary), var(--primary-2));
+  box-shadow: 0 6px 14px -6px rgba(99, 102, 241, 0.55);
+}
+.note-head-meta { flex: 1; min-width: 0; }
+.note-title {
+  font-weight: 700; font-size: 15px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.note-path {
+  margin-top: 2px; font-size: 12px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.note-close { flex-shrink: 0; }
+.note-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 32px 24px; text-align: center; color: var(--muted);
+}
+.note-empty svg { color: var(--primary); opacity: 0.7; margin-bottom: 6px; }
+.note-empty p { margin: 0; color: var(--text); font-weight: 600; font-size: 15px; }
+.note-empty span { font-size: 13px; line-height: 1.6; max-width: 260px; }
+.note-empty .btn { margin-top: 10px; }
+.note-edit { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+.note-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+}
+.note-hint { font-size: 12px; color: var(--muted); }
+.note-editor {
+  flex: 1; width: 100%; min-height: 0; resize: none; border: 0;
+  padding: 16px 18px 20px; background: transparent;
+  font: 14.5px/1.7 -apple-system, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text); outline: none;
+}
+.note-drop {
+  position: absolute; inset: 48px 12px 12px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+  background: rgba(238, 242, 255, 0.86);
+  color: var(--primary); font-weight: 600;
+  pointer-events: none;
+}
+.note-body {
+  flex: 1; overflow: auto; padding: 8px 22px 28px;
+  font-size: 14.5px; line-height: 1.75; color: var(--text);
+}
+.note-body h2, .note-body h3, .note-body h4 {
+  margin: 1.15em 0 0.45em; line-height: 1.35; font-weight: 700; letter-spacing: -0.01em;
+}
+.note-body h2 { font-size: 20px; }
+.note-body h3 { font-size: 16.5px; }
+.note-body h4 { font-size: 14.5px; color: #334155; }
+.note-body p { margin: 0.65em 0; white-space: pre-wrap; }
+.note-body ul, .note-body ol { margin: 0.5em 0 0.7em; padding-left: 1.25em; }
+.note-body li { margin: 0.2em 0; }
+.note-body blockquote {
+  margin: 0.8em 0; padding: 8px 14px;
+  border-left: 3px solid rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.06);
+  border-radius: 0 12px 12px 0;
+  color: #334155;
+}
+.note-body code {
+  font-family: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-size: 12.5px; padding: 1px 6px; border-radius: 6px;
+  background: rgba(15, 23, 42, 0.06);
+}
+.note-body a { color: var(--primary); text-decoration: none; }
+.note-body a:hover { text-decoration: underline; }
+.note-img-btn {
+  display: block; width: 100%; margin: 12px 0; padding: 0;
+  border: 0; background: none; cursor: zoom-in; text-align: left;
+}
+.note-img {
+  display: block; max-width: 100%; height: auto;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px -12px rgba(15, 23, 42, 0.28);
+  background: #fff;
+}
+.note-img-ph {
+  height: 120px; margin: 12px 0; border-radius: 14px;
+  background: linear-gradient(90deg, rgba(148,163,184,.16), rgba(148,163,184,.08), rgba(148,163,184,.16));
+  background-size: 200% 100%; animation: note-shimmer 1.2s ease infinite;
+}
+@keyframes note-shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+.note-img-missing { color: var(--muted); font-size: 12.5px; }
+.note-error {
+  margin: 0 16px 8px; padding: 8px 12px; border-radius: 10px;
+  background: rgba(254, 242, 242, 0.9); color: var(--red); font-size: 12.5px;
+}
+.note-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 14px 12px; border-top: 1px solid var(--border);
+}
+.note-status { display: flex; gap: 10px; font-size: 12px; color: var(--muted); min-width: 0; }
+.note-status em { font-style: normal; }
+.note-lightbox {
+  position: fixed; inset: 0; z-index: 1100;
+  background: rgba(15, 23, 42, 0.72);
+  display: flex; align-items: center; justify-content: center; padding: 28px;
+  cursor: zoom-out;
+}
+.note-lightbox img {
+  max-width: 100%; max-height: 100%;
+  border-radius: 16px; box-shadow: 0 24px 60px -20px rgba(0,0,0,0.5);
+}
+@media (max-width: 700px) {
+  .note-drawer { top: 8px; right: 8px; bottom: 8px; left: 8px; width: auto; }
+  .note-hint { display: none; }
+}

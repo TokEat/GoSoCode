@@ -244,3 +244,29 @@ type ShareLink struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// PathNote is a user-authored remark attached to a file or directory,
+// keyed by logical path. The body is Markdown; images live as NoteImage
+// rows and are referenced from the body.
+type PathNote struct {
+	ID        uint   `gorm:"primaryKey"`
+	Path      string `gorm:"size:1024;uniqueIndex"`
+	IsDir     bool
+	Body      string `gorm:"type:text"`
+	UpdatedBy uint   `gorm:"index"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// NoteImage is an image uploaded into a path note, stored on the local disk
+// under the notes directory and served through the API (never as a public file).
+type NoteImage struct {
+	ID        uint   `gorm:"primaryKey"`
+	NotePath  string `gorm:"size:1024;index"`
+	Name      string `gorm:"size:255"`
+	MIME      string `gorm:"size:64"`
+	Size      int64
+	DiskName  string `gorm:"size:80;uniqueIndex"`
+	CreatedBy uint
+	CreatedAt time.Time
+}

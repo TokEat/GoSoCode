@@ -482,9 +482,161 @@ func coveringRule(logical string, rules []models.AccessRule) *models.AccessRule 
 	return best
 }
 
-// handleSearchFiles finds files and directories by name or logical path in the
-// local metadata table (no Baidu round-trip). Password-protected descendants
-// are omitted for non-owners so names inside a locked folder are not leaked;
+func queryTokens(q string) []string {
+	return strings.Fields(strings.TrimSpace(q))
+}
+
+// matchQuery is a case-insensitive substring ("fuzzy") match: every
+// whitespace-separated token must appear in the logical path (file or directory names).
+func matchQuery(logical, q string) bool {
+	toks := queryTokens(q)
+	if len(toks) == 0 {
+		return false
+	}
+	target := strings.ToLower(logical)
+	for _, tok := range toks {
+		if !strings.Contains(target, strings.ToLower(tok)) {
+			return false
+		}
+	}
+	return true
+}
+
+func primarySearchKey(q string) string {
+	toks := queryTokens(q)
+	if len(toks) == 0 {
+		return strings.TrimSpace(q)
+	}
+	best := toks[0]
+	for _, t := range toks[1:] {
+		if len([]rune(t)) > len([]rune(best)) {
+			best = t
+		}
+	}
+	return best
+}
+
+// remoteToLogical maps a netdisk path under a node's mount root to the
+// user-facing logical path ("/<mount>/..."). Empty means the remote path
+// is outside this mount.
+func remoteToLogical(mount, root, remotePath string) string {
+	remotePath = path.Clean(remotePath)
+	root = path.Clean(root)
+	if root == "/" {
+		if remotePath == "/" {
+			return mount
+		}
+		return path.Clean(mount + remotePath)
+	}
+	if remotePath == root {
+		return mount
+	}
+	if strings.HasPrefix(remotePath, root+"/") {
+		return path.Clean(mount + strings.TrimPrefix(remotePath, root))
+	}
+	return ""
+}
+
+type searchCand struct {
+	path      string
+	id        uint
+	size      int64
+	isDir     bool
+	created   time.Time
+	modified  time.Time
+	encrypted bool
+	remote    string
+	acctID    uint
+	status    string
+	mount     bool
+	fsID      uint64
+}
+
+// mergeRemoteSearch runs a recursive Baidu search on one node and adds hits
+// that are not already present. Failures are logged and skipped so a single
+// node outage does not empty the whole result set.
+func (s *Server) mergeRemoteSearch(c *gin.Context, n models.BaiduAccount, q string, temporary bool, grantPaths []string, seen map[string]bool, add func(searchCand)) {
+	if s.client == nil || s.pool == nil || s.coord == nil {
+		return
+	}
+	ctx := c.Request.Context()
+	token, err := s.pool.Token(ctx, &n)
+	if err != nil {
+		log.Printf("search: token for node %d: %v", n.ID, err)
+		return
+	}
+	if err := s.coord.Limiter.Wait(ctx, "acct:"+itoa(n.ID)); err != nil {
+		log.Printf("search: limiter for node %d: %v", n.ID, err)
+		return
+	}
+	items, err := s.client.Search(ctx, token, nodeMountPath(n), primarySearchKey(q))
+	if err != nil {
+		log.Printf("search: baidu node %d: %v", n.ID, err)
+		return
+	}
+	remotePaths := make([]string, 0, len(items))
+	for _, it := range items {
+		remotePaths = append(remotePaths, it.Path)
+	}
+	rowByRemote := map[string]models.File{}
+	if len(remotePaths) > 0 {
+		var mapped []models.File
+		s.db.Where("baidu_account_id = ? AND status <> ? AND remote_path IN ?", n.ID, "deleted", remotePaths).
+			Order("id asc").Find(&mapped)
+		for _, r := range mapped {
+			rowByRemote[r.RemotePath] = r
+		}
+	}
+	mount := "/" + mountName(n)
+	root := nodeMountPath(n)
+	for _, it := range items {
+		name := it.ServerFilename
+		if name == "" {
+			name = path.Base(it.Path)
+		}
+		if name == manifest.FileName || name == models.ImportsDirName || hiddenLogical(it.Path) {
+			continue
+		}
+		logical := ""
+		enc := false
+		var fileID uint
+		var remote string
+		if r, ok := rowByRemote[it.Path]; ok {
+			logical = r.LogicalPath
+			enc = r.Encrypted
+			fileID = r.ID
+			remote = r.RemotePath
+		} else {
+			logical = remoteToLogical(mount, root, it.Path)
+			remote = it.Path
+		}
+		logical = cleanLogical(logical)
+		if logical == "/" || logical == "" || seen[logical] || hiddenLogical(logical) {
+			continue
+		}
+		// Prefer the logical (user-facing) name. A UUID remote name should
+		// not surface unless the logical path itself matches the query.
+		if !matchQuery(logical, q) {
+			continue
+		}
+		if temporary && !pathCoveredByGrant(logical, grantPaths) {
+			continue
+		}
+		seen[logical] = true
+		add(searchCand{
+			path: logical, id: fileID, size: it.Size, isDir: it.IsDir == 1,
+			created: unixTime(it.ServerCTime), modified: unixTime(it.ServerMTime),
+			encrypted: enc, remote: remote, acctID: n.ID, status: "ready",
+			fsID: it.FsID,
+		})
+	}
+}
+
+// handleSearchFiles finds files and directories by name or logical path.
+// It searches local metadata and, because the file manager lists live from
+// Baidu, also runs a recursive netdisk search on each active node so items
+// without a File row still show up. Password-protected descendants are
+// omitted for non-owners so names inside a locked folder are not leaked;
 // a match on the protected item itself is returned and flagged.
 func (s *Server) handleSearchFiles(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
@@ -516,8 +668,10 @@ func (s *Server) handleSearchFiles(c *gin.Context) {
 		pwd = c.GetHeader("X-Access-Password")
 	}
 
-	query := s.db.Model(&models.File{}).
-		Where("status <> ? AND status <> ? AND logical_path LIKE ? ESCAPE ?", "deleted", "uploading", likeContains(q), `\`)
+	query := s.db.Model(&models.File{}).Where("status <> ? AND status <> ?", "deleted", "uploading")
+	for _, tok := range queryTokens(q) {
+		query = query.Where("logical_path LIKE ? ESCAPE ?", likeContains(tok), `\`)
+	}
 	if role == "temporary" {
 		if len(grantPaths) == 0 {
 			query = query.Where("1 = 0")
@@ -539,20 +693,7 @@ func (s *Server) handleSearchFiles(c *gin.Context) {
 	}
 
 	acctIDs := map[uint]struct{}{}
-	type cand struct {
-		path      string
-		id        uint
-		size      int64
-		isDir     bool
-		created   time.Time
-		modified  time.Time
-		encrypted bool
-		remote    string
-		acctID    uint
-		status    string
-		mount     bool
-	}
-	cands := make([]cand, 0, len(rows)+4)
+	cands := make([]searchCand, 0, len(rows)+4)
 	seen := map[string]bool{}
 	for _, f := range rows {
 		p := cleanLogical(f.LogicalPath)
@@ -560,7 +701,7 @@ func (s *Server) handleSearchFiles(c *gin.Context) {
 			continue
 		}
 		seen[p] = true
-		cands = append(cands, cand{
+		cands = append(cands, searchCand{
 			path: p, id: f.ID, size: f.Size, isDir: f.IsDir,
 			created: f.CreatedAt, modified: f.UpdatedAt, encrypted: f.Encrypted,
 			remote: f.RemotePath, acctID: f.BaiduAccountID, status: f.Status,
@@ -572,22 +713,25 @@ func (s *Server) handleSearchFiles(c *gin.Context) {
 
 	nodes, err := s.activeNodes()
 	if err == nil {
-		ql := strings.ToLower(q)
 		for _, n := range nodes {
 			m := mountName(n)
 			p := "/" + m
-			if seen[p] || !strings.Contains(strings.ToLower(m), ql) {
-				continue
+			if !seen[p] && matchQuery(m, q) {
+				if role != "temporary" || pathCoveredByGrant(p, grantPaths) {
+					seen[p] = true
+					cands = append(cands, searchCand{
+						path: p, isDir: true, created: n.CreatedAt, modified: n.UpdatedAt,
+						acctID: n.ID, status: "ready", mount: true,
+					})
+					acctIDs[n.ID] = struct{}{}
+				}
 			}
-			if role == "temporary" && !pathCoveredByGrant(p, grantPaths) {
-				continue
-			}
-			seen[p] = true
-			cands = append(cands, cand{
-				path: p, isDir: true, created: n.CreatedAt, modified: n.UpdatedAt,
-				acctID: n.ID, status: "ready", mount: true,
+			s.mergeRemoteSearch(c, n, q, role == "temporary", grantPaths, seen, func(item searchCand) {
+				cands = append(cands, item)
+				if item.acctID != 0 {
+					acctIDs[item.acctID] = struct{}{}
+				}
 			})
-			acctIDs[n.ID] = struct{}{}
 		}
 	}
 
@@ -1151,6 +1295,7 @@ func (s *Server) handleRenameFile(c *gin.Context) {
 	}
 	s.db.Model(&f).Update("logical_path", in.Path)
 	s.moveAccessRules(cleanLogical(f.LogicalPath), cleanLogical(in.Path))
+	s.movePathNotes(cleanLogical(f.LogicalPath), cleanLogical(in.Path))
 	s.msync.Mark(f.BaiduAccountID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -1198,6 +1343,7 @@ func (s *Server) handleDeletePath(c *gin.Context) {
 	s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 		Update("status", "deleted")
 	s.dropAccessRules(p)
+	s.dropPathNotes(p, true)
 	s.msync.Mark(acc.ID)
 	s.audit(c, uid, usernameOf(c), "file.delete", p)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -1406,6 +1552,7 @@ func (s *Server) handleMove(c *gin.Context) {
 		s.db.Model(&models.File{}).Where("id = ?", k.ID).Updates(updates)
 	}
 	s.moveAccessRules(src, dst)
+	s.movePathNotes(src, dst)
 	s.msync.Mark(srcAcc.ID)
 	s.audit(c, uid, usernameOf(c), "move", src+" -> "+dst)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "moved": len(kids) + 1})
@@ -1448,6 +1595,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		s.db.Model(&models.File{}).Where("(logical_path = ? OR logical_path LIKE ?) AND status != ?", p, p+"/%", "deleted").
 			Update("status", "deleted")
 		s.dropAccessRules(p)
+		s.dropPathNotes(p, true)
 		s.msync.Mark(acc.ID)
 		s.audit(c, uid, usernameOf(c), "folder.delete", p)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -1471,6 +1619,7 @@ func (s *Server) handleDeleteFolder(c *gin.Context) {
 		s.db.Model(&models.File{}).Where("id = ?", f.ID).Update("status", "deleted")
 	}
 	s.dropAccessRules(p)
+	s.dropPathNotes(p, true)
 	for id := range touched {
 		s.msync.Mark(id)
 	}
