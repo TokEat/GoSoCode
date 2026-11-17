@@ -327,7 +327,7 @@ tr.locate { background: rgba(99, 102, 241, 0.14); animation: locate-pulse 1.6s e
 }
 
 table.explorer td { vertical-align: middle; }
-.name-cell { display: flex; align-items: center; gap: 9px; }
+.name-cell { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .name-cell .name-link { cursor: pointer; transition: color 0.15s ease; }
 .name-cell .name-link:hover { color: var(--primary); }
 tr.row-folder { cursor: pointer; }
@@ -563,6 +563,38 @@ tr.row-folder:hover { background: rgba(99, 102, 241, 0.06); }
   cursor: pointer;
 }
 .note-badge:hover { background: rgba(99, 102, 241, 0.26); border-color: rgba(99, 102, 241, 0.42); }
+.note-inline {
+  display: block;
+  flex: 1 1 8em;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  font-weight: 400;
+  color: var(--muted);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.note-inline:hover { color: #64748b; }
+.note-inline code {
+  font-size: 11.5px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.06);
+}
+.note-inline strong { font-weight: 600; }
+.note-inline em { font-style: italic; }
+.explorer-bar > .note-inline {
+  flex: 0 1 240px;
+  max-width: 240px;
+}
 tr.has-note td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
 tr.has-note { background: rgba(99, 102, 241, 0.05); }
 tr.has-note:hover { background: rgba(99, 102, 241, 0.09); }

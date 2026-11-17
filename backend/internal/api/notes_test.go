@@ -101,12 +101,19 @@ func TestNotesPutGetDelete(t *testing.T) {
 	s.handleIndexNotes(c)
 	var idx struct {
 		Paths []string `json:"paths"`
+		Notes []struct {
+			Path string `json:"path"`
+			Body string `json:"body"`
+		} `json:"notes"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &idx); err != nil {
 		t.Fatal(err)
 	}
 	if len(idx.Paths) != 1 || idx.Paths[0] != "/资料盘/docs/a.pdf" {
 		t.Fatalf("index %+v", idx.Paths)
+	}
+	if len(idx.Notes) != 1 || idx.Notes[0].Path != "/资料盘/docs/a.pdf" || idx.Notes[0].Body != "这是一份很长的备注\n\n第二段" {
+		t.Fatalf("index notes %+v", idx.Notes)
 	}
 
 	c, w = notesCtx(s, admin, http.MethodDelete, "/api/notes?path="+urlQuery("/资料盘/docs/a.pdf"), nil, "")
@@ -279,11 +286,23 @@ func TestNotesHiddenInLockedFolder(t *testing.T) {
 	s.handleIndexNotes(c)
 	var idx struct {
 		Paths []string `json:"paths"`
+		Notes []struct {
+			Path string `json:"path"`
+			Body string `json:"body"`
+		} `json:"notes"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &idx)
 	for _, p := range idx.Paths {
 		if strings.HasPrefix(p, "/资料盘/secret") {
 			t.Fatalf("locked path leaked in index: %v", idx.Paths)
+		}
+	}
+	if len(idx.Notes) != 1 || idx.Notes[0].Path != "/资料盘/open.txt" || idx.Notes[0].Body != "ok" {
+		t.Fatalf("visible note body missing: %+v", idx.Notes)
+	}
+	for _, n := range idx.Notes {
+		if strings.HasPrefix(n.Path, "/资料盘/secret") || n.Body == "hidden" {
+			t.Fatalf("locked note body leaked in index: %+v", idx.Notes)
 		}
 	}
 }

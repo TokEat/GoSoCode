@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isSafeHref, noteImageId, parseNote } from "./noteMarkdown";
+import { isSafeHref, isSimpleNoteText, noteImageId, parseNote, SIMPLE_NOTE_MAX_CHARS, simpleNoteLine } from "./noteMarkdown";
 
 describe("parseNote", () => {
   it("parses headings, paragraphs, emphasis and lists", () => {
@@ -28,5 +28,52 @@ describe("parseNote", () => {
     expect(isSafeHref("/api/notes/images/3")).toBe(true);
     expect(isSafeHref("javascript:alert(1)")).toBe(false);
     expect(isSafeHref("/etc/passwd")).toBe(false);
+  });
+});
+
+describe("isSimpleNoteText", () => {
+  it("accepts a short plain line", () => {
+    expect(isSimpleNoteText("这是一份简短备注")).toBe(true);
+    expect(isSimpleNoteText("  hello world  ")).toBe(true);
+  });
+
+  it("accepts two short lines and joins them", () => {
+    expect(isSimpleNoteText("第一行\n第二行")).toBe(true);
+    expect(isSimpleNoteText("第一行\n\n第二行")).toBe(true);
+    expect(simpleNoteLine("第一行\n\n第二行")).toBe("第一行 第二行");
+  });
+
+  it("accepts inline italic, bold and code", () => {
+    expect(isSimpleNoteText("这是 **重要** 和 *临时* 的 `code`")).toBe(true);
+  });
+
+  it("rejects empty or whitespace-only text", () => {
+    expect(isSimpleNoteText("")).toBe(false);
+    expect(isSimpleNoteText("   \n  ")).toBe(false);
+  });
+
+  it("rejects more than two non-empty lines", () => {
+    expect(isSimpleNoteText("a\nb\nc")).toBe(false);
+  });
+
+  it("rejects text longer than the row budget", () => {
+    expect(isSimpleNoteText("啊".repeat(SIMPLE_NOTE_MAX_CHARS))).toBe(true);
+    expect(isSimpleNoteText("啊".repeat(SIMPLE_NOTE_MAX_CHARS + 1))).toBe(false);
+    expect(isSimpleNoteText("甲".repeat(70) + "\n" + "乙".repeat(70))).toBe(false);
+  });
+
+  it("rejects headings, lists, quotes, fences and images", () => {
+    expect(isSimpleNoteText("# 标题")).toBe(false);
+    expect(isSimpleNoteText("## 小标题")).toBe(false);
+    expect(isSimpleNoteText("- 一项")).toBe(false);
+    expect(isSimpleNoteText("* 一项")).toBe(false);
+    expect(isSimpleNoteText("+ 一项")).toBe(false);
+    expect(isSimpleNoteText("1. 一项")).toBe(false);
+    expect(isSimpleNoteText("> 引用")).toBe(false);
+    expect(isSimpleNoteText("```\ncode\n```")).toBe(false);
+    expect(isSimpleNoteText("前言 ```js")).toBe(false);
+    expect(isSimpleNoteText("见图 ![示意图](/api/notes/images/12)")).toBe(false);
+    expect(isSimpleNoteText("![](https://example.com/a.png)")).toBe(false);
+    expect(isSimpleNoteText("见 ](/api/notes/images/3)")).toBe(false);
   });
 });

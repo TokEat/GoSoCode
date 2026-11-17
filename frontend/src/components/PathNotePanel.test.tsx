@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { PathNotePanel, NoteBadge, NotePreview } from "./PathNotePanel";
+import { PathNotePanel, NoteBadge, NotePreview, PathNoteHint } from "./PathNotePanel";
 
 vi.mock("../lib/api", () => ({
   api: {
@@ -102,5 +102,33 @@ describe("NotePreview", () => {
     expect(screen.getByText("文件备注")).toBeInTheDocument();
     await userEvent.setup().click(screen.getByRole("button", { name: "编辑" }));
     expect(onEdit).toHaveBeenCalled();
+  });
+});
+
+describe("PathNoteHint", () => {
+  it("renders short plain text inline and opens the preview callback on click", async () => {
+    const user = userEvent.setup();
+    const onClick = vi.fn();
+    render(<PathNoteHint body="这是一份简短备注" onClick={onClick} />);
+    const btn = screen.getByRole("button", { name: "查看备注" });
+    expect(btn).toHaveClass("note-inline");
+    expect(btn).toHaveTextContent("这是一份简短备注");
+    expect(btn).not.toHaveClass("note-badge");
+    await user.click(btn);
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the 备注 badge for notes with images or long markdown", () => {
+    const { rerender } = render(
+      <PathNoteHint body={"封面\n\n![示意图](/api/notes/images/12)"} onClick={() => {}} />,
+    );
+    expect(screen.getByRole("button", { name: "查看备注" })).toHaveClass("note-badge");
+    expect(screen.getByRole("button", { name: "查看备注" })).toHaveTextContent("备注");
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.queryByText(/\/api\/notes\/images/)).not.toBeInTheDocument();
+
+    rerender(<PathNoteHint body={"# 标题\n\n" + "很长的备注内容。".repeat(20)} onClick={() => {}} />);
+    expect(screen.getByRole("button", { name: "查看备注" })).toHaveClass("note-badge");
+    expect(screen.queryByText("# 标题")).not.toBeInTheDocument();
   });
 });

@@ -79,15 +79,17 @@ func (s *Server) handleIndexNotes(c *gin.Context) {
 		s.db.Where("path = ? OR path LIKE ?", dir, dir+"/%").Find(&notes)
 	}
 	paths := make([]string, 0, len(notes))
+	items := make([]gin.H, 0, len(notes))
 	for _, n := range notes {
 		if n.Path == dir || path.Dir(n.Path) == dir {
 			if s.accessDeniedNoWrite(c, n.Path) {
 				continue
 			}
 			paths = append(paths, n.Path)
+			items = append(items, gin.H{"path": n.Path, "body": n.Body})
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"paths": paths})
+	c.JSON(http.StatusOK, gin.H{"paths": paths, "notes": items})
 }
 
 func (s *Server) handlePutNote(c *gin.Context) {

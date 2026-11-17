@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type ClipboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../lib/api";
-import { noteImageId, renderNote } from "../lib/noteMarkdown";
+import { isSimpleNoteText, noteImageId, renderNote, renderSimpleNote } from "../lib/noteMarkdown";
 
 export type NoteTarget = { path: string; isDir: boolean; name: string };
 
@@ -283,6 +283,25 @@ export function NoteBadge({ onClick, title = "查看备注" }: { onClick: (e: Re
       备注
     </button>
   );
+}
+
+/** Inline simple-text note, or the “备注” badge for richer / longer markdown. */
+export function PathNoteHint({
+  body, onClick, title = "查看备注",
+}: {
+  body: string;
+  onClick: (e: ReactMouseEvent) => void;
+  title?: string;
+}) {
+  if (isSimpleNoteText(body)) {
+    return (
+      <button type="button" className="note-inline" title={title} aria-label={title}
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); onClick(e); }}>
+        {renderSimpleNote(body)}
+      </button>
+    );
+  }
+  return <NoteBadge onClick={onClick} title={title} />;
 }
 
 /** @deprecated use NoteBadge */

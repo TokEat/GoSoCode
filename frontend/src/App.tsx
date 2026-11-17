@@ -16,23 +16,13 @@ import Settings from "./pages/Settings";
 import ClientSettings from "./pages/ClientSettings";
 import TransferDrawer from "./TransferDrawer";
 import SharePage from "./pages/SharePage";
+import { hashForPage, hashesEqual, pageFromHash, type AppPage } from "./lib/hashRoute";
 
 export interface JobEvent {
   job_id: string; status: string; progress: number; logical_path: string; error?: string;
 }
 
-type Page =
-  | "overview" | "files" | "share" | "transfers" | "profile"
-  | "users" | "nodes" | "traffic" | "logs" | "settings" | "client";
-
-const PAGES: Page[] = ["overview", "files", "share", "transfers", "profile", "users", "nodes", "traffic", "logs", "settings", "client"];
-
-// Hash-based routing (#/files, #/transfers, …) so a refresh or a shared link
-// lands on the same page instead of resetting to the overview.
-function pageFromHash(): Page {
-  const h = window.location.hash.replace(/^#\/?/, "").split("?")[0];
-  return PAGES.includes(h as Page) ? (h as Page) : "overview";
-}
+type Page = AppPage;
 
 const USER_NAV: { key: Page; label: string; ico: string }[] = [
   { key: "overview", label: "概览", ico: "▦" },
@@ -102,7 +92,11 @@ function Shell({ runtime, onRuntimeChange, onLogout }: {
   const guard = (p: Page): Page =>
     (!isAdmin && ADMIN_NAV.some((n) => n.key === p)) || (p === "client" && !clientMode) ? "overview" : p;
   const [page, setPageState] = useState<Page>(() => guard(pageFromHash()));
-  const setPage = (p: Page) => { window.location.hash = "/" + p; };
+  const setPage = (p: Page) => {
+    const next = hashForPage(p, window.location.hash);
+    if (hashesEqual(window.location.hash, next)) return;
+    window.location.hash = next.replace(/^#/, "");
+  };
   useEffect(() => {
     const onHash = () => setPageState(guard(pageFromHash()));
     window.addEventListener("hashchange", onHash);

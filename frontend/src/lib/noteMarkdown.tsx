@@ -136,3 +136,65 @@ export function renderNote(
     return <p key={i}>{renderInlines(b.kids, renderImage)}</p>;
   });
 }
+
+/** Max visible characters (after trim / joining lines) for an inline list-row note. */
+export const SIMPLE_NOTE_MAX_CHARS = 120;
+export const SIMPLE_NOTE_MAX_LINES = 2;
+
+const NOTE_IMAGE_REF = /\]\(\s*\/api\/notes\/images\//;
+const MD_IMAGE = /!\[[^\]]*\]\([^)]*\)/;
+
+/** Join a short note into a single row-friendly line. */
+export function simpleNoteLine(body: string): string {
+  return body
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * A note is "simple" when it can be shown inline in the file list:
+ * short (at most two lines, <= 120 chars), no images, headings, lists,
+ * block quotes, or code fences. Inline *italic* / **bold** / `code` is allowed.
+ */
+export function isSimpleNoteText(body: string): boolean {
+  const trimmed = body.replace(/\r\n/g, "\n").trim();
+  if (!trimmed) return false;
+  if (/```/.test(trimmed) || /^~~~/m.test(trimmed)) return false;
+  if (MD_IMAGE.test(trimmed) || NOTE_IMAGE_REF.test(trimmed)) return false;
+  const rawLines = trimmed.split("\n");
+  const nonEmpty: string[] = [];
+  for (const line of rawLines) {
+    const l = line.trim();
+    if (!l) continue;
+    if (/^#{1,6}\s+/.test(l)) return false;
+    if (/^>\s?/.test(l)) return false;
+    if (/^[-*+]\s+/.test(l)) return false;
+    if (/^\d+\.\s+/.test(l)) return false;
+    nonEmpty.push(l);
+  }
+  if (nonEmpty.length > SIMPLE_NOTE_MAX_LINES) return false;
+  if (nonEmpty.join(" ").length > SIMPLE_NOTE_MAX_CHARS) return false;
+  return true;
+}
+
+function renderCompactInlines(kids: Inline[]): ReactNode[] {
+  return kids.map((n, i) => {
+    if (n.t === "text") return <Fragment key={i}>{n.v}</Fragment>;
+    if (n.t === "code") return <code key={i}>{n.v}</code>;
+    if (n.t === "strong") return <strong key={i}>{renderCompactInlines(n.kids)}</strong>;
+    if (n.t === "em") return <em key={i}>{renderCompactInlines(n.kids)}</em>;
+    if (n.t === "link") return <Fragment key={i}>{renderCompactInlines(n.kids)}</Fragment>;
+    return <Fragment key={i}>{n.alt || ""}</Fragment>;
+  });
+}
+
+/** Compact inline rendering of a simple note (bold / italic / code; links unwrapped). */
+export function renderSimpleNote(body: string): ReactNode {
+  const line = simpleNoteLine(body);
+  if (!line) return null;
+  return renderCompactInlines(parseInlines(line));
+}

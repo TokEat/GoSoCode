@@ -8,8 +8,21 @@ import { JobEvent } from "../App";
 import LocalFilePicker from "../LocalFilePicker";
 import { LocalEntry } from "../lib/api";
 import FileSearch from "../components/FileSearch";
-import { PathNotePanel, NoteBadge, NotePreview } from "../components/PathNotePanel";
+import { PathNotePanel, PathNoteHint, NotePreview } from "../components/PathNotePanel";
 import { normDir, fullPath, parentDir, baseName, searchLocateTarget } from "../lib/searchLocate";
+import { filesHashFor, filesLocationFromHash, hashesEqual, viewFromFilesLocation } from "../lib/hashRoute";
+
+function writeFilesHash(path: string, kind: "dir" | "file") {
+  const next = filesHashFor(path, kind);
+  if (hashesEqual(window.location.hash, next)) return;
+  window.location.hash = next.replace(/^#/, "");
+}
+
+function initialFilesView() {
+  const loc = filesLocationFromHash(typeof window !== "undefined" ? window.location.hash : "");
+  if (!loc) return { cwd: "/", locatePath: "", pending: null as string | null };
+  return viewFromFilesLocation(loc);
+}
 
 // ---- path helpers ----------------------------------------------------------
 
@@ -83,13 +96,21 @@ interface MenuItem { label: string; onClick?: () => void; danger?: boolean; disa
 export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [storage, setStorage] = useState<Storage | null>(null);
-  const [cwd, setCwd] = useState("/");
+  const boot = useRef(initialFilesView()).current;
+  const [cwd, setCwd] = useState(boot.cwd);
   const [menu, setMenu] = useState<Menu | null>(null);
   const [clip, setClip] = useState<Clip | null>(null);
   const [localPicker, setLocalPicker] = useState(false);
-  const [locatePath, setLocatePath] = useState("");
+  const [locatePath, setLocatePath] = useState(boot.locatePath);
+  const pendingResolve = useRef<string | null>(boot.pending);
+  const cwdRef = useRef(boot.cwd);
+  const locateRef = useRef(boot.locatePath);
+  const filesRef = useRef(files);
+  cwdRef.current = cwd;
+  locateRef.current = locatePath;
+  filesRef.current = files;
   const [noteTarget, setNoteTarget] = useState<{ path: string; isDir: boolean; name: string } | null>(null);
-  const [noteFlags, setNoteFlags] = useState<Set<string>>(new Set());
+  const [notesByPath, setNotesByPath] = useState<Map<string, string>>(new Map());
   const [notePreview, setNotePreview] = useState<{ path: string; isDir: boolean; name: string; x: number; y: number } | null>(null);
 
   const openNotePreview = (e: React.MouseEvent, t: { path: string; isDir: boolean; name: string }) => {
@@ -125,17 +146,41 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const refreshNotes = async (dir = cwd) => {
     const key = fullPath(dir).replace(/\/+$/, "") || "/";
     try {
-      const paths = await api.noteIndex(key, pwdFor(dir));
-      setNoteFlags(new Set(paths));
+      const idx = await api.noteIndex(key, pwdFor(dir));
+      const next = new Map<string, string>();
+      for (const n of idx.notes) next.set(n.path, n.body);
+      for (const p of idx.paths) {
+        if (!next.has(p)) next.set(p, "");
+      }
+      setNotesByPath(next);
     } catch {
-      setNoteFlags(new Set());
+      setNotesByPath(new Map());
     }
   };
 
+  function resolvePendingFromList(list: FileItem[], listedDir: string) {
+    const target = pendingResolve.current;
+    if (!target) return;
+    const resolved = viewFromFilesLocation({ path: target, explicitDir: false }, list, listedDir);
+    if (resolved.pending) return;
+    pendingResolve.current = null;
+    if (normDir(cwdRef.current) !== normDir(resolved.cwd)) {
+      cwdRef.current = resolved.cwd;
+      setCwd(resolved.cwd);
+    }
+    if (locateRef.current !== resolved.locatePath) {
+      locateRef.current = resolved.locatePath;
+      setLocatePath(resolved.locatePath);
+    }
+  }
+
   const refresh = async () => {
     try {
-      setFiles(await api.listFiles(cwd, pwdFor(cwd)));
+      const list = await api.listFiles(cwd, pwdFor(cwd));
+      filesRef.current = list;
+      setFiles(list);
       void refreshNotes(cwd);
+      resolvePendingFromList(list, cwd);
     } catch (e: any) {
       if (!e?.protected) return;
       const pwd = await dialog.prompt({
@@ -148,14 +193,18 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         try {
           const list = await api.listFiles(cwd, pwd.trim());
           pwds.current.set(key, pwd.trim());
+          filesRef.current = list;
           setFiles(list);
           void refreshNotes(cwd);
+          resolvePendingFromList(list, cwd);
           return;
         } catch (e2: any) {
           toast("err", e2.message || "访问密码错误");
         }
       }
-      setCwd(parentDir(cwd));
+      const upDir = parentDir(cwd);
+      cwdRef.current = upDir;
+      setCwd(upDir);
     }
   };
   const refreshStorage = () => api.storage().then(setStorage).catch(() => {});
@@ -167,23 +216,81 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   useEffect(() => {
     if (!locatePath) return;
     const el = document.querySelector("tr.locate") as HTMLElement | null;
-    el?.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (typeof el?.scrollIntoView === "function") el.scrollIntoView({ block: "center", behavior: "smooth" });
     const t = setTimeout(() => setLocatePath(""), 4000);
     return () => clearTimeout(t);
   }, [locatePath, files]);
 
   function locate(item: FileItem) {
     const t = searchLocateTarget(item);
+    cwdRef.current = t.cwd;
+    locateRef.current = t.highlightPath;
+    pendingResolve.current = null;
     setCwd(t.cwd);
     setLocatePath(t.highlightPath);
+    writeFilesHash(t.highlightPath || t.cwd, t.highlightPath ? "file" : "dir");
   }
 
   const { folderRows, here } = useMemo(() => buildListing(files, cwd), [files, cwd]);
   const segments = cwd.split("/").filter(Boolean);
 
-  function goTo(depth: number) { setCwd(depth <= 0 ? "/" : "/" + segments.slice(0, depth).join("/") + "/"); }
+  function goTo(depth: number) {
+    const next = depth <= 0 ? "/" : "/" + segments.slice(0, depth).join("/") + "/";
+    cwdRef.current = next;
+    locateRef.current = "";
+    pendingResolve.current = null;
+    setCwd(next);
+    setLocatePath("");
+    writeFilesHash(next, "dir");
+  }
   function up() { goTo(segments.length - 1); }
-  function enter(name: string) { setCwd(normDir(cwd) + name + "/"); }
+  function enter(name: string) {
+    const next = normDir(cwd) + name + "/";
+    cwdRef.current = next;
+    locateRef.current = "";
+    pendingResolve.current = null;
+    setCwd(next);
+    setLocatePath("");
+    writeFilesHash(next, "dir");
+  }
+  function visitFile(item: FileItem) {
+    const fp = fullPath(item.path);
+    locateRef.current = fp;
+    pendingResolve.current = null;
+    setLocatePath(fp);
+    writeFilesHash(fp, "file");
+  }
+
+  const applyHashRef = useRef<(hash: string) => void>(() => {});
+  applyHashRef.current = (hash: string) => {
+    const loc = filesLocationFromHash(hash);
+    if (!loc) return;
+    const fp = fullPath(loc.path).replace(/\/+$/, "") || "/";
+    // Already showing this directory (we just wrote the hash from enter/goTo).
+    if (fp !== "/" && !loc.explicitDir && normDir(cwdRef.current) === normDir(fp)) {
+      pendingResolve.current = null;
+      if (locateRef.current) {
+        locateRef.current = "";
+        setLocatePath("");
+      }
+      return;
+    }
+    const resolved = viewFromFilesLocation(loc, filesRef.current, cwdRef.current);
+    pendingResolve.current = resolved.pending;
+    if (normDir(cwdRef.current) !== normDir(resolved.cwd)) {
+      cwdRef.current = resolved.cwd;
+      setCwd(resolved.cwd);
+    }
+    if (locateRef.current !== resolved.locatePath) {
+      locateRef.current = resolved.locatePath;
+      setLocatePath(resolved.locatePath);
+    }
+  };
+  useEffect(() => {
+    const onHash = () => applyHashRef.current(window.location.hash);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
   const closeMenu = () => setMenu(null);
 
   function openMenu(e: React.MouseEvent, target: Target) {
@@ -519,8 +626,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         </div>
         <FileSearch onLocate={locate} />
         {cwd !== "/" && (
-          noteFlags.has(cwdKey) ? (
-            <NoteBadge title="查看当前目录备注"
+          notesByPath.has(cwdKey) ? (
+            <PathNoteHint
+              body={notesByPath.get(cwdKey) || ""}
+              title="查看当前目录备注"
               onClick={(e) => openNotePreview(e, { path: cwdKey, isDir: true, name: baseName(cwd) || cwd })} />
           ) : (
             <button className="btn ghost sm" title="当前目录备注"
@@ -544,10 +653,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
             {folderRows.map((d) => {
               const dp = normDir(cwd) + d.name;
               return (
-                <tr key={"d:" + d.name} className={"row-folder" + (noteFlags.has(dp) ? " has-note" : "")} style={cutPath === dp ? { opacity: 0.5 } : undefined}
+                <tr key={"d:" + d.name} className={"row-folder" + (notesByPath.has(dp) ? " has-note" : "")} style={cutPath === dp ? { opacity: 0.5 } : undefined}
                   onDoubleClick={() => enter(d.name)}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
-                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}{noteFlags.has(dp) && <NoteBadge onClick={(e) => openNotePreview(e, { path: dp, isDir: true, name: d.name })} />}</div></td>
+                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}{notesByPath.has(dp) && <PathNoteHint body={notesByPath.get(dp) || ""} onClick={(e) => openNotePreview(e, { path: dp, isDir: true, name: d.name })} />}</div></td>
                   {/* the listing only covers direct children, so a folder's
                       own size is unknown — show a dash instead of "0 B" */}
                   <td className="muted">{d.count > 0 ? humanSize(d.size) : "—"}</td>
@@ -561,10 +670,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
               const name = baseName(f.path);
               return (
                 <tr key={"f:" + f.id}
-                  className={[locatePath === fullPath(f.path) ? "locate" : "", noteFlags.has(fullPath(f.path)) ? "has-note" : ""].filter(Boolean).join(" ") || undefined}
+                  className={[locatePath === fullPath(f.path) ? "locate" : "", notesByPath.has(fullPath(f.path)) ? "has-note" : ""].filter(Boolean).join(" ") || undefined}
                   style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
-                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>}{noteFlags.has(fullPath(f.path)) && <NoteBadge onClick={(e) => openNotePreview(e, { path: fullPath(f.path), isDir: false, name })} />} {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td><div className="name-cell" onClick={() => visitFile(f)}><FileIcon /> <span className="name-link">{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>}{notesByPath.has(fullPath(f.path)) && <PathNoteHint body={notesByPath.get(fullPath(f.path)) || ""} onClick={(e) => openNotePreview(e, { path: fullPath(f.path), isDir: false, name })} />} {f.status !== "ready" && statusBadge(f.status)}</div></td>
                   <td className="muted">{humanSize(f.size)}</td>
                   <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
                   <td className="muted">{extOf(name)}</td>

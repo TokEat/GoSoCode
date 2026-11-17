@@ -8,6 +8,8 @@ export interface FileItem {
 }
 export interface ProtectInfo { protected: boolean; owner?: string; is_dir?: boolean; password?: string; }
 export interface PathNote { path: string; is_dir: boolean; body: string; exists: boolean; updated?: string; updated_by?: number; }
+export interface PathNoteIndexEntry { path: string; body: string; }
+export interface PathNoteIndex { paths: string[]; notes: PathNoteIndexEntry[]; }
 export interface NoteImageUpload { id: number; url: string; name: string; mime: string; size: number; }
 export interface Storage { total: number; used: number; free: number; }
 export interface TransferLogItem { ID: number; Kind: string; Name: string; Path: string; Size: number; At: string; }
@@ -154,8 +156,16 @@ export const api = {
     json(`/notes${pq(pwd)}`, "PUT", { path, is_dir: isDir, body }),
   deleteNote: (path: string, pwd?: string) =>
     json(`/notes?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "DELETE"),
-  noteIndex: (dir: string, pwd?: string): Promise<string[]> =>
-    json(`/notes/index?dir=${encodeURIComponent(dir)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.paths || []),
+  noteIndex: (dir: string, pwd?: string): Promise<PathNoteIndex> =>
+    json(`/notes/index?dir=${encodeURIComponent(dir)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => {
+      const notes: PathNoteIndexEntry[] = Array.isArray(r.notes)
+        ? r.notes
+            .map((n: PathNoteIndexEntry) => ({ path: String(n?.path || ""), body: String(n?.body || "") }))
+            .filter((n: PathNoteIndexEntry) => n.path)
+        : [];
+      const paths: string[] = Array.isArray(r.paths) ? r.paths.map(String) : notes.map((n) => n.path);
+      return { paths, notes };
+    }),
   uploadNoteImage: (path: string, file: File, pwd?: string): Promise<NoteImageUpload> => {
     const fd = new FormData();
     fd.append("path", path);
