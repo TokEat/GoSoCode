@@ -60,7 +60,11 @@ func Load() *Config {
 
 		StreamEnabled:       env("GSC_STREAM_ENABLED", "1") != "0",
 		StreamMaxConcurrent: envInt("GSC_STREAM_MAX_CONCURRENT", 8),
-		StreamWindow:        envInt("GSC_STREAM_WINDOW", 3),
+		// Default 3: peak RAM is about window × slice_size per session (SVIP
+		// slices are 32MB, so 3×32MB×8 sessions ≈ 768MB). Raising to 4 would
+		// push that near 1GB; leave the default conservative and override with
+		// GSC_STREAM_WINDOW when the host has headroom.
+		StreamWindow: envInt("GSC_STREAM_WINDOW", 3),
 
 		AgentEnabled:    env("GSC_AGENT_ENABLED", "1") != "0",
 		AgentWindow:     envInt("GSC_AGENT_WINDOW", 8),

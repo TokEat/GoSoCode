@@ -1,20 +1,16 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from "react";
-import SparkMD5 from "spark-md5";
 import { auth, clientApi, ClientTask } from "./lib/api";
+import { computeBlockList, formatHashNote, hashPercent, parseCheckProgress, shouldPublishHashProgress } from "./lib/blockList";
+import {
+  MAX_SLICE_RETRY, sleep, backoffMs, autoResumeDelayMs,
+  FINISH_PAUSE_NOTE, sliceRetryNote, nextAutoResume,
+  isRetryableTransferError, describeErr,
+} from "./lib/transferRetry";
 import { useToast } from "./ui";
 
 const CHUNK = 4 * 1024 * 1024; // 4MB browser->server chunk (legacy store-and-forward)
-const MAX_RETRY = 5;           // consecutive-stall retries before giving up
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const backoff = (n: number) => Math.min(1000 * 2 ** n, 8000) + Math.floor(Math.random() * 400);
-function describeErr(e: unknown): string {
-  const m = (e as Error)?.message || String(e);
-  if (/failed to fetch|networkerror|load failed|err_/i.test(m)) return "网络中断或丢包，连接被重置";
-  return m;
-}
-
-export type TransferStatus = "running" | "paused" | "finalizing" | "done" | "error" | "canceled";
+export type TransferStatus = "hashing" | "running" | "paused" | "finalizing" | "done" | "error" | "canceled";
 
 export interface Transfer {
   id: string;
@@ -29,6 +25,7 @@ export interface Transfer {
   eta?: number;       // estimated seconds remaining (undefined when unknown)
   status: TransferStatus;
   note?: string;  // transient message, e.g. "retrying (2/5)…"
+  checkProgress?: number; // 0-100 checksum/pre-scan progress (not network bytes)
   error?: string; // terminal failure reason
   localPath?: string; // client-mode: final local file path (download) or source path (upload)
 }
@@ -65,6 +62,9 @@ interface Ctl {
   dlSeq: number;   // next IndexedDB chunk sequence for this download
   idbOff?: boolean; // IndexedDB unavailable: keep download buffer in memory only
   retrying: boolean;
+  userPaused: boolean; // true only when the user clicked 暂停 (auto-resume must not override it)
+  autoResumes: number; // automatic whole-transfer recoveries used since the last successful slice
+  autoResumeGen: number; // bumped to cancel an in-flight auto-resume timer
   lastTime: number;
   lastBytes: number;
   lastSynced: number;
@@ -227,13 +227,13 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
     const raw = JSON.parse(localStorage.getItem(storeKey()) || "[]") as PersistEntry[];
     for (const e of raw) {
       if (!e || !e.id) continue;
-      const wasActive = e.status === "running" || e.status === "paused" || e.status === "finalizing";
+      const wasActive = e.status === "hashing" || e.status === "running" || e.status === "paused" || e.status === "finalizing";
       // import jobs run server-side: they stay "running" across a refresh and
       // are resolved by the /api/jobs poll instead of a local resume
       const status: TransferStatus = wasActive && e.kind !== "import" ? "paused" : e.status;
       // transfers that were mid-flight get auto-resumed once their local data
       // (upload File / download buffer) is reattached from IndexedDB
-      if ((e.status === "running" || e.status === "finalizing") && e.kind !== "import") resumeIds.push(e.id);
+      if ((e.status === "hashing" || e.status === "running" || e.status === "finalizing") && e.kind !== "import") resumeIds.push(e.id);
       const transferred = e.transferred || 0;
       const synced = e.stream ? Math.min(e.synced || 0, e.total) : undefined;
       list.push({
@@ -245,7 +245,7 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
         sent: transferred, shown: transferred, synced: synced || 0,
         paused: true, canceled: e.status === "canceled",
         uploadId: e.uploadId, fileId: e.fileId, downloadUrl: e.downloadUrl, jobId: e.jobId,
-        chunks: [], dlSeq: 0, retrying: false,
+        chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
         lastTime: Date.now(), lastBytes: transferred, lastSynced: synced || 0,
         stream: e.stream ? {
           sessionId: e.stream.sessionId, sliceSize: e.stream.sliceSize,
@@ -329,24 +329,6 @@ async function putSlice(
   }
 }
 
-// computeBlockList md5-hashes the file slice by slice (local read only, no
-// network) — required by Baidu precreate and what unlocks rapid-upload (秒传).
-async function computeBlockList(
-  file: File, sliceSize: number,
-  onProgress: (done: number, total: number) => void,
-  isCanceled: () => boolean,
-): Promise<string[] | null> {
-  const total = Math.max(1, Math.ceil(file.size / sliceSize));
-  const out: string[] = [];
-  for (let i = 0; i < total; i++) {
-    if (isCanceled()) return null;
-    const buf = await file.slice(i * sliceSize, Math.min((i + 1) * sliceSize, file.size)).arrayBuffer();
-    out.push(SparkMD5.ArrayBuffer.hash(buf));
-    onProgress(i + 1, total);
-  }
-  return out;
-}
-
 function BrowserTransferProvider({ children }: { children: ReactNode }) {
   // restore persisted transfers exactly once, before first render
   const restored = useRef<{ list: Transfer[]; ctls: Map<string, Ctl>; resumeIds: string[] } | null>(null);
@@ -405,6 +387,35 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     patch(id, p);
   }, [patch]);
 
+  // resumeRef lets stall recovery call resume() without a circular useCallback
+  // dependency (resume is declared later and closes over the transfer drivers).
+  const resumeRef = useRef<(id: string, opts?: { auto?: boolean }) => void | Promise<void>>(() => {});
+
+  const scheduleAutoResume = useCallback((id: string, kind: "transfer" | "finish" = "transfer") => {
+    void (async () => {
+      const ctl = ctls.current.get(id);
+      if (!ctl || ctl.canceled || ctl.userPaused) return;
+      const decision = nextAutoResume(ctl.autoResumes);
+      if (!decision.resume) {
+        ctl.paused = true;
+        patch(id, {
+          status: "paused", speed: 0, syncSpeed: 0,
+          note: kind === "finish" ? FINISH_PAUSE_NOTE : decision.note,
+        });
+        return;
+      }
+      ctl.autoResumes = decision.index;
+      ctl.paused = true;
+      ctl.autoResumeGen++;
+      const gen = ctl.autoResumeGen;
+      patch(id, { status: "running", speed: 0, syncSpeed: 0, note: decision.note });
+      await sleep(autoResumeDelayMs(decision.index - 1));
+      if (ctl.canceled || ctl.userPaused || ctl.autoResumeGen !== gen) return;
+      ctl.paused = false;
+      await resumeRef.current(id, { auto: true });
+    })();
+  }, [patch]);
+
   // ---- legacy upload (store-and-forward: temp file + async Baidu job) -------
   const driveUpload = useCallback(async (id: string) => {
     const ctl = ctls.current.get(id);
@@ -431,20 +442,22 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
             });
             if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
             ctl.sent = (await res.json()).offset;
+            ctl.autoResumes = 0;
             if (ctl.retrying) { ctl.retrying = false; patch(id, { note: undefined }); }
             break;
           } catch (e) {
-            if (ctl.paused || ctl.canceled) return;
+            if (ctl.paused || ctl.canceled || ctl.userPaused) return;
             // The chunk may have landed before the connection dropped: re-sync.
             try {
               const off = await getUploadOffset(ctl.uploadId!);
-              if (off > ctl.sent) { ctl.sent = off; if (ctl.retrying) { ctl.retrying = false; patch(id, { note: undefined }); } break; }
+              if (off > ctl.sent) { ctl.sent = off; ctl.autoResumes = 0; if (ctl.retrying) { ctl.retrying = false; patch(id, { note: undefined }); } break; }
             } catch { /* ignore, will retry */ }
+            if (!isRetryableTransferError(e)) throw e;
             attempt++;
-            if (attempt >= MAX_RETRY) throw new Error(`分片上传失败（已重试 ${MAX_RETRY} 次）：${describeErr(e)}`);
+            if (attempt >= MAX_SLICE_RETRY) throw new Error(`分片上传失败（已重试 ${MAX_SLICE_RETRY} 次）：${describeErr(e)}`);
             ctl.retrying = true;
-            patch(id, { note: `网络波动，正在重试 (${attempt}/${MAX_RETRY})…`, speed: 0 });
-            await sleep(backoff(attempt - 1));
+            patch(id, { note: sliceRetryNote(attempt), speed: 0 });
+            await sleep(backoffMs(attempt - 1));
           }
         }
         tick(id);
@@ -455,19 +468,17 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       fileDrop(id); // server owns the bytes now
       toast("ok", `上传完成：${ctl.name}`);
     } catch (e: unknown) {
-      if (ctl.canceled || ctl.paused) return;
+      if (ctl.canceled || ctl.userPaused) return;
       if (ctl.uploadId) {
-        // the server-side session is still valid: pause instead of failing so
-        // resume continues from the server offset (no restart, no re-pick)
-        ctl.paused = true;
-        patch(id, { status: "paused", note: "网络持续异常，已暂停，点击「恢复」继续", speed: 0 });
+        // the server-side session is still valid: auto-resume (then pause if the cap is hit)
+        scheduleAutoResume(id);
       } else {
         ctl.file = undefined;
         dropStored(id);
         patch(id, { status: "error", error: describeErr(e), speed: 0, note: undefined });
       }
     }
-  }, [patch, tick]);
+  }, [patch, tick, scheduleAutoResume]);
 
   // ---- streaming upload (pipelined: slices sync to Baidu as they arrive) ----
 
@@ -510,10 +521,11 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
           recomputeSent(ctl);
           throw Object.assign(new Error("need-more-slices"), { needMore: true });
         }
+        if (!isRetryableTransferError(e)) throw e;
         attempt++;
-        if (attempt >= MAX_RETRY) throw new Error(`云端保存失败（已重试 ${MAX_RETRY} 次）：${describeErr(e)}`);
-        patch(id, { note: `正在完成云端保存，重试 (${attempt}/${MAX_RETRY})…` });
-        await sleep(backoff(attempt - 1));
+        if (attempt >= MAX_SLICE_RETRY) throw new Error(`云端保存失败（已重试 ${MAX_SLICE_RETRY} 次）：${describeErr(e)}`);
+        patch(id, { note: `正在完成云端保存，重试 (${attempt}/${MAX_SLICE_RETRY})…` });
+        await sleep(backoffMs(attempt - 1));
       }
     }
   }, [patch]);
@@ -551,6 +563,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
                 st.inflight.delete(seq);
                 st.doneBytes += buf.byteLength;
                 ctl.synced += buf.byteLength;
+                ctl.autoResumes = 0;
                 recomputeSent(ctl);
                 if (ctl.retrying) { ctl.retrying = false; patch(id, { note: undefined }); }
                 tick(id);
@@ -559,16 +572,17 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
                 st.inflight.delete(seq);
                 recomputeSent(ctl);
                 const err = e as Error & { status?: number; aborted?: boolean };
-                if (err.aborted || ctl.paused || ctl.canceled) return; // pause/cancel aborts are expected
+                if (err.aborted || ctl.paused || ctl.canceled || ctl.userPaused) return; // pause/cancel aborts are expected
                 if (err.status === 404) {
                   fatal = Object.assign(new Error("上传会话已失效，请重新上传"), { sessionLost: true });
                   return;
                 }
+                if (!isRetryableTransferError(e)) { fatal = e as Error; return; }
                 attempt++;
-                if (attempt >= MAX_RETRY) { fatal = new Error(`上传失败（已重试 ${MAX_RETRY} 次）：${describeErr(e)}`); return; }
+                if (attempt >= MAX_SLICE_RETRY) { fatal = new Error(`上传失败（已重试 ${MAX_SLICE_RETRY} 次）：${describeErr(e)}`); return; }
                 ctl.retrying = true;
-                patch(id, { note: `网络波动，正在重试 (${attempt}/${MAX_RETRY})…`, speed: 0 });
-                await sleep(backoff(attempt - 1));
+                patch(id, { note: sliceRetryNote(attempt), speed: 0 });
+                await sleep(backoffMs(attempt - 1));
               }
             }
           }
@@ -577,17 +591,15 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       await Promise.all(workers);
 
       if (ctl.canceled) return;
-      if (ctl.paused) { patch(id, { status: "paused", speed: 0, syncSpeed: 0 }); return; }
+      if (ctl.userPaused || (ctl.paused && !fatal)) { patch(id, { status: "paused", speed: 0, syncSpeed: 0 }); return; }
       if (fatal) {
-        if ((fatal as { sessionLost?: boolean }).sessionLost) {
-          // the server no longer knows this session: nothing to resume
+        if ((fatal as { sessionLost?: boolean }).sessionLost || !isRetryableTransferError(fatal)) {
+          // the server no longer knows this session, or the error is not transient
           ctl.file = undefined;
           dropStored(id);
           patch(id, { status: "error", error: describeErr(fatal), speed: 0, syncSpeed: 0, note: undefined });
         } else {
-          // transient exhaustion: keep session + file, resume continues where it stopped
-          ctl.paused = true;
-          patch(id, { status: "paused", speed: 0, syncSpeed: 0, note: "网络持续异常，已暂停，点击「恢复」继续" });
+          scheduleAutoResume(id);
         }
         return;
       }
@@ -596,13 +608,12 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         return;
       } catch (e) {
         if ((e as { needMore?: boolean }).needMore) continue; // missing slices were re-queued
-        // finish kept failing: the session is still resumable — pause, don't discard
-        ctl.paused = true;
-        patch(id, { status: "paused", speed: 0, syncSpeed: 0, note: "云端保存未完成，已暂停，点击「恢复」重试" });
+        if (ctl.userPaused || ctl.canceled) return;
+        scheduleAutoResume(id, "finish");
         return;
       }
     }
-  }, [patch, tick, streamFinish]);
+  }, [patch, tick, streamFinish, scheduleAutoResume]);
 
   // driveStreamUpload runs plan -> local md5 pre-scan -> init (rapid-upload
   // short-circuit) -> sliding-window slices -> finish. Returns "fallback" when
@@ -624,9 +635,26 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       const win: number = plan.window || 3;
 
       // local md5 pre-scan (no network); also what makes 秒传 possible.
-      // Intentionally silent: no note/progress during initialization.
-      let blockList = await computeBlockList(file, sliceSize, () => {}, () => ctl.canceled);
-      if (!blockList) return "ok"; // canceled during hashing
+      // Visible checksum progress — never reported as network bytes.
+      const hashFile = async (size: number) => {
+        let lastPct = -1;
+        let lastAt = 0;
+        const report = (done: number, total: number) => {
+          const pct = hashPercent(done, total);
+          const now = Date.now();
+          if (!shouldPublishHashProgress(lastPct, pct, now - lastAt) && lastPct >= 0) return;
+          lastPct = pct;
+          lastAt = now;
+          patch(id, { status: "hashing", note: formatHashNote(pct), checkProgress: pct, speed: 0 });
+        };
+        report(0, Math.max(1, Math.ceil(file.size / size)));
+        return computeBlockList(file, size, report, () => ctl.canceled || ctl.userPaused || ctl.paused);
+      };
+
+      let blockList = await hashFile(sliceSize);
+      if (!blockList) return "ok"; // canceled or paused during hashing
+
+      patch(id, { status: "running", note: "正在准备秒传…", checkProgress: 100, speed: 0 });
 
       let init: Record<string, unknown>;
       for (;;) {
@@ -641,14 +669,15 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
           // node changed between plan and init and implies another slice size: re-hash once
           if (err.status === 409 && err.data?.slice_size && err.data.slice_size !== sliceSize) {
             sliceSize = err.data.slice_size;
-            blockList = await computeBlockList(file, sliceSize, () => {}, () => ctl.canceled);
+            blockList = await hashFile(sliceSize);
             if (!blockList) return "ok";
+            patch(id, { status: "running", note: "正在准备秒传…", checkProgress: 100, speed: 0 });
             continue;
           }
           throw e;
         }
       }
-      patch(id, { note: undefined });
+      patch(id, { note: undefined, checkProgress: undefined });
 
       const total = Math.max(1, Math.ceil(file.size / sliceSize));
       ctl.stream = {
@@ -676,20 +705,17 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       await streamLoop(id);
       return "ok";
     } catch (e) {
-      if (!ctl.canceled && !ctl.paused) {
-        if (ctl.stream) {
-          // session exists: recoverable — pause so resume picks it back up
-          ctl.paused = true;
-          patch(id, { status: "paused", speed: 0, syncSpeed: 0, note: "已暂停，点击「恢复」继续" });
-        } else {
-          ctl.file = undefined;
-          dropStored(id);
-          patch(id, { status: "error", error: describeErr(e), speed: 0, syncSpeed: 0, note: undefined });
-        }
+      if (ctl.canceled || ctl.userPaused) return "ok";
+      if (ctl.stream && isRetryableTransferError(e)) {
+        scheduleAutoResume(id);
+      } else {
+        ctl.file = undefined;
+        dropStored(id);
+        patch(id, { status: "error", error: describeErr(e), speed: 0, syncSpeed: 0, note: undefined, checkProgress: undefined });
       }
       return "ok";
     }
-  }, [patch, streamLoop, streamFinish]);
+  }, [patch, streamLoop, streamFinish, scheduleAutoResume]);
 
   // resumeStream re-syncs the missing-slice set from the server (superfile2 is
   // idempotent, so anything aborted mid-flight is simply re-sent).
@@ -720,17 +746,16 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       await streamLoop(id);
     } catch (e) {
       const err = e as Error & { status?: number };
-      if (ctl.canceled || ctl.paused) return;
-      if (err.status === 404) { // session truly gone on the server
+      if (ctl.canceled || ctl.userPaused) return;
+      if (err.status === 404 || !isRetryableTransferError(e)) { // session truly gone on the server
         ctl.file = undefined;
         dropStored(id);
         patch(id, { status: "error", error: "上传会话已失效，请重新上传", speed: 0, syncSpeed: 0, note: undefined });
-      } else { // transient: stay resumable
-        ctl.paused = true;
-        patch(id, { status: "paused", speed: 0, syncSpeed: 0, note: "恢复失败，已暂停，点击「恢复」重试" });
+      } else {
+        scheduleAutoResume(id);
       }
     }
-  }, [patch, streamLoop, streamFinish]);
+  }, [patch, streamLoop, streamFinish, scheduleAutoResume]);
 
   // ---- download (ranged streaming, resumable, retrying) --------------------
   // Received bytes are flushed to IndexedDB so an interruption or page refresh
@@ -755,6 +780,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     if (!ctl) return;
     let attempt = 0;
     let pendBytes = ctl.chunks.reduce((n, c) => n + c.length, 0);
+    if (ctl.sent === 0) patch(id, { note: "正在获取下载地址…" });
     for (;;) {
       const before = ctl.sent;
       try {
@@ -770,7 +796,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         }
         const reader = res.body!.getReader();
         ctl.lastTime = Date.now(); ctl.lastBytes = ctl.sent;
-        if (ctl.retrying) { ctl.retrying = false; patch(id, { note: undefined }); }
+        if (ctl.retrying || before === 0) { ctl.retrying = false; patch(id, { note: undefined }); }
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -799,28 +825,33 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         toast("ok", `下载完成：${ctl.name}`);
         return;
       } catch (e: unknown) {
-        if (ctl.paused || ctl.canceled) { if (ctl.paused) flushDownload(id); return; }
-        attempt = ctl.sent > before ? 1 : attempt + 1; // reset budget when progress was made
-        if (attempt >= MAX_RETRY) {
-          // keep the received bytes: pause instead of failing, resume continues via Range
-          ctl.paused = true;
+        if (ctl.paused || ctl.canceled || ctl.userPaused) { if (ctl.paused) flushDownload(id); return; }
+        if (ctl.sent > before) ctl.autoResumes = 0;
+        if (!isRetryableTransferError(e)) {
           await flushDownload(id);
-          patch(id, { status: "paused", note: "网络持续异常，已暂停，点击「恢复」继续", speed: 0 });
+          patch(id, { status: "error", error: describeErr(e), speed: 0, note: undefined });
+          return;
+        }
+        attempt = ctl.sent > before ? 1 : attempt + 1; // reset budget when progress was made
+        if (attempt >= MAX_SLICE_RETRY) {
+          // keep the received bytes: auto-resume (then pause if the cap is hit)
+          await flushDownload(id);
+          scheduleAutoResume(id);
           return;
         }
         ctl.retrying = true;
-        patch(id, { note: `网络中断，正在重试 (${attempt}/${MAX_RETRY})…`, speed: 0 });
-        await sleep(backoff(attempt - 1)); // resumes from ctl.sent via Range on next loop
+        patch(id, { note: `网络中断，正在重试 (${attempt}/${MAX_SLICE_RETRY})…`, speed: 0 });
+        await sleep(backoffMs(attempt - 1)); // resumes from ctl.sent via Range on next loop
       }
     }
-  }, [patch, tick, flushDownload]);
+  }, [patch, tick, flushDownload, scheduleAutoResume]);
 
   // ---- public api ----------------------------------------------------------
   const startUpload = useCallback((file: File, path: string) => {
     const id = uid();
     ctls.current.set(id, {
       kind: "upload", name: file.name, path, total: file.size, sent: 0, shown: 0, synced: 0,
-      paused: false, canceled: false, file, chunks: [], dlSeq: 0, retrying: false,
+      paused: false, canceled: false, file, chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
     // persist the File so a refresh/interruption never needs re-picking
@@ -852,7 +883,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     ctls.current.set(id, {
       kind: "download", name, path: item.path, total: item.size, sent: 0, shown: 0, synced: 0,
       paused: false, canceled: false, fileId: item.id, downloadUrl: dlUrl,
-      chunks: [], dlSeq: 0, retrying: false,
+      chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
     setTransfers((l) => [{ id, kind: "download", name, path: item.path, total: item.size, transferred: 0, speed: 0, status: "running" }, ...l]);
@@ -863,14 +894,21 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     const ctl = ctls.current.get(id);
     if (!ctl) return;
     ctl.paused = true;
-    patch(id, { status: "paused", speed: 0, syncSpeed: 0 });
+    ctl.userPaused = true;
+    ctl.autoResumeGen++;
+    patch(id, { status: "paused", speed: 0, syncSpeed: 0, checkProgress: undefined });
     if (ctl.abort) { try { ctl.abort.abort(); } catch { /* ignore */ } }
     if (ctl.stream) ctl.stream.xhrs.forEach((x) => { try { x.abort(); } catch { /* ignore */ } });
   }, [patch]);
 
-  const resume = useCallback(async (id: string) => {
+  const resume = useCallback(async (id: string, opts?: { auto?: boolean }) => {
     const ctl = ctls.current.get(id);
     if (!ctl) return;
+    if (!opts?.auto) {
+      ctl.userPaused = false;
+      ctl.autoResumes = 0;
+      ctl.autoResumeGen++; // cancel any pending automatic retry timer
+    }
     if (ctl.kind === "download") {
       ctl.paused = false;
       patch(id, { status: "running", note: undefined });
@@ -884,6 +922,11 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       const stored = await fileLoad(id).catch(() => undefined);
       if (stored && stored.name === ctl.name && stored.size === ctl.total) {
         ctl.file = stored;
+      } else if (opts?.auto) {
+        // never pop a file picker from an automatic retry
+        ctl.paused = true;
+        patch(id, { status: "paused", note: "原文件不可用，恢复时请重新选择" });
+        return;
       } else {
         const f = await pickFile();
         if (!f) return; // picker dismissed: stay paused
@@ -922,11 +965,13 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     }
     driveUpload(id);
   }, [patch, driveUpload, driveDownload, resumeStream, driveStreamUpload]);
+  resumeRef.current = resume;
 
   const cancel = useCallback((id: string) => {
     const ctl = ctls.current.get(id);
     if (!ctl) return;
     ctl.canceled = true;
+    ctl.autoResumeGen++;
     ctl.chunks = [];   // free download buffer
     ctl.file = undefined;
     if (ctl.abort) { try { ctl.abort.abort(); } catch { /* ignore */ } }
@@ -948,7 +993,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
 
   const clearFinished = useCallback(() => {
     setTransfers((l) => l.filter((t) => {
-      const keep = t.status === "running" || t.status === "paused" || t.status === "finalizing";
+      const keep = t.status === "hashing" || t.status === "running" || t.status === "paused" || t.status === "finalizing";
       if (!keep) { ctls.current.delete(t.id); dropStored(t.id); }
       return keep;
     }));
@@ -972,7 +1017,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     const id = "imp-" + jobId;
     ctls.current.set(id, {
       kind: "import", name, path, total, sent: 0, shown: 0, synced: 0,
-      paused: false, canceled: false, chunks: [], jobId, dlSeq: 0, retrying: false,
+      paused: false, canceled: false, chunks: [], jobId, dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
     setTransfers((l) => [{ id, kind: "import", name, path, total, transferred: 0, speed: 0, status: "running" }, ...l]);
@@ -1018,16 +1063,18 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
 }
 
 function taskToTransfer(task: ClientTask): Transfer {
-  const active = task.status === "waiting" || task.status === "hashing" || task.status === "running";
-  const status: TransferStatus = active
-    ? "running"
-    : task.status === "done" ? "done" : task.status === "error" ? "error" : "canceled";
+  const status: TransferStatus = task.status === "hashing"
+    ? "hashing"
+    : task.status === "waiting" || task.status === "running"
+      ? "running"
+      : task.status === "done" ? "done" : task.status === "error" ? "error" : "canceled";
   const note = task.detail
     || (task.status === "waiting"
       ? "等待本地客户端调度"
       : task.status === "hashing"
-        ? "正在本机计算文件指纹"
+        ? formatHashNote(0)
         : undefined);
+  const checkProgress = task.status === "hashing" ? (parseCheckProgress(note) ?? 0) : undefined;
   return {
     id: task.id,
     kind: task.kind,
@@ -1042,6 +1089,7 @@ function taskToTransfer(task: ClientTask): Transfer {
       : undefined,
     status,
     note,
+    checkProgress,
     error: task.error,
   };
 }

@@ -3,6 +3,7 @@ import { useTransfers, TransferStatus } from "./transfer";
 import { humanRate } from "./lib/format";
 
 const LABEL: Record<TransferStatus, string> = {
+  hashing: "正在校验",
   running: "传输中",
   paused: "已暂停",
   finalizing: "云端处理中",
@@ -21,7 +22,7 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
   const shown = transfers.filter((t) => t.status !== "done" && t.status !== "canceled");
   if (hidden || shown.length === 0) return null;
 
-  const active = shown.filter((t) => t.status === "running" || t.status === "paused" || t.status === "finalizing");
+  const active = shown.filter((t) => t.status === "hashing" || t.status === "running" || t.status === "paused" || t.status === "finalizing");
   const speed = active.reduce((s, t) => s + (t.status === "running" ? t.speed : 0), 0);
   const summary = active.length > 0 ? `${active.length} 个进行中` : "已全部结束";
 
@@ -39,10 +40,13 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
       {open && (
         <div className="transfer-drawer-body">
           {shown.map((t) => {
-            const pct = t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
-            const color = t.status === "error" ? "#dc2626" : t.status === "done" ? "#16a34a" : t.status === "paused" ? "#d97706" : "#6366f1";
+            const isHashing = t.status === "hashing";
+            const pct = isHashing
+              ? (t.checkProgress ?? 0)
+              : t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
+            const color = t.status === "error" ? "#dc2626" : t.status === "done" ? "#16a34a" : t.status === "paused" ? "#d97706" : isHashing ? "#7c3aed" : "#6366f1";
             // streaming uploads carry a second progress: bytes confirmed at the cloud
-            const isStream = t.kind === "upload" && t.synced !== undefined;
+            const isStream = !isHashing && t.kind === "upload" && t.synced !== undefined;
             const syncPct = isStream && t.total > 0 ? Math.min(100, Math.round(((t.synced || 0) / t.total) * 100)) : 0;
             return (
               <div key={t.id} className="transfer-drawer-row">
@@ -56,17 +60,19 @@ export default function TransferDrawer({ hidden = false, onViewAll }: { hidden?:
                     </div>
                   )}
                 </div>
-                <span className="drawer-pct" title={isStream ? `已上传 ${pct}% · 云端已保存 ${syncPct}%` : undefined}>
-                  {isStream ? `${pct}%·☁${syncPct}%` : `${pct}%`}
+                <span className="drawer-pct" title={isHashing ? `校验 ${pct}%` : isStream ? `已上传 ${pct}% · 云端已保存 ${syncPct}%` : undefined}>
+                  {isHashing ? `校验 ${pct}%` : isStream ? `${pct}%·☁${syncPct}%` : `${pct}%`}
                 </span>
                 <span className="drawer-info" title={t.error || t.note || undefined}>
                   {t.status === "error"
                     ? (t.error || LABEL.error)
-                    : t.status === "running"
-                      ? (isStream
-                          ? `↑${humanRate(t.speed)} ☁${humanRate(t.syncSpeed || 0)}`
-                          : (t.speed > 0 ? humanRate(t.speed) : (t.note || LABEL.running)))
-                      : LABEL[t.status]}
+                    : isHashing
+                      ? (t.note || LABEL.hashing)
+                      : t.status === "running"
+                        ? (isStream
+                            ? `↑${humanRate(t.speed)} ☁${humanRate(t.syncSpeed || 0)}`
+                            : (t.speed > 0 ? humanRate(t.speed) : (t.note || LABEL.running)))
+                        : (t.note || LABEL[t.status])}
                 </span>
               </div>
             );

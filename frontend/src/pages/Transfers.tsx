@@ -7,6 +7,7 @@ import { useTransfers, TransferStatus } from "../transfer";
 const HIST_PAGE_SIZE = 20;
 
 const STATUS: Record<TransferStatus, { label: string; kind: string }> = {
+  hashing: { label: "正在校验", kind: "blue" },
   running: { label: "传输中", kind: "blue" },
   paused: { label: "已暂停", kind: "amber" },
   finalizing: { label: "云端处理中", kind: "amber" },
@@ -65,11 +66,14 @@ export default function Transfers() {
         </thead>
         <tbody>
           {transfers.map((t) => {
-            const pct = t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
-            const barColor = t.status === "error" ? "#dc2626" : t.status === "paused" ? "#d97706" : t.status === "done" ? "#16a34a" : "#6366f1";
+            const isHashing = t.status === "hashing";
+            const pct = isHashing
+              ? (t.checkProgress ?? 0)
+              : t.total > 0 ? Math.min(100, Math.round((t.transferred / t.total) * 100)) : (t.status === "done" ? 100 : 0);
+            const barColor = t.status === "error" ? "#dc2626" : t.status === "paused" ? "#d97706" : t.status === "done" ? "#16a34a" : isHashing ? "#7c3aed" : "#6366f1";
             const s = STATUS[t.status];
             // streaming uploads carry a second progress: bytes confirmed at the cloud
-            const isStream = t.kind === "upload" && t.synced !== undefined;
+            const isStream = !isHashing && t.kind === "upload" && t.synced !== undefined;
             const syncPct = isStream && t.total > 0 ? Math.min(100, Math.round(((t.synced || 0) / t.total) * 100)) : 0;
             return (
               <tr key={t.id}>
@@ -83,7 +87,7 @@ export default function Transfers() {
                     </div>
                   )}
                   <span className="muted" style={{ fontSize: 12 }}>
-                    {isStream ? `已上传 ${pct}% · 云端已保存 ${syncPct}%` : `${pct}%`}
+                    {isHashing ? `校验 ${pct}%` : isStream ? `已上传 ${pct}% · 云端已保存 ${syncPct}%` : `${pct}%`}
                   </span>
                 </td>
                 <td className="muted">
@@ -103,7 +107,7 @@ export default function Transfers() {
                     </div>
                   ) : "—"}
                 </td>
-                <td className="muted">{humanSize(t.transferred)} / {humanSize(t.total)}</td>
+                <td className="muted">{isHashing ? `校验中 · ${humanSize(t.total)}` : `${humanSize(t.transferred)} / ${humanSize(t.total)}`}</td>
                 <td>
                   <Badge kind={s.kind}>{s.label}</Badge>
                   {t.note && <div style={{ fontSize: 11, color: "#d97706", marginTop: 2 }}>{t.note}</div>}
@@ -111,9 +115,9 @@ export default function Transfers() {
                 </td>
                 <td>
                   <div className="row">
-                    {!clientMode && t.kind !== "import" && t.status === "running" && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
+                    {!clientMode && t.kind !== "import" && (t.status === "running" || t.status === "hashing") && <button className="btn ghost sm" onClick={() => pause(t.id)}>暂停</button>}
                     {!clientMode && t.status === "paused" && <button className="btn ghost sm" onClick={() => resume(t.id)}>恢复</button>}
-                    {t.kind !== "import" && (t.status === "running" || t.status === "paused" || t.status === "finalizing") &&
+                    {t.kind !== "import" && (t.status === "running" || t.status === "hashing" || t.status === "paused" || t.status === "finalizing") &&
                       <button className="btn danger sm" onClick={() => cancel(t.id)}>取消</button>}
                     {(t.status === "done" || t.status === "error" || t.status === "canceled") &&
                       <button className="btn ghost sm" onClick={() => remove(t.id)}>清除</button>}

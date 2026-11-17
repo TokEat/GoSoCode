@@ -112,7 +112,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 	var blocks []string
 	for attempt := 0; ; attempt++ {
 		t.setStatus("hashing")
-		t.setDetail("正在计算文件指纹")
+		t.setDetail("正在校验，准备秒传… 0%")
 		t.logf("hashing local file attempt=%d slice_size=%d", attempt+1, sliceSize)
 		var size int64
 		blocks, size, err = sliceMD5sWithProgress(t, sliceSize, encKey, encIV)
@@ -289,7 +289,7 @@ func sliceMD5sWithProgress(t *Task, sliceSize int64, key, iv []byte) ([]string, 
 		// every 5% to keep the phase log readable
 		if pct := int(read * 100 / t.Size); pct <= 100 && (lastPct < 0 || pct-lastPct >= 5) {
 			lastPct = pct
-			t.setDetail(fmt.Sprintf("正在计算文件指纹 %d%%", pct))
+			t.setDetail(fmt.Sprintf("正在校验，准备秒传… %d%%", pct))
 		}
 	}}
 	return baidu.SliceReaderMD5s(cr, sliceSize)
