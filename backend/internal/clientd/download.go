@@ -127,6 +127,11 @@ func (d *Daemon) runDownload(ctx context.Context, t *Task, logicalPath string) {
 			return
 		}
 		t.logf("encrypted file; segments will be decrypted locally")
+	} else if info.Size >= 256 {
+		if err := d.sniffPlaintext(ctx, info); err != nil {
+			t.fail(err.Error())
+			return
+		}
 	}
 	t.set(func(t *Task) {
 		if info.Name != "" {
@@ -405,4 +410,34 @@ func (d *Daemon) reportDown(auth string, nodeID uint, bytes int64) {
 	} else if status != http.StatusOK {
 		log.Printf("[client] 下载流量上报失败 node=%d bytes=%d HTTP=%d error=%s", nodeID, bytes, status, serverErrMsg(raw, "unknown"))
 	}
+}
+
+// sniffPlaintext peek-reads the first bytes of an unmarked file from Baidu and
+// aborts before creating a local target when the payload looks like ciphertext.
+// Transport errors are logged and ignored so a flaky probe cannot block a
+// normal plaintext download; the main transfer still has its own retries.
+func (d *Daemon) sniffPlaintext(ctx context.Context, info *dlInfo) error {
+	if d.baidu == nil || info == nil || info.Dlink == "" {
+		return nil
+	}
+	resp, err := d.baidu.OpenDownload(ctx, info.Token, info.Dlink, "bytes=0-511")
+	if err != nil {
+		log.Printf("[client] ciphertext sniff skipped name=%q: %v", info.Name, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("[client] ciphertext sniff skipped name=%q: HTTP %d", info.Name, resp.StatusCode)
+		return nil
+	}
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil && err != io.EOF {
+		log.Printf("[client] ciphertext sniff skipped name=%q: %v", info.Name, err)
+		return nil
+	}
+	if cryptoutil.LooksLikeCiphertext(prefix) {
+		log.Printf("[client] download aborted: content looks like ciphertext name=%q size=%d", info.Name, info.Size)
+		return fmt.Errorf("文件内容疑似加密密文且无法解密，已中止下载")
+	}
+	return nil
 }

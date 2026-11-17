@@ -11,6 +11,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -205,7 +206,14 @@ func (s *Syncer) loop() {
 		for _, id := range ids {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if err := s.SyncNow(ctx, id); err != nil {
-				log.Printf("[manifest] write-back failed node=%d: %v", id, err)
+				switch {
+				case errors.Is(err, ErrEmptyManifestRefused):
+					log.Printf("[manifest] refused empty overwrite node=%d: %v", id, err)
+				case errors.Is(err, ErrEmptyManifestSkipped):
+					log.Printf("[manifest] skipped empty write-back node=%d: %v", id, err)
+				default:
+					log.Printf("[manifest] write-back failed node=%d: %v", id, err)
+				}
 			}
 			cancel()
 		}
@@ -223,6 +231,10 @@ func (s *Syncer) SyncNow(ctx context.Context, accID uint) error {
 	if err != nil {
 		return err
 	}
+	local, err := ParseDoc(data)
+	if err != nil {
+		return fmt.Errorf("构建清单失败: %w", err)
+	}
 	token, err := s.pool.Token(ctx, acc)
 	if err != nil {
 		return err
@@ -232,6 +244,31 @@ func (s *Syncer) SyncNow(ctx context.Context, accID uint) error {
 		return err
 	}
 	defer unlock()
+
+	// Empty snapshots must never be uploaded: they are the 0-entry / ~91-byte
+	// document that previously overwrote live remote manifests after a mass
+	// delete or a passthrough-only rebuild.
+	if IsEmptyDoc(local) {
+		remoteDoc, exists, ferr := s.fetchIfExists(ctx, acc)
+		if ferr != nil {
+			return fmt.Errorf("拒绝写入空清单：无法确认网盘现有清单: %w", ferr)
+		}
+		if err := DecideWrite(local, remoteDoc, exists); err != nil {
+			// The decision is final for this snapshot; remember it so the
+			// 10-minute reconcile loop does not hammer ListDir/Fetch.
+			s.markSynced(accID, snapshotAt)
+			n := 0
+			if remoteDoc != nil {
+				n = len(remoteDoc.Entries)
+			}
+			if errors.Is(err, ErrEmptyManifestRefused) {
+				log.Printf("[manifest] refused empty overwrite node=%d remote=%s remote_entries=%d local_bytes=%d", accID, RemotePath(acc), n, len(data))
+			} else {
+				log.Printf("[manifest] skipped empty write-back node=%d remote_exists=%v remote_entries=%d local_bytes=%d", accID, exists, n, len(data))
+			}
+			return err
+		}
+	}
 
 	remote := RemotePath(acc)
 	sum := md5.Sum(data)
@@ -294,7 +331,7 @@ func (s *Syncer) Fetch(ctx context.Context, acc *models.BaiduAccount) (*Doc, err
 		}
 	}
 	if fsID == 0 {
-		return nil, fmt.Errorf("网盘上未找到元数据清单 %s", FileName)
+		return nil, fmt.Errorf("%w %s", ErrNotFound, FileName)
 	}
 	if err := s.coord.Limiter.Wait(ctx, acctKey); err != nil {
 		return nil, err

@@ -360,6 +360,10 @@ func (s *Server) serveZip(c *gin.Context, targetPath string, share *models.Share
 				return
 			}
 		}
+		if err := s.ensureDecryptable(&files[i]); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	s.logTransferEvent(&models.TransferEvent{
@@ -426,6 +430,18 @@ func (s *Server) serveZip(c *gin.Context, targetPath string, share *models.Share
 			continue
 		}
 
+		body, err := s.decryptedBody(resp, &f)
+		if err != nil {
+			log.Printf("[zip] decrypt init failed file=%d: %v", f.ID, err)
+			resp.Body.Close()
+			continue
+		}
+		if body, err = s.guardedDownloadBody(body, &f, 0); err != nil {
+			log.Printf("[zip] ciphertext refused file=%d: %v", f.ID, err)
+			resp.Body.Close()
+			return
+		}
+
 		header := &zip.FileHeader{
 			Name:   entryName,
 			Method: zip.Deflate,
@@ -434,13 +450,6 @@ func (s *Server) serveZip(c *gin.Context, targetPath string, share *models.Share
 		w, err := zw.CreateHeader(header)
 		if err != nil {
 			log.Printf("[zip] create header failed file=%d: %v", f.ID, err)
-			resp.Body.Close()
-			continue
-		}
-
-		body, err := s.decryptedBody(resp, &f)
-		if err != nil {
-			log.Printf("[zip] decrypt init failed file=%d: %v", f.ID, err)
 			resp.Body.Close()
 			continue
 		}

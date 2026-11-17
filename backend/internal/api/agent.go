@@ -257,6 +257,10 @@ func (s *Server) handleAgentDownloadResolve(c *gin.Context) {
 		encFile = &ff
 	}
 
+	if err := s.ensureDecryptable(encFile); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 	token, err := s.pool.Token(ctx, acc)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

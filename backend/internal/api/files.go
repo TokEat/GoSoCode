@@ -909,6 +909,10 @@ func (s *Server) decryptedBody(resp *http.Response, f *models.File) (io.Reader, 
 }
 
 func (s *Server) proxyDownload(c *gin.Context, uid uint, acc *models.BaiduAccount, token string, fsID uint64, fallbackName, logLabel string, encFile *models.File) int64 {
+	if err := s.ensureDecryptable(encFile); err != nil {
+		s.rejectDownload(c, logLabel, acc.ID, err)
+		return 0
+	}
 	ctx := c.Request.Context()
 	var resp *http.Response
 	filename := fallbackName
@@ -959,6 +963,10 @@ func (s *Server) proxyDownload(c *gin.Context, uid uint, acc *models.BaiduAccoun
 	if err != nil {
 		log.Printf("[download] decrypt init failed %s node=%d: %v", logLabel, acc.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法解密文件"})
+		return 0
+	}
+	if body, err = s.guardedDownloadBody(body, encFile, contentRangeStart(resp)); err != nil {
+		s.rejectDownload(c, logLabel, acc.ID, err)
 		return 0
 	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
@@ -1105,6 +1113,10 @@ func (s *Server) handleDownload(c *gin.Context) {
 	if s.accessDenied(c, f.LogicalPath) {
 		return
 	}
+	if err := s.ensureDecryptable(&f); err != nil {
+		s.rejectDownload(c, fmt.Sprintf("file=%d", f.ID), f.BaiduAccountID, err)
+		return
+	}
 
 	var offsetStart, offsetEnd int64
 	parseRangeHeader(c.GetHeader("Range"), f.Size, &offsetStart, &offsetEnd)
@@ -1179,6 +1191,10 @@ func (s *Server) handleDownload(c *gin.Context) {
 	if err != nil {
 		log.Printf("[download] decrypt init failed file=%d node=%d: %v", f.ID, acc.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法解密文件"})
+		return
+	}
+	if body, err = s.guardedDownloadBody(body, &f, contentRangeStart(resp)); err != nil {
+		s.rejectDownload(c, fmt.Sprintf("file=%d", f.ID), acc.ID, err)
 		return
 	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
