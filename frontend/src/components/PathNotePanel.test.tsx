@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { PathNotePanel } from "./PathNotePanel";
+import { PathNotePanel, NoteBadge, NotePreview } from "./PathNotePanel";
 
 vi.mock("../lib/api", () => ({
   api: {
@@ -66,5 +66,41 @@ describe("PathNotePanel", () => {
     await user.click(screen.getByRole("button", { name: "完成" }));
     await waitFor(() => expect(putNote.mock.calls.some((c: any[]) => String(c[2]).includes("第一段说明") && String(c[2]).length > 80)).toBe(true));
     expect(onChanged).toHaveBeenCalled();
+  });
+});
+
+describe("NoteBadge", () => {
+  it("shows a visible 备注 label and previews on click", async () => {
+    const user = userEvent.setup();
+    const onClick = vi.fn();
+    render(<NoteBadge onClick={onClick} />);
+    const btn = screen.getByRole("button", { name: "查看备注" });
+    expect(btn).toHaveTextContent("备注");
+    await user.click(btn);
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("NotePreview", () => {
+  it("loads and shows the note body", async () => {
+    getNote.mockResolvedValue({
+      path: "/资料盘/a.pdf", is_dir: false, exists: true,
+      body: "这是预览内容\n\n第二段",
+    });
+    const onEdit = vi.fn();
+    render(
+      <NotePreview
+        target={target}
+        x={40}
+        y={80}
+        onClose={() => {}}
+        onEdit={onEdit}
+      />,
+    );
+    expect(await screen.findByText("这是预览内容")).toBeInTheDocument();
+    expect(screen.getByText("第二段")).toBeInTheDocument();
+    expect(screen.getByText("文件备注")).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "编辑" }));
+    expect(onEdit).toHaveBeenCalled();
   });
 });

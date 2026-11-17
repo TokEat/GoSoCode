@@ -8,7 +8,7 @@ import { JobEvent } from "../App";
 import LocalFilePicker from "../LocalFilePicker";
 import { LocalEntry } from "../lib/api";
 import FileSearch from "../components/FileSearch";
-import { PathNotePanel, NoteFlag } from "../components/PathNotePanel";
+import { PathNotePanel, NoteBadge, NotePreview } from "../components/PathNotePanel";
 import { normDir, fullPath, parentDir, baseName, searchLocateTarget } from "../lib/searchLocate";
 
 // ---- path helpers ----------------------------------------------------------
@@ -90,6 +90,11 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
   const [locatePath, setLocatePath] = useState("");
   const [noteTarget, setNoteTarget] = useState<{ path: string; isDir: boolean; name: string } | null>(null);
   const [noteFlags, setNoteFlags] = useState<Set<string>>(new Set());
+  const [notePreview, setNotePreview] = useState<{ path: string; isDir: boolean; name: string; x: number; y: number } | null>(null);
+
+  const openNotePreview = (e: React.MouseEvent, t: { path: string; isDir: boolean; name: string }) => {
+    setNotePreview({ ...t, x: e.clientX, y: e.clientY });
+  };
   const fileRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
   const dialog = useDialog();
@@ -514,10 +519,15 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         </div>
         <FileSearch onLocate={locate} />
         {cwd !== "/" && (
-          <button className="btn ghost sm" title="当前目录备注"
-            onClick={() => setNoteTarget({ path: cwdKey, isDir: true, name: baseName(cwd) || cwd })}>
-            备注{noteFlags.has(cwdKey) && <NoteFlag />}
-          </button>
+          noteFlags.has(cwdKey) ? (
+            <NoteBadge title="查看当前目录备注"
+              onClick={(e) => openNotePreview(e, { path: cwdKey, isDir: true, name: baseName(cwd) || cwd })} />
+          ) : (
+            <button className="btn ghost sm" title="当前目录备注"
+              onClick={() => setNoteTarget({ path: cwdKey, isDir: true, name: baseName(cwd) || cwd })}>
+              备注
+            </button>
+          )
         )}
         <div className="crumb-count">
           {clip && <span className="clip-hint">已剪切: {baseName(clip.path)} · <span className="link" onClick={() => paste(cwd)}>粘贴到此</span></span>}
@@ -534,10 +544,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
             {folderRows.map((d) => {
               const dp = normDir(cwd) + d.name;
               return (
-                <tr key={"d:" + d.name} className="row-folder" style={cutPath === dp ? { opacity: 0.5 } : undefined}
+                <tr key={"d:" + d.name} className={"row-folder" + (noteFlags.has(dp) ? " has-note" : "")} style={cutPath === dp ? { opacity: 0.5 } : undefined}
                   onDoubleClick={() => enter(d.name)}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "folder", name: d.name, path: dp }); }}>
-                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}{noteFlags.has(dp) && <NoteFlag />}</div></td>
+                  <td><div className="name-cell" onClick={() => enter(d.name)}><FolderIcon /> <span className="name-link">{d.name}</span>{d.protected && <span title={d.protectedOwn ? "私密目录（你可管理）" : `私密目录${d.protectedBy ? `（由「${d.protectedBy}」设置）` : ""}`}>🔒</span>}{noteFlags.has(dp) && <NoteBadge onClick={(e) => openNotePreview(e, { path: dp, isDir: true, name: d.name })} />}</div></td>
                   {/* the listing only covers direct children, so a folder's
                       own size is unknown — show a dash instead of "0 B" */}
                   <td className="muted">{d.count > 0 ? humanSize(d.size) : "—"}</td>
@@ -551,10 +561,10 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
               const name = baseName(f.path);
               return (
                 <tr key={"f:" + f.id}
-                  className={locatePath === fullPath(f.path) ? "locate" : undefined}
+                  className={[locatePath === fullPath(f.path) ? "locate" : "", noteFlags.has(fullPath(f.path)) ? "has-note" : ""].filter(Boolean).join(" ") || undefined}
                   style={cutPath === fullPath(f.path) ? { opacity: 0.5 } : undefined}
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, { kind: "file", item: f }); }}>
-                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>}{noteFlags.has(fullPath(f.path)) && <NoteFlag />} {f.status !== "ready" && statusBadge(f.status)}</div></td>
+                  <td><div className="name-cell"><FileIcon /> <span>{name}</span>{f.protected && <span title={f.protected_own ? "私密文件（你可管理）" : `私密文件${f.protected_by ? `（由「${f.protected_by}」设置）` : ""}`}>🔒</span>}{f.encrypted && <span title="加密存储：云端仅保存密文，下载时自动解密">🛡️</span>}{noteFlags.has(fullPath(f.path)) && <NoteBadge onClick={(e) => openNotePreview(e, { path: fullPath(f.path), isDir: false, name })} />} {f.status !== "ready" && statusBadge(f.status)}</div></td>
                   <td className="muted">{humanSize(f.size)}</td>
                   <td className="muted">{fmtTime(f.modified || f.created_at)}</td>
                   <td className="muted">{extOf(name)}</td>
@@ -588,6 +598,21 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
             )}
           </div>
         </>,
+        document.body,
+      )}
+      {notePreview && createPortal(
+        <NotePreview
+          target={notePreview}
+          pwd={pwdFor(notePreview.path)}
+          x={notePreview.x}
+          y={notePreview.y}
+          onClose={() => setNotePreview(null)}
+          onEdit={() => {
+            const { path, isDir, name } = notePreview;
+            setNotePreview(null);
+            setNoteTarget({ path, isDir, name });
+          }}
+        />,
         document.body,
       )}
       {noteTarget && createPortal(

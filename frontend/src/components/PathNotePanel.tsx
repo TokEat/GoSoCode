@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent, type ClipboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type ClipboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../lib/api";
 import { noteImageId, renderNote } from "../lib/noteMarkdown";
 
@@ -275,10 +275,94 @@ export function PathNotePanel({
   );
 }
 
-export function NoteFlag({ title = "已有备注" }: { title?: string }) {
+export function NoteBadge({ onClick, title = "查看备注" }: { onClick: (e: ReactMouseEvent) => void; title?: string }) {
   return (
-    <span className="note-flag" title={title} aria-label={title}>
+    <button type="button" className="note-badge" title={title} aria-label={title}
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); onClick(e); }}>
       <NoteIcon size={13} />
-    </span>
+      备注
+    </button>
+  );
+}
+
+/** @deprecated use NoteBadge */
+export const NoteFlag = NoteBadge;
+
+export function NotePreview({
+  target, pwd, x, y, onClose, onEdit,
+}: {
+  target: NoteTarget;
+  pwd?: string;
+  x: number;
+  y: number;
+  onClose: () => void;
+  onEdit: () => void;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ x, y });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [body, setBody] = useState("");
+  const [lightbox, setLightbox] = useState<{ url: string; alt: string } | null>(null);
+
+  useEffect(() => {
+    let gone = false;
+    setLoading(true);
+    setError("");
+    api.getNote(target.path, pwd).then((n) => {
+      if (gone) return;
+      setBody(n.body || "");
+      setLoading(false);
+    }).catch((e: any) => {
+      if (gone) return;
+      setError(e?.message || "无法打开备注");
+      setLoading(false);
+    });
+    return () => { gone = true; };
+  }, [target.path, pwd]);
+
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    let nx = x, ny = y + 8;
+    if (nx + r.width > window.innerWidth - 10) nx = Math.max(10, window.innerWidth - 10 - r.width);
+    if (ny + r.height > window.innerHeight - 10) ny = Math.max(10, y - 8 - r.height);
+    if (nx !== pos.x || ny !== pos.y) setPos({ x: nx, y: ny });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [x, y, loading, body, error]);
+
+  return (
+    <>
+      <div className="note-preview-overlay" onClick={onClose} />
+      <div ref={box} className="note-preview" style={{ left: pos.x, top: pos.y }} role="dialog" aria-label="备注预览">
+        <header className="note-preview-head">
+          <div className="note-preview-title">{target.name}</div>
+          <span className="note-preview-kind">{target.isDir ? "文件夹备注" : "文件备注"}</span>
+        </header>
+        {loading ? (
+          <div className="note-preview-empty">正在载入…</div>
+        ) : error ? (
+          <div className="note-preview-empty">{error}</div>
+        ) : !body.trim() ? (
+          <div className="note-preview-empty">这条备注是空的</div>
+        ) : (
+          <article className="note-preview-body note-body">
+            {renderNote(body, (src, alt) => (
+              <AuthImage src={src} alt={alt} pwd={pwd} onOpen={(url, a) => setLightbox({ url, alt: a })} />
+            ))}
+          </article>
+        )}
+        <footer className="note-preview-foot">
+          <button className="btn ghost sm" type="button" onClick={onClose}>关闭</button>
+          <button className="btn sm" type="button" onClick={onEdit}>编辑</button>
+        </footer>
+      </div>
+      {lightbox && (
+        <div className="note-lightbox" onClick={() => setLightbox(null)} role="presentation">
+          <img src={lightbox.url} alt={lightbox.alt} />
+        </div>
+      )}
+    </>
   );
 }
