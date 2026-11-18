@@ -57,10 +57,7 @@ func (s *Server) shareAccessDenied(c *gin.Context, logical string) bool {
 	if rule == nil {
 		return false
 	}
-	pwd := c.Query("pwd")
-	if pwd == "" {
-		pwd = c.GetHeader("X-Access-Password")
-	}
+	pwd := presentedPassword(c)
 	if pwd != "" {
 		plain, err := crypto.Unwrap(s.systemConfig().MasterKey, rule.PasswordEnc)
 		if err == nil && plain == pwd {
@@ -166,7 +163,7 @@ func (s *Server) handleCreateShare(c *gin.Context) {
 		return
 	}
 
-	s.audit(c, uidOf(c), usernameOf(c), "share.create", "path="+target+" token="+token)
+	s.audit(c, uidOf(c), usernameOf(c), "share.create", "path="+target)
 
 	scheme := "http"
 	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {

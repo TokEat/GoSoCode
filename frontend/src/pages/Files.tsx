@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, auth, FileItem, Storage, downloadZipUrl } from "../lib/api";
+import { api, auth, FileItem, Storage, downloadZip } from "../lib/api";
 import { Card, statusBadge, useToast, useDialog } from "../ui";
 import { humanSize, fmtTime } from "../lib/format";
 import { useTransfers } from "../transfer";
@@ -352,7 +352,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
       return;
     }
     try {
-      await transfers.startClientUpload(entry.path, cwd);
+      await transfers.startClientUpload(entry.path, cwd, pwdFor(cwd));
       setLocalPicker(false);
       toast("ok", "本机上传任务已创建，可在「传输管理」查看进度");
     } catch (e: any) {
@@ -369,7 +369,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
       if (fileRef.current) fileRef.current.value = "";
       return;
     }
-    transfers.startUpload(f, normDir(cwd) + f.name);
+    transfers.startUpload(f, normDir(cwd) + f.name, pwdFor(cwd));
     toast("ok", "已加入上传队列,可在「传输管理」查看进度");
     if (fileRef.current) fileRef.current.value = "";
   }
@@ -438,7 +438,7 @@ export default function Files({ jobs }: { jobs: Record<string, JobEvent> }) {
         }
       }
     }
-    window.open(downloadZipUrl(dirPath, pwd), "_blank");
+    downloadZip(dirPath, pwd).catch((e: any) => toast("err", e?.message || "打包下载失败"));
   }
 
   async function doDownload(item: FileItem) {

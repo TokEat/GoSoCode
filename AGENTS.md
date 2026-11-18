@@ -18,7 +18,7 @@ npm run dev                # vite on :5173, proxies /api (+WebSocket) to :8080
 npm run build              # tsc -b && vite build
 ```
 
-There are no tests. Config is env vars only (see `backend/internal/config/config.go`): `GSC_ADDR`, `GSC_DB`, `GSC_JWT_SECRET`, `GSC_REDIS` (empty = in-memory coordination, single instance), `GSC_STREAM_ENABLED/_MAX_CONCURRENT/_WINDOW`, etc. First registered user (or seeded `admin`/`admin@qwe123`) is admin. Baidu OAuth app credentials live in the DB (admin UI), not env.
+There are no tests. Config is env vars only (see `backend/internal/config/config.go`): `GSC_ADDR`, `GSC_DB`, `GSC_JWT_SECRET`, `GSC_REDIS` (empty = in-memory coordination, single instance), `GSC_STREAM_ENABLED/_MAX_CONCURRENT/_WINDOW`, etc. The first user in an empty database is a seeded `admin` account; the password comes from `GSC_ADMIN_PASSWORD` or is generated and printed once in the server log. Baidu OAuth app credentials live in the DB (admin UI), not env.
 
 ## Architecture
 

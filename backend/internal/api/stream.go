@@ -235,7 +235,7 @@ func (s *Server) handleStreamInit(c *gin.Context) {
 	if logical == "/" {
 		logical = "/" + in.Name
 	}
-	if s.temporaryAccessDenied(c, logical) {
+	if s.accessDenied(c, logical) {
 		return
 	}
 
@@ -398,7 +398,7 @@ func (s *Server) handleStreamSlice(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
 		return
 	}
-	if s.temporaryAccessDenied(c, sess.LogicalPath) {
+	if s.accessDenied(c, sess.LogicalPath) {
 		return
 	}
 	if seq >= sess.TotalSlices {
@@ -578,7 +578,7 @@ func (s *Server) handleStreamFinish(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "stream session not found"})
 		return
 	}
-	if s.temporaryAccessDenied(c, sess.LogicalPath) {
+	if s.accessDenied(c, sess.LogicalPath) {
 		return
 	}
 	if sess.Completed {

@@ -8,6 +8,7 @@ package api
 import (
 	"net/http"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,20 @@ import (
 func isAdmin(c *gin.Context) bool {
 	role, _ := c.Get("role")
 	return role == "admin"
+}
+
+func isTemporary(c *gin.Context) bool {
+	role, _ := c.Get("role")
+	return role == "temporary"
+}
+
+const accessPasswordHeader = "X-Access-Password"
+
+// presentedPassword returns the path-access password supplied by the client.
+// It is only accepted via the X-Access-Password header so the secret never
+// appears in URLs, proxy logs, or Referer headers.
+func presentedPassword(c *gin.Context) string {
+	return strings.TrimSpace(c.GetHeader(accessPasswordHeader))
 }
 
 // ruleFor returns the most specific AccessRule covering the path (the path
@@ -93,10 +108,7 @@ func (s *Server) accessDenied(c *gin.Context, logical string) bool {
 	if rule.OwnerUserID == uidOf(c) {
 		return false
 	}
-	pwd := c.Query("pwd")
-	if pwd == "" {
-		pwd = c.GetHeader("X-Access-Password")
-	}
+	pwd := presentedPassword(c)
 	if pwd != "" {
 		plain, err := crypto.Unwrap(s.systemConfig().MasterKey, rule.PasswordEnc)
 		if err == nil && plain == pwd {
@@ -112,6 +124,10 @@ func (s *Server) accessDenied(c *gin.Context, logical string) bool {
 // handleProtect creates or updates a password rule on a path.
 // POST /api/files/protect {path, is_dir, password}
 func (s *Server) handleProtect(c *gin.Context) {
+	if isTemporary(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "临时用户不能设置访问密码"})
+		return
+	}
 	uid := uidOf(c)
 	var in struct {
 		Path     string `json:"path" binding:"required"`
@@ -165,6 +181,10 @@ func (s *Server) handleProtect(c *gin.Context) {
 // handleUnprotect removes a password rule. Owner or admin only.
 // POST /api/files/unprotect {path}
 func (s *Server) handleUnprotect(c *gin.Context) {
+	if isTemporary(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "临时用户不能取消访问密码"})
+		return
+	}
 	uid := uidOf(c)
 	var in struct {
 		Path string `json:"path" binding:"required"`
@@ -196,6 +216,9 @@ func (s *Server) handleUnprotect(c *gin.Context) {
 // GET /api/files/protect?path=
 func (s *Server) handleGetProtect(c *gin.Context) {
 	p := cleanLogical(c.Query("path"))
+	if s.temporaryAccessDenied(c, p) {
+		return
+	}
 	var rule models.AccessRule
 	if err := s.db.Where("path = ?", p).First(&rule).Error; err != nil {
 		c.JSON(http.StatusOK, gin.H{"protected": false})

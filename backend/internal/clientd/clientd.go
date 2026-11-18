@@ -487,17 +487,21 @@ func (d *Daemon) invalidateControl() {
 // negotiated on first use. An expired/unknown session (e.g. after a server
 // restart) is renegotiated once transparently.
 func (d *Daemon) serverJSON(ctx context.Context, auth, method, p string, body []byte) (int, []byte, error) {
-	status, raw, err := d.serverJSONOnce(ctx, auth, method, p, body)
+	return d.serverJSONAccess(ctx, auth, method, p, body, "")
+}
+
+func (d *Daemon) serverJSONAccess(ctx context.Context, auth, method, p string, body []byte, accessPassword string) (int, []byte, error) {
+	status, raw, err := d.serverJSONOnce(ctx, auth, method, p, body, accessPassword)
 	if err == nil && status == http.StatusUnauthorized &&
 		strings.Contains(serverErrMsg(raw, ""), "控制面会话") {
 		log.Printf("[client][control] %s %s session expired; renegotiating", method, p)
 		d.invalidateControl()
-		return d.serverJSONOnce(ctx, auth, method, p, body)
+		return d.serverJSONOnce(ctx, auth, method, p, body, accessPassword)
 	}
 	return status, raw, err
 }
 
-func (d *Daemon) serverJSONOnce(ctx context.Context, auth, method, p string, body []byte) (int, []byte, error) {
+func (d *Daemon) serverJSONOnce(ctx context.Context, auth, method, p string, body []byte, accessPassword string) (int, []byte, error) {
 	started := time.Now()
 	cfg := d.config()
 	if !d.connected() {
@@ -514,9 +518,10 @@ func (d *Daemon) serverJSONOnce(ctx context.Context, auth, method, p string, bod
 		return 0, nil, fmt.Errorf("控制面密钥协商失败: %w", err)
 	}
 	encrypted, err := codec.SealRequest(method, target.Path, controlcrypto.Request{
-		Authorization: auth,
-		Query:         target.RawQuery,
-		Body:          body,
+		Authorization:  auth,
+		Query:          target.RawQuery,
+		Body:           body,
+		AccessPassword: accessPassword,
 	})
 	if err != nil {
 		return 0, nil, fmt.Errorf("加密控制请求失败: %w", err)

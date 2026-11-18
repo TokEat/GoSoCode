@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -51,6 +52,9 @@ func (s *Server) issueToken(userID uint) string {
 
 func (s *Server) parseToken(raw string) (uint, bool) {
 	tok, err := jwt.Parse(raw, func(t *jwt.Token) (any, error) {
+		if t.Method != jwt.SigningMethodHS256 {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
 		return []byte(s.cfg.JWTSecret), nil
 	})
 	if err != nil || !tok.Valid {

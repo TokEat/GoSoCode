@@ -253,6 +253,7 @@ func (d *Daemon) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		LocalPath string `json:"local_path"`
 		RemoteDir string `json:"remote_dir"`
+		Pwd       string `json:"pwd"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil || in.LocalPath == "" {
 		writeErr(w, http.StatusBadRequest, "请指定本地文件路径")
@@ -282,7 +283,7 @@ func (d *Daemon) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	t := &Task{
 		ID: uuid.NewString(), Kind: "upload", Name: name,
 		LocalPath: in.LocalPath, RemotePath: logical, Size: fi.Size(),
-		Status: "waiting", CreatedAt: time.Now(), auth: auth, cancel: cancel,
+		Status: "waiting", CreatedAt: time.Now(), auth: auth, pwd: in.Pwd, cancel: cancel,
 	}
 	d.tasks.add(t)
 	t.logf("created local=%q remote=%q size=%d", t.LocalPath, t.RemotePath, t.Size)

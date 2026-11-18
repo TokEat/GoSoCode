@@ -104,9 +104,10 @@ export const auth = {
   history.replaceState(null, "", window.location.pathname + window.location.search);
 })();
 
-async function req(path: string, opts: RequestInit = {}) {
+async function req(path: string, opts: RequestInit = {}, pwd?: string) {
   const headers = new Headers(opts.headers);
   if (auth.token) headers.set("Authorization", `Bearer ${auth.token}`);
+  if (pwd) headers.set("X-Access-Password", pwd);
   const res = await fetch(`/api${path}`, { ...opts, headers });
   if (!res.ok) {
     if (res.status === 401) {
@@ -123,10 +124,8 @@ async function req(path: string, opts: RequestInit = {}) {
   }
   return res;
 }
-// appends ?pwd= for operations on password-protected items
-const pq = (pwd?: string) => (pwd ? `?pwd=${encodeURIComponent(pwd)}` : "");
-const json = (p: string, method: string, body?: any) =>
-  req(p, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined })
+const json = (p: string, method: string, body?: any, pwd?: string) =>
+  req(p, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined }, pwd)
     .then((r) => r.json());
 
 export const api = {
@@ -139,25 +138,25 @@ export const api = {
   // files
   storage: (): Promise<Storage> => json("/storage", "GET"),
   listFiles: (path = "/", pwd?: string): Promise<FileItem[]> =>
-    json(`/files?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.files),
+    json(`/files?path=${encodeURIComponent(path)}`, "GET", undefined, pwd).then((r) => r.files),
   searchFiles: (q: string, pwd?: string): Promise<FileItem[]> =>
-    json(`/files/search?q=${encodeURIComponent(q)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => r.files || []),
-  createFolder: (path: string, pwd?: string) => json(`/files/folder${pq(pwd)}`, "POST", { path }),
-  move: (src: string, dst: string, pwd?: string) => json(`/files/move${pq(pwd)}`, "POST", { src, dst }),
-  deletePath: (path: string, pwd?: string) => json(`/files/delete-path${pq(pwd)}`, "POST", { path }),
-  deleteFolder: (path: string, pwd?: string) => json(`/files/delete-folder${pq(pwd)}`, "POST", { path }),
-  deleteFile: (id: number, pwd?: string) => json(`/files/${id}${pq(pwd)}`, "DELETE"),
-  renameFile: (id: number, path: string, pwd?: string) => json(`/files/${id}/rename${pq(pwd)}`, "POST", { path }),
+    json(`/files/search?q=${encodeURIComponent(q)}`, "GET", undefined, pwd).then((r) => r.files || []),
+  createFolder: (path: string, pwd?: string) => json(`/files/folder`, "POST", { path }, pwd),
+  move: (src: string, dst: string, pwd?: string) => json(`/files/move`, "POST", { src, dst }, pwd),
+  deletePath: (path: string, pwd?: string) => json(`/files/delete-path`, "POST", { path }, pwd),
+  deleteFolder: (path: string, pwd?: string) => json(`/files/delete-folder`, "POST", { path }, pwd),
+  deleteFile: (id: number, pwd?: string) => json(`/files/${id}`, "DELETE", undefined, pwd),
+  renameFile: (id: number, path: string, pwd?: string) => json(`/files/${id}/rename`, "POST", { path }, pwd),
 
   // path notes (备注)
   getNote: (path: string, pwd?: string): Promise<PathNote> =>
-    json(`/notes?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET"),
+    json(`/notes?path=${encodeURIComponent(path)}`, "GET", undefined, pwd),
   putNote: (path: string, isDir: boolean, body: string, pwd?: string): Promise<PathNote & { ok: boolean }> =>
-    json(`/notes${pq(pwd)}`, "PUT", { path, is_dir: isDir, body }),
+    json(`/notes`, "PUT", { path, is_dir: isDir, body }, pwd),
   deleteNote: (path: string, pwd?: string) =>
-    json(`/notes?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "DELETE"),
+    json(`/notes?path=${encodeURIComponent(path)}`, "DELETE", undefined, pwd),
   noteIndex: (dir: string, pwd?: string): Promise<PathNoteIndex> =>
-    json(`/notes/index?dir=${encodeURIComponent(dir)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`, "GET").then((r) => {
+    json(`/notes/index?dir=${encodeURIComponent(dir)}`, "GET", undefined, pwd).then((r) => {
       const notes: PathNoteIndexEntry[] = Array.isArray(r.notes)
         ? r.notes
             .map((n: PathNoteIndexEntry) => ({ path: String(n?.path || ""), body: String(n?.body || "") }))
@@ -170,22 +169,21 @@ export const api = {
     const fd = new FormData();
     fd.append("path", path);
     fd.append("file", file);
-    return req(`/notes/images${pq(pwd)}`, { method: "POST", body: fd }).then((r) => r.json());
+    return req(`/notes/images`, { method: "POST", body: fd }, pwd).then((r) => r.json());
   },
   noteImageBlob: (id: number, pwd?: string): Promise<Blob> =>
-    req(`/notes/images/${id}${pq(pwd)}`).then((r) => r.blob()),
+    req(`/notes/images/${id}`, {}, pwd).then((r) => r.blob()),
 
   // password protection (私密)
   getProtect: (path: string): Promise<ProtectInfo> => json(`/files/protect?path=${encodeURIComponent(path)}`, "GET"),
   setProtect: (path: string, isDir: boolean, password: string, pwd?: string) =>
-    json(`/files/protect${pq(pwd)}`, "POST", { path, is_dir: isDir, password }),
-  unprotect: (path: string, pwd?: string) => json(`/files/unprotect${pq(pwd)}`, "POST", { path }),
+    json(`/files/protect`, "POST", { path, is_dir: isDir, password }, pwd),
+  unprotect: (path: string, pwd?: string) => json(`/files/unprotect`, "POST", { path }, pwd),
   checkAccess: (id?: number, path?: string, pwd?: string): Promise<{ ok: boolean }> => {
     const params = new URLSearchParams();
     if (id !== undefined) params.set("id", String(id));
     if (path) params.set("path", path);
-    if (pwd) params.set("pwd", pwd);
-    return json(`/files/access-check?${params.toString()}`, "GET");
+    return json(`/files/access-check?${params.toString()}`, "GET", undefined, pwd);
   },
 
   // share-link import (转存)
@@ -196,7 +194,7 @@ export const api = {
     fs_ids: string[]; total_size: number; target_dir: string; encrypt: boolean;
     rand_name: boolean;
   }, pwd?: string): Promise<{ job_id: string }> =>
-    json(`/share/import${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ""}`, "POST", p),
+    json(`/share/import`, "POST", p, pwd),
 
   // system share links
   createShare: (p: { id?: number; path?: string; expires_in: string }): Promise<ShareLinkResult> =>
@@ -246,12 +244,27 @@ export const api = {
   saveSystemConfig: (cfg: Partial<SystemConfig>): Promise<SystemConfig> => json("/admin/system-config", "PUT", cfg),
 };
 
-export function downloadShareUrl(token: string, pwd?: string): string {
-  return `/api/shares/${encodeURIComponent(token)}/download${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ""}`;
+async function triggerBrowserDownload(apiPath: string, filename: string, pwd?: string) {
+  const res = await req(apiPath, {}, pwd);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export function downloadZipUrl(path: string, pwd?: string): string {
-  return `/api/files/zip?path=${encodeURIComponent(path)}${pwd ? `&pwd=${encodeURIComponent(pwd)}` : ""}`;
+export function downloadShare(token: string, name: string, pwd?: string) {
+  const filename = name || "download";
+  return triggerBrowserDownload(`/shares/${encodeURIComponent(token)}/download`, filename, pwd);
+}
+
+export function downloadZip(path: string, pwd?: string) {
+  const name = path.split("/").filter(Boolean).pop() || "download";
+  return triggerBrowserDownload(`/files/zip?path=${encodeURIComponent(path)}`, `${name}.zip`, pwd);
 }
 
 export interface ClientInfo {
@@ -301,8 +314,8 @@ export const clientApi = {
   localFiles: (path = ""): Promise<LocalDirectory> =>
     json(`/client/fs${path ? `?path=${encodeURIComponent(path)}` : ""}`, "GET"),
   tasks: (): Promise<ClientTask[]> => json("/client/transfers", "GET").then((r) => r.tasks),
-  upload: (localPath: string, remoteDir: string): Promise<{ id: string }> =>
-    json("/client/transfers/upload", "POST", { local_path: localPath, remote_dir: remoteDir }),
+  upload: (localPath: string, remoteDir: string, pwd?: string): Promise<{ id: string }> =>
+    json("/client/transfers/upload", "POST", { local_path: localPath, remote_dir: remoteDir, pwd }),
   download: (file: { path: string; name: string; pwd?: string }): Promise<{ id: string }> =>
     json("/client/transfers/download", "POST", { path: file.path, name: file.name, pwd: file.pwd }),
   cancel: (id: string) => json(`/client/transfers/${encodeURIComponent(id)}/cancel`, "POST"),

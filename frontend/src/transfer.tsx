@@ -55,6 +55,7 @@ interface Ctl {
   uploadId?: string;
   fileId?: number;
   downloadUrl?: string;
+  accessPwd?: string;
   abort?: AbortController;
   chunks: Uint8Array[];
   jobId?: string;
@@ -75,8 +76,8 @@ interface Ctl {
 interface TransferApi {
   clientMode: boolean;
   transfers: Transfer[];
-  startUpload: (file: File, path: string) => void;
-  startClientUpload: (localPath: string, remoteDir: string) => Promise<void>;
+  startUpload: (file: File, path: string, pwd?: string) => void;
+  startClientUpload: (localPath: string, remoteDir: string, pwd?: string) => Promise<void>;
   startDownload: (item: { id: number; path: string; size: number; download_url?: string; pwd?: string }) => void | Promise<void>;
   pause: (id: string) => void;
   resume: (id: string) => void;
@@ -99,11 +100,16 @@ export function TransferProvider({ children, mode = "server" }: { children: Reac
 
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const authHeader = () => ({ Authorization: `Bearer ${auth.token}` });
+const accessHeaders = (extra?: Record<string, string>, pwd?: string): Record<string, string> => {
+  const headers: Record<string, string> = { ...authHeader(), ...extra };
+  if (pwd) headers["X-Access-Password"] = pwd;
+  return headers;
+};
 
-async function postJSON(url: string, body: unknown) {
+async function postJSON(url: string, body: unknown, pwd?: string) {
   const res = await fetch(url, {
     method: "POST",
-    headers: { ...authHeader(), "Content-Type": "application/json" },
+    headers: accessHeaders({ "Content-Type": "application/json" }, pwd),
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -115,8 +121,8 @@ async function postJSON(url: string, body: unknown) {
   return data;
 }
 
-async function getJSON(url: string) {
-  const res = await fetch(url, { headers: authHeader() });
+async function getJSON(url: string, pwd?: string) {
+  const res = await fetch(url, { headers: accessHeaders(undefined, pwd) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error || res.statusText) as Error & { status?: number };
@@ -214,7 +220,7 @@ interface PersistEntry {
   id: string; kind: "upload" | "download" | "import"; name: string; path: string;
   total: number; transferred: number; synced?: number;
   status: TransferStatus; error?: string;
-  uploadId?: string; fileId?: number; downloadUrl?: string; jobId?: string;
+  uploadId?: string; fileId?: number; downloadUrl?: string; accessPwd?: string; jobId?: string;
   stream?: { sessionId: string; sliceSize: number; total: number; window: number };
 }
 
@@ -244,7 +250,7 @@ function restoreTransfers(): { list: Transfer[]; ctls: Map<string, Ctl>; resumeI
         kind: e.kind, name: e.name, path: e.path, total: e.total,
         sent: transferred, shown: transferred, synced: synced || 0,
         paused: true, canceled: e.status === "canceled",
-        uploadId: e.uploadId, fileId: e.fileId, downloadUrl: e.downloadUrl, jobId: e.jobId,
+        uploadId: e.uploadId, fileId: e.fileId, downloadUrl: e.downloadUrl, accessPwd: e.accessPwd, jobId: e.jobId,
         chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
         lastTime: Date.now(), lastBytes: transferred, lastSynced: synced || 0,
         stream: e.stream ? {
@@ -265,11 +271,13 @@ function putSliceXHR(
   url: string, body: ArrayBuffer,
   onProgress: (loaded: number) => void,
   xhrs: Set<XMLHttpRequest>,
+  pwd?: string,
 ): Promise<{ done_count: number; total: number }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url);
     xhr.setRequestHeader("Authorization", `Bearer ${auth.token}`);
+    if (pwd) xhr.setRequestHeader("X-Access-Password", pwd);
     xhr.upload.onprogress = (e) => onProgress(e.loaded);
     xhr.onload = () => {
       xhrs.delete(xhr);
@@ -306,15 +314,16 @@ async function putSlice(
   url: string, body: ArrayBuffer,
   onProgress: (loaded: number) => void,
   xhrs: Set<XMLHttpRequest>,
+  pwd?: string,
 ): Promise<{ done_count: number; total: number }> {
-  if (body.byteLength <= SLICE_PART) return putSliceXHR(url, body, onProgress, xhrs);
+  if (body.byteLength <= SLICE_PART) return putSliceXHR(url, body, onProgress, xhrs, pwd);
   let off = 0;
   for (;;) {
     const end = Math.min(off + SLICE_PART, body.byteLength);
     try {
       const res = await putSliceXHR(
         `${url}&off=${off}`, body.slice(off, end),
-        (loaded) => onProgress(off + loaded), xhrs,
+        (loaded) => onProgress(off + loaded), xhrs, pwd,
       );
       if (end >= body.byteLength) return res;
       off = end;
@@ -344,7 +353,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       return {
         id: t.id, kind: t.kind, name: t.name, path: t.path, total: t.total,
         transferred: t.transferred, synced: t.synced, status: t.status, error: t.error,
-        uploadId: ctl?.uploadId, fileId: ctl?.fileId, downloadUrl: ctl?.downloadUrl, jobId: ctl?.jobId,
+        uploadId: ctl?.uploadId, fileId: ctl?.fileId, downloadUrl: ctl?.downloadUrl, accessPwd: ctl?.accessPwd, jobId: ctl?.jobId,
         stream: ctl?.stream ? {
           sessionId: ctl.stream.sessionId, sliceSize: ctl.stream.sliceSize,
           total: ctl.stream.total, window: ctl.stream.window,
@@ -423,7 +432,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     const size = ctl.file.size;
     try {
       if (!ctl.uploadId) {
-        const r = await postJSON("/api/files/upload/init", { name: ctl.file.name, path: ctl.path, size });
+        const r = await postJSON("/api/files/upload/init", { name: ctl.file.name, path: ctl.path, size }, ctl.accessPwd);
         ctl.uploadId = r.upload_id;
       }
       ctl.lastTime = Date.now(); ctl.lastBytes = ctl.sent;
@@ -438,7 +447,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         for (;;) {
           try {
             const res = await fetch(`/api/files/upload/chunk?upload_id=${ctl.uploadId}&offset=${ctl.sent}`, {
-              method: "PUT", headers: authHeader(), body: buf,
+              method: "PUT", headers: accessHeaders(undefined, ctl.accessPwd), body: buf,
             });
             if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
             ctl.sent = (await res.json()).offset;
@@ -463,7 +472,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         tick(id);
       }
       patch(id, { status: "finalizing", speed: 0, transferred: ctl.total, note: undefined });
-      const fin = await postJSON("/api/files/upload/finish", { upload_id: ctl.uploadId });
+      const fin = await postJSON("/api/files/upload/finish", { upload_id: ctl.uploadId }, ctl.accessPwd);
       ctl.jobId = fin.job_id; // flips to done via resolveJob when Baidu leg completes
       fileDrop(id); // server owns the bytes now
       toast("ok", `上传完成：${ctl.name}`);
@@ -501,7 +510,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     let attempt = 0;
     for (;;) {
       try {
-        await postJSON("/api/files/stream/finish", { session_id: ctl.stream.sessionId });
+        await postJSON("/api/files/stream/finish", { session_id: ctl.stream.sessionId }, ctl.accessPwd);
         ctl.sent = ctl.total; ctl.shown = ctl.total; ctl.synced = ctl.total;
         ctl.file = undefined;
         fileDrop(id);
@@ -559,6 +568,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
                   `/api/files/stream/slice?session=${st.sessionId}&seq=${seq}`, buf,
                   (loaded) => { st.inflight.set(seq, Math.min(loaded, buf.byteLength)); recomputeSent(ctl); tick(id); },
                   st.xhrs,
+                  ctl.accessPwd,
                 );
                 st.inflight.delete(seq);
                 st.doneBytes += buf.byteLength;
@@ -625,7 +635,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     // plan failing (older backend, transient error) is not fatal: fall back
     let plan: { enabled?: boolean; slice_size?: number; window?: number };
     try {
-      plan = await getJSON(`/api/files/stream/plan?size=${file.size}&path=${encodeURIComponent(ctl.path)}`);
+      plan = await getJSON(`/api/files/stream/plan?size=${file.size}&path=${encodeURIComponent(ctl.path)}`, ctl.accessPwd);
     } catch {
       return "fallback";
     }
@@ -661,7 +671,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
         try {
           init = await postJSON("/api/files/stream/init", {
             name: file.name, path: ctl.path, size: file.size, slice_size: sliceSize, block_list: blockList,
-          });
+          }, ctl.accessPwd);
           break;
         } catch (e) {
           const err = e as Error & { status?: number; data?: { fallback?: boolean; slice_size?: number } };
@@ -724,7 +734,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     if (!ctl || !ctl.stream) return;
     const st = ctl.stream;
     try {
-      const status = await getJSON(`/api/files/stream/status?session=${st.sessionId}`);
+      const status = await getJSON(`/api/files/stream/status?session=${st.sessionId}`, ctl.accessPwd);
       st.pending = (status.need_seqs as number[]) || [];
       st.inflight.clear();
       const missingBytes = st.pending.reduce((s, seq) => s + sliceLen(st, ctl.total, seq), 0);
@@ -786,6 +796,7 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
       try {
         ctl.abort = new AbortController();
         const headers: Record<string, string> = { ...authHeader() };
+        if (ctl.accessPwd) headers["X-Access-Password"] = ctl.accessPwd;
         if (ctl.sent > 0) headers.Range = `bytes=${ctl.sent}-`;
         const url = ctl.downloadUrl || `/api/files/${ctl.fileId}/download`;
         const res = await fetch(url, { headers, signal: ctl.abort.signal });
@@ -847,11 +858,11 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
   }, [patch, tick, flushDownload, scheduleAutoResume]);
 
   // ---- public api ----------------------------------------------------------
-  const startUpload = useCallback((file: File, path: string) => {
+  const startUpload = useCallback((file: File, path: string, pwd?: string) => {
     const id = uid();
     ctls.current.set(id, {
       kind: "upload", name: file.name, path, total: file.size, sent: 0, shown: 0, synced: 0,
-      paused: false, canceled: false, file, chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
+      paused: false, canceled: false, file, accessPwd: pwd, chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
     // persist the File so a refresh/interruption never needs re-picking
@@ -875,14 +886,10 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
   const startDownload = useCallback((item: { id: number; path: string; size: number; download_url?: string; pwd?: string }) => {
     const id = uid();
     const name = item.path.split("/").pop() || "download";
-    let dlUrl = item.download_url;
-    if (item.pwd) {
-      const base = dlUrl || `/api/files/${item.id}/download`;
-      dlUrl = base + (base.includes("?") ? "&" : "?") + `pwd=${encodeURIComponent(item.pwd)}`;
-    }
+    const dlUrl = item.download_url;
     ctls.current.set(id, {
       kind: "download", name, path: item.path, total: item.size, sent: 0, shown: 0, synced: 0,
-      paused: false, canceled: false, fileId: item.id, downloadUrl: dlUrl,
+      paused: false, canceled: false, fileId: item.id, downloadUrl: dlUrl, accessPwd: item.pwd,
       chunks: [], dlSeq: 0, retrying: false, userPaused: false, autoResumes: 0, autoResumeGen: 0,
       lastTime: Date.now(), lastBytes: 0, lastSynced: 0,
     });
@@ -977,9 +984,9 @@ function BrowserTransferProvider({ children }: { children: ReactNode }) {
     if (ctl.abort) { try { ctl.abort.abort(); } catch { /* ignore */ } }
     if (ctl.stream) {
       ctl.stream.xhrs.forEach((x) => { try { x.abort(); } catch { /* ignore */ } });
-      postJSON("/api/files/stream/cancel", { session_id: ctl.stream.sessionId }).catch(() => {});
+      postJSON("/api/files/stream/cancel", { session_id: ctl.stream.sessionId }, ctl.accessPwd).catch(() => {});
     } else if (ctl.kind === "upload" && ctl.uploadId) {
-      postJSON("/api/files/upload/cancel", { upload_id: ctl.uploadId }).catch(() => {});
+      postJSON("/api/files/upload/cancel", { upload_id: ctl.uploadId }, ctl.accessPwd).catch(() => {});
     }
     dropStored(id);
     patch(id, { status: "canceled", speed: 0, syncSpeed: 0 });
@@ -1137,8 +1144,8 @@ function ClientTransferProvider({ children }: { children: ReactNode }) {
     return () => { alive = false; window.clearInterval(timer); };
   }, [notifyDone]);
 
-  const startClientUpload = useCallback(async (localPath: string, remoteDir: string) => {
-    await clientApi.upload(localPath, remoteDir);
+  const startClientUpload = useCallback(async (localPath: string, remoteDir: string, pwd?: string) => {
+    await clientApi.upload(localPath, remoteDir, pwd);
     await refresh();
   }, [refresh]);
 

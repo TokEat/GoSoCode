@@ -1,218 +1,91 @@
 # GoSoCode
 
-> 百度网盘账号池 · 共享文件系统 · 多端传输
+把多个百度网盘账号聚合成一个共享文件空间。用浏览器就能上传、下载、搜索和管理文件，也可以安装本机客户端，让数据直连百度网盘，不经过平台服务器。
 
-GoSoCode 把多个百度网盘账号聚合成"存储节点"，对平台用户呈现为一个统一的逻辑文件系统。
-支持浏览器流式上传、客户端直连加速、轻量运维。
+![文件管理](docs/screenshots/files.png)
 
-- **后端**: Go + Gin + GORM + SQLite (Redis 可选)
-- **前端**: React + TypeScript + Vite
-- **客户端**: 同仓库的 Go CLI，数据面绕过服务端直接连百度
+## 能做什么
 
----
+- **统一的文件空间**：多个网盘账号显示为共享空间里的目录，成员在同一个界面里协作。
+- **文件管理**：上传、下载、新建文件夹、重命名、移动、删除；当前路径会写在浏览器地址栏里，刷新、前进后退，或把链接发给同事，都能回到同一位置。
+- **全局搜索**：在文件管理页搜索，会在整个共享空间里查找，不只看当前文件夹。
+- **备注**：给文件或目录写备注。简单文字会直接显示在列表里；内容较复杂时显示「备注」标签，点击即可预览。
+- **私密访问**：给文件或目录设置访问密码。未授权的人打开或下载前需要输入密码。
+- **加密存储**（可选）：上传时使用 AES-256 加密。通过本平台下载会自动解密；直接在百度网盘下载只能得到密文。
+- **分享转存**：粘贴别人的百度网盘分享链接，勾选文件后转存到共享空间。
+- **传输管理**：上传前会显示校验进度，传输中可暂停、恢复、取消；网络波动时会自动续传。如果文件看起来是密文又无法解密，下载会立即中止，避免空等很久却下到无法打开的文件。
+- **本机客户端**（可选）：数据在你的电脑和百度网盘之间直连，通常更快，也不占用服务器带宽。
 
-## 功能特性
+## 界面一览
 
-- 多百度账号聚合为一个共享文件系统
-- 元数据由本地 SQLite 维护，列表/搜索不依赖百度接口
-- 三条传输路径 (任选):
-  - **浏览器流式**: 分片秒传 + 云端同步实时回显
-  - **先存后转**: 临时落盘，异步推送到云
-  - **客户端直连**: 数据不经服务端，绕过浏览器限速
-- 自动账号选择 (容量感知 + 单飞令牌刷新 + 配额刷新)
-- 分布式锁 (路径并发安全) + 每账号 QPS 限流
-- 实时进度 (WebSocket) + 流量计量
-- 跨平台发布 (Linux/Windows/macOS × amd64/arm64)
+### 文件管理
 
----
+在「文件管理」里浏览共享空间、上传文件或新建文件夹。顶部可以看到容量，列表里是当前目录的内容。
 
-## 快速开始
+![文件管理](docs/screenshots/files.png)
 
-### 1. 启动服务端
+### 传输任务
 
-```bash
-cd backend
-go run ./cmd/server
-# 监听 :8080，首次启动自动创建并迁移 gosocode.db
-```
+上传和下载的进度、速度和剩余时间会显示在传输栏和「传输管理」页面，可以随时暂停或取消。
 
-打开 http://localhost:8080 ，使用种子管理员登录:
+![传输任务](docs/screenshots/transfers-bar.png)
 
-```
-用户名: admin
-密码:   admin@qwe123
-```
+### 私密文件和目录
 
-**首次登录后请立即修改密码** (`设置` → `修改密码`)。
+在文件或目录上右键，选择设置私密并指定访问密码。设为私密后，列表里会有图标标识。
 
-### 2. 添加百度账号 (管理员)
+![设置私密](docs/screenshots/private-menu.png)
 
-进入 `管理` → `账号池`，点击 `添加账号`：
+![私密标识](docs/screenshots/private-icon.png)
 
-1. 在百度网盘开放平台创建一个应用
-2. 把 AppKey / SecretKey 粘贴到平台 `管理员 → 设置`
-3. 在账号列表点击 `添加账号`，跳转百度 OAuth 授权
-4. 同一个 AppKey 可以绑定任意多个百度账号
+![私密设置](docs/screenshots/private-settings.png)
 
-### 3. 下载客户端 (可选，提升上传/下载速度)
+### 加密存储
 
-进入 `客户端设置` 页面，自动识别你的操作系统，点击 `下载` 即可。
-客户端是一个本地守护进程，数据在本机和百度之间直接传输，不经过平台服务器。
+管理员可以在系统设置里开启加密存储。开启后，新上传的文件会加密保存，列表中同样有图标标识。
 
-```bash
-# 解压后 (Windows 用 .exe)
-./client -server http://localhost:8080
-# 默认仅监听 127.0.0.1:8190，浏览器访问 http://localhost:8190 即可
-```
+![加密存储设置](docs/screenshots/encryption-settings.png)
 
-客户端会接管全部 UI，浏览器看到的页面就是同一个，只是上传/下载的数据走本机。
+![加密文件标识](docs/screenshots/encryption-icon.png)
 
----
+网盘侧会保存一份元数据清单（`.gsc-manifest.json`），用于记录文件映射和加密信息。请不要在百度网盘里手动删除或改动这份文件。
 
-## 命令清单
+![元数据清单](docs/screenshots/manifest.png)
 
-### 后端 (`backend/`)
+### 本机客户端
 
-```bash
-go run ./cmd/server                      # 服务端 :8080
-go run ./cmd/client -server <URL>        # 客户端 :8090
+在「概览」页可以按系统下载客户端。启动后用浏览器打开本地地址，界面和网页版相同，只是上传下载改由本机直连百度网盘。
 
-go build ./... && go vet ./...           # 编译 + 静态检查
-```
+![下载本机客户端](docs/screenshots/client-overview.png)
 
-### 前端 (`frontend/`)
+![客户端启动](docs/screenshots/client-cli.png)
 
-```bash
-npm install
-npm run dev                              # vite :5173，代理 /api 到 :8080
-npm run build                            # tsc -b && vite build，输出到 dist/
-```
+![客户端设置](docs/screenshots/client-settings.png)
 
-### 调试参数
+## 使用说明
 
-```bash
-VITE_API_TARGET=http://localhost:8090 npm run dev   # 客户端模式下开发前端
-GSC_WEBUI=./frontend/dist ./server                  # 用本地 dist 替换内嵌 UI
-```
+更完整的操作说明见 [使用手册](docs/user-manual.md)。常见用法如下：
 
----
+1. 使用管理员发给你的账号登录。
+2. 打开「文件管理」，进入对应目录后上传、下载或整理文件。
+3. 用顶部搜索查找文件；给文件或目录添加备注，方便以后辨认。
+4. 在「传输管理」里查看进度。大文件建议等云端进度完成后再关闭页面。
+5. 若要转存别人的百度分享，打开「分享转存」，粘贴链接后选择目标目录。
+6. 经常传输大文件时，可在「概览」下载本机客户端，速度通常更好。
 
-## 配置 (环境变量)
+管理员还需要接入百度网盘账号、管理用户和系统设置，步骤见使用手册中的「管理员功能」。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `GSC_ADDR` | `:8080` | HTTP 监听地址（生产环境应由 HTTPS 反向代理对外提供服务） |
-| `GSC_DB` | `gosocode.db` | SQLite 文件路径 |
-| `GSC_JWT_SECRET` | `dev-insecure-change-me` | JWT 签名密钥 (生产必改) |
-| `GSC_REDIS` | _(空)_ | Redis 地址；空 = 内存协调 (单实例) |
-| `GSC_APP_NAME` | `gosocode` | 百度 OpenAPI 应用名，决定沙盒目录 `/apps/<AppName>/` |
-| `GSC_BAIDU_APPKEY` / `GSC_BAIDU_SECRET` | _(空)_ | OAuth 凭证 (推荐改为在管理后台填) |
-| `GSC_REDIRECT_URI` | `http://localhost:8080/api/oauth/callback` | OAuth 回调地址，需与百度应用配置一致 |
-| `GSC_STREAM_ENABLED` | `1` | 浏览器流式上传开关 |
-| `GSC_STREAM_MAX_CONCURRENT` | `8` | 同时进行的流式上传会话数 |
-| `GSC_STREAM_WINDOW` | `3` | 流式上传飞行分片数 |
-| `GSC_AGENT_ENABLED` | `1` | 是否允许 CLI 客户端直连 (会下发 access_token) |
-| `GSC_AGENT_CONTROL_KEY` | _(空)_ | 64 位十六进制密钥；启用 CLI 直连时必须与每个客户端的同名变量一致，用于 AES-256-GCM 加密控制面报文 |
-| `GSC_AGENT_WINDOW` | `8` | 客户端飞行分片数 (本机 leg 免费可加大) |
-| `GSC_WEBUI` | `webui` | 内嵌 UI 的目录覆盖 |
-| `GSC_CLIENT_DIR` | _(空)_ | CLI 客户端二进制目录，启动后可通过 Web 下载 |
+## 自己部署
 
----
-
-## 部署
-
-### 单机 (最简)
-
-```bash
-./server
-# 监听 :8080，SQLite 在 ./gosocode.db
-```
-
-放在 nginx/systemd 后面即可，参考 `docs/` 下的部署说明。
-
-### 生产清单
-
-- [ ] 设置 `GSC_JWT_SECRET` 为强随机值
-- [ ] 反向代理 (nginx) + HTTPS
-- [ ] 定时备份 `gosocode.db` (元数据是权威，丢了没法重建)
-- [ ] 配置 `GSC_REDIS` 启用分布式协调 (多实例时必填)
-- [ ] 把 release tarball 解压到 `GSC_CLIENT_DIR`，Web UI 自动提供下载
-
----
-
-## 客户端二进制分发
-
-项目自带 GitHub Actions 发布流水线 (`.github/workflows/release.yml`)。推送 `v*` tag 自动:
-
-1. 交叉编译 6 个平台的服务端 + 客户端二进制
-2. 输出各平台服务端程序 (`gosocode-server-<os>-<arch>`)、按平台打包的客户端
-   tar.gz / zip (`gosocode-client-<os>-<arch>.*`) 和一份合并的
-   `gosocode-client-binaries.tar.gz`
-3. 创建对应版本的 GitHub Release 并附加以上产物
-
-(推送 master 分支则滚动更新预发布的 `latest` Release，产物相同。)
-
-运营侧只要把那份 `gosocode-client-binaries.tar.gz` 解压到 `GSC_CLIENT_DIR`
-指向的目录（或服务端启动目录下的 `client-bin/`），Web 端 `概览` 页面就会自动
-出现下载按钮，并按浏览器 UA 推荐当前平台的客户端。
-
-下载流程见 [docs/client-mode.md](docs/client-mode.md)。
-
----
-
-## 项目结构
-
-```
-backend/
-  cmd/
-    server/                # 服务端入口
-    client/                # CLI 客户端入口
-  internal/
-    api/                   # gin handlers + 路由
-    account/               # 账号池 / 选盘 / token 刷新
-    baidu/                 # 百度 OpenAPI 客户端
-    coord/                 # 分布式锁 + 限流 (内存/Redis)
-    job/                   # worker pool + janitor
-    models/                # GORM 模型
-    realtime/              # WebSocket hub
-    metrics/               # 流量计量
-    store/                 # SQLite + 自动迁移
-    webui/                 //go:embed 前端产物
-    config/                # 环境变量配置
-
-frontend/
-  src/
-    pages/                 # 各页面 (Files, Transfers, Login, ...)
-    lib/                   # API 客户端
-    transfer.tsx           # 传输引擎 (流式上传 + 范围下载)
-    LocalFilePicker.tsx    # 客户端模式下的本地文件选择
-
-docs/
-  streaming-upload-sync.md # 流式上传设计
-  client-mode.md           # 客户端模式
-  baidu-client-optimizations.md
-```
-
----
-
-## 安全须知
-
-- **不要在公网裸跑默认 JWT secret**。第一件事就是改 `GSC_JWT_SECRET`。
-- `GSC_AGENT_ENABLED=1` 时，平台会向 CLI 客户端下发百度 access_token。必须设置同一份 `GSC_AGENT_CONTROL_KEY` 到服务端与客户端，控制请求中的 JWT、参数和 agent 响应中的令牌均使用 AES-256-GCM 加密；仍建议在生产环境部署 HTTPS。
-  这等于把整个百度账号的控制权交给运行客户端的人 — 仅在可信部署中开启。
-- OAuth AppKey / SecretKey 可以通过环境变量传入，**也可以在管理后台填并保存到 DB**。
-  管理后台填写的优先级更高，便于不重启滚动更新。
-- 百度账号授权是 OAuth 2.0 标准流程，**不要把百度账号密码交给 GoSoCode**。
-
----
+如果你要在自己的机器上运行 GoSoCode，请看独立的 [开发文档](docs/development.md)，里面有本地启动、配置项、目录结构和部署注意事项。
 
 ## 文档
 
-- [docs/streaming-upload-sync.md](docs/streaming-upload-sync.md) — 浏览器流式上传原理
-- [docs/client-mode.md](docs/client-mode.md) — 客户端模式与 Agent 接口
-- [docs/baidu-client-optimizations.md](docs/baidu-client-optimizations.md) — 百度 API 调优笔记
-
----
+- [使用手册](docs/user-manual.md) — 面向使用者的完整操作说明
+- [开发文档](docs/development.md) — 本地开发、配置、架构与部署
+- [流式上传设计](docs/streaming-upload-sync.md)
+- [客户端模式](docs/client-mode.md)
+- [百度接口调优笔记](docs/baidu-client-optimizations.md)
 
 ## 许可证
 

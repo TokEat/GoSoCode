@@ -37,6 +37,12 @@ func (s *Server) agentGuard() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "客户端直连已被管理员禁用"})
 			return
 		}
+		// Agent endpoints return a Baidu access_token, which is equivalent to
+		// full control of that storage node. Temporary users must not receive it.
+		if isTemporary(c) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "临时用户不能使用客户端直连"})
+			return
+		}
 		c.Next()
 	}
 }
@@ -63,7 +69,7 @@ func (s *Server) handleAgentUploadInit(c *gin.Context) {
 	if logical == "/" {
 		logical = "/" + in.Name
 	}
-	if s.temporaryAccessDenied(c, logical) {
+	if s.accessDenied(c, logical) {
 		return
 	}
 	// No streamActive cap: agent sessions consume no server memory, so they are

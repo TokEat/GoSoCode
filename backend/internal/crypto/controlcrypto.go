@@ -26,9 +26,10 @@ type Envelope struct {
 }
 
 type Request struct {
-	Authorization string `json:"authorization"`
-	Query         string `json:"query,omitempty"`
-	Body          []byte `json:"body,omitempty"`
+	Authorization  string `json:"authorization"`
+	Query          string `json:"query,omitempty"`
+	Body           []byte `json:"body,omitempty"`
+	AccessPassword string `json:"access_password,omitempty"`
 }
 
 // New creates an AES-256-GCM codec from a 64-character hexadecimal key.

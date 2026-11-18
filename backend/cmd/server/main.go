@@ -25,6 +25,9 @@ func main() {
 	flag.Parse()
 
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	if *clientDir != "" {
 		cfg.ClientDir = *clientDir
 	} else if cfg.ClientDir == "" {

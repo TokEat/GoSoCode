@@ -30,7 +30,8 @@ func (s *Server) handleUploadInit(c *gin.Context) {
 	if logical == "" {
 		logical = "/" + in.Name
 	}
-	if s.temporaryAccessDenied(c, logical) {
+	logical = cleanLogical(logical)
+	if s.accessDenied(c, logical) {
 		return
 	}
 	tmp, err := os.CreateTemp("", "gsc-rsu-*")
@@ -134,7 +135,7 @@ func (s *Server) handleUploadFinish(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "upload incomplete"})
 		return
 	}
-	if s.temporaryAccessDenied(c, sess.LogicalPath) {
+	if s.accessDenied(c, sess.LogicalPath) {
 		return
 	}
 	acc, remote, remoteUUID, logical, release, err := s.resolveUploadTarget(c, sess.LogicalPath, sess.Offset)

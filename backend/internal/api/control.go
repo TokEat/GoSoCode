@@ -136,6 +136,11 @@ func (s *Server) controlCryptoMiddleware() gin.HandlerFunc {
 			return
 		}
 		c.Request.Header.Set("Authorization", request.Authorization)
+		if request.AccessPassword != "" {
+			c.Request.Header.Set(accessPasswordHeader, request.AccessPassword)
+		} else {
+			c.Request.Header.Del(accessPasswordHeader)
+		}
 		c.Request.URL.RawQuery = request.Query
 		c.Request.Body = io.NopCloser(bytes.NewReader(request.Body))
 		c.Request.ContentLength = int64(len(request.Body))

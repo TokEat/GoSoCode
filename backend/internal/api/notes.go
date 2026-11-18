@@ -413,13 +413,6 @@ func (s *Server) temporaryAccessDeniedNoWrite(c *gin.Context, logical string) bo
 	return count == 0
 }
 
-func presentedPassword(c *gin.Context) string {
-	if p := strings.TrimSpace(c.Query("pwd")); p != "" {
-		return p
-	}
-	return strings.TrimSpace(c.GetHeader("X-Access-Password"))
-}
-
 func (s *Server) accessDeniedNoWrite(c *gin.Context, logical string) bool {
 	logical = cleanLogical(logical)
 	if s.temporaryAccessDeniedNoWrite(c, logical) {

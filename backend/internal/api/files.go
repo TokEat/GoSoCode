@@ -261,10 +261,19 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			return
 		}
 		out := make([]gin.H, 0, len(nodes))
+		role, _ := c.Get("role")
+		var grantPaths []string
+		if role == "temporary" {
+			grantPaths = s.activeGrantPaths(uidOf(c))
+		}
 		for _, n := range nodes {
 			m := mountName(n)
+			mountPath := "/" + m
+			if role == "temporary" && !pathOverlapsGrant(mountPath, grantPaths) {
+				continue
+			}
 			out = append(out, gin.H{
-				"id": 0, "path": "/" + m, "size": 0, "status": "ready",
+				"id": 0, "path": mountPath, "size": 0, "status": "ready",
 				"created_at": n.CreatedAt, "modified": n.UpdatedAt, "is_dir": true,
 				"owner": "百度网盘", "node_id": n.ID, "mount": true,
 			})
@@ -469,6 +478,30 @@ func pathCoveredByGrant(logical string, grants []string) bool {
 	return false
 }
 
+// pathOverlapsGrant is true when logical is a grant, is inside a grant, or is an
+// ancestor of a grant (so a temporary user can see the mount that leads to it).
+func pathOverlapsGrant(logical string, grants []string) bool {
+	logical = cleanLogical(logical)
+	for _, g := range grants {
+		g = cleanLogical(g)
+		if logical == g || strings.HasPrefix(logical, g+"/") || strings.HasPrefix(g, logical+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) activeGrantPaths(uid uint) []string {
+	var grants []models.AccessGrant
+	now := time.Now()
+	s.db.Where("user_id = ? AND (expires_at IS NULL OR expires_at > ?)", uid, now).Find(&grants)
+	paths := make([]string, 0, len(grants))
+	for _, g := range grants {
+		paths = append(paths, cleanLogical(g.Path))
+	}
+	return paths
+}
+
 func coveringRule(logical string, rules []models.AccessRule) *models.AccessRule {
 	var best *models.AccessRule
 	for i := range rules {
@@ -653,20 +686,12 @@ func (s *Server) handleSearchFiles(c *gin.Context) {
 	uid := uidOf(c)
 	var grantPaths []string
 	if role == "temporary" {
-		var grants []models.AccessGrant
-		now := time.Now()
-		s.db.Where("user_id = ? AND (expires_at IS NULL OR expires_at > ?)", uid, now).Find(&grants)
-		for _, g := range grants {
-			grantPaths = append(grantPaths, cleanLogical(g.Path))
-		}
+		grantPaths = s.activeGrantPaths(uid)
 	}
 
 	var rules []models.AccessRule
 	s.db.Find(&rules)
-	pwd := c.Query("pwd")
-	if pwd == "" {
-		pwd = c.GetHeader("X-Access-Password")
-	}
+	pwd := presentedPassword(c)
 
 	query := s.db.Model(&models.File{}).Where("status <> ? AND status <> ?", "deleted", "uploading")
 	for _, tok := range queryTokens(q) {

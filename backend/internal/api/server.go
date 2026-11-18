@@ -97,7 +97,7 @@ func (s *Server) Router() *gin.Engine {
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Access-Password"},
 		AllowCredentials: false,
 	}))
 	r.MaxMultipartMemory = 32 << 20

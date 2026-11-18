@@ -112,6 +112,7 @@ cat > "${GSC_ETC}/env" <<EOF
 # GoSoCode runtime configuration
 # 修改后执行: systemctl restart ${GSC_SERVICE}
 
+GSC_ENV=production
 GSC_ADDR=${GSC_ADDR}
 GSC_DB=${GSC_DB}
 GSC_JWT_SECRET=${GSC_JWT_SECRET}

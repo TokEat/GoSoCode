@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, downloadShareUrl, ShareInfo } from "../lib/api";
+import { api, downloadShare, ShareInfo } from "../lib/api";
 import { Card, useToast } from "../ui";
 import { humanSize } from "../lib/format";
 
@@ -35,7 +35,9 @@ export default function SharePage() {
       toast("err", "请输入访问密码");
       return;
     }
-    window.location.href = downloadShareUrl(token, pwd.trim() || undefined);
+    downloadShare(token, info?.name || "download", pwd.trim() || undefined).catch((e: any) => {
+      toast("err", e?.message || "下载失败");
+    });
   }
 
   if (loading) {

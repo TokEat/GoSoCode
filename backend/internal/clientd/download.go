@@ -80,10 +80,7 @@ func (s *dlSource) refresh(ctx context.Context, stale *dlInfo) error {
 
 func (d *Daemon) resolve(ctx context.Context, auth, logicalPath, pwd string) (*dlInfo, []byte, error) {
 	q := "/api/agent/download/resolve?path=" + url.QueryEscape(logicalPath)
-	if pwd != "" {
-		q += "&pwd=" + url.QueryEscape(pwd)
-	}
-	status, raw, err := d.serverJSON(ctx, auth, http.MethodGet, q, nil)
+	status, raw, err := d.serverJSONAccess(ctx, auth, http.MethodGet, q, nil, pwd)
 	if err != nil {
 		return nil, nil, err
 	}

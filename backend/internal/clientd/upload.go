@@ -140,7 +140,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		body, _ := json.Marshal(init)
 		err = retryTask(ctx, t, 5, "initialize upload session", func() error {
 			var callErr error
-			status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/agent/upload/init", body)
+			status, raw, callErr = d.serverJSONAccess(ctx, t.auth, http.MethodPost, "/api/agent/upload/init", body, t.pwd)
 			if callErr == nil && (status == http.StatusTooManyRequests || status >= 500) {
 				return fmt.Errorf("server HTTP %d: %s", status, serverErrMsg(raw, "temporary error"))
 			}
@@ -178,7 +178,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		body, _ := json.Marshal(map[string]string{"session_id": ses.SessionID})
 		bg, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_, _, _ = d.serverJSON(bg, t.auth, http.MethodPost, "/api/files/stream/cancel", body)
+		_, _, _ = d.serverJSONAccess(bg, t.auth, http.MethodPost, "/api/files/stream/cancel", body, t.pwd)
 	}
 
 	t.setStatus("running")
@@ -209,7 +209,7 @@ func (d *Daemon) runUpload(ctx context.Context, t *Task) {
 		t.logf("finishing cloud file attempt=%d/5 session=%s", attempt+1, ses.SessionID)
 		t.setDetail("云端合并处理中…")
 		body, _ := json.Marshal(map[string]string{"session_id": ses.SessionID})
-		status, raw, err = d.serverJSON(ctx, t.auth, http.MethodPost, "/api/files/stream/finish", body)
+		status, raw, err = d.serverJSONAccess(ctx, t.auth, http.MethodPost, "/api/files/stream/finish", body, t.pwd)
 		if err != nil {
 			finishErr = "无法连接服务端: " + err.Error()
 		} else if status == http.StatusOK {
@@ -315,8 +315,8 @@ func (d *Daemon) uploadNeedSeqs(ctx context.Context, t *Task, sessionID string) 
 	var raw []byte
 	err := retryTask(ctx, t, 4, "query missing upload slices", func() error {
 		var callErr error
-		status, raw, callErr = d.serverJSON(ctx, t.auth, http.MethodGet,
-			"/api/files/stream/status?session="+url.QueryEscape(sessionID), nil)
+		status, raw, callErr = d.serverJSONAccess(ctx, t.auth, http.MethodGet,
+			"/api/files/stream/status?session="+url.QueryEscape(sessionID), nil, t.pwd)
 		if callErr != nil {
 			return callErr
 		}

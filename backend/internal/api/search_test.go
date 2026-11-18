@@ -159,10 +159,10 @@ func doSearch(t *testing.T, s *Server, uid uint, role, q, pwd string) (int, []ma
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	u := "/api/files/search?q=" + url.QueryEscape(q)
-	if pwd != "" {
-		u += "&pwd=" + url.QueryEscape(pwd)
-	}
 	c.Request = httptest.NewRequest(http.MethodGet, u, nil)
+	if pwd != "" {
+		c.Request.Header.Set("X-Access-Password", pwd)
+	}
 	c.Set("uid", uid)
 	c.Set("role", role)
 	c.Set("username", "tester")
